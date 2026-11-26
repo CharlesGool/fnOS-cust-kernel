@@ -1,0 +1,44 @@
+From 4f757268712ac4899d507cd96de9147eb9a4298e Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:21:26 +0700
+Subject: [PATCH 104/110] =?UTF-8?q?trimafs2:=20=E9=80=82=E9=85=8D=206.18.6?=
+ =?UTF-8?q?5=20=E7=9A=84=20backing=5Ffile=5Fopen/backing=5Ftmpfile=5Fopen?=
+ =?UTF-8?q?=20(=E4=BC=A0=20user=5Ffile)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+6.18.65 的 stable 改动把这两个函数的第一个参数从 user_path 改成了 user_file。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/trimafs2/file.c  | 2 +-
+ fs/trimafs2/inode.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/trimafs2/file.c b/fs/trimafs2/file.c
+index 4ac45db40..78314b1bb 100644
+--- a/fs/trimafs2/file.c
++++ b/fs/trimafs2/file.c
+@@ -95,7 +95,7 @@ int trimafs2_open(struct inode *inode, struct file *file)
+ 	}
+ 	flags &= ~(O_CREAT | O_EXCL | O_NOCTTY);
+ 
+-	lower_file = backing_file_open(file_user_path(file), flags, &lower_path, cred);
++	lower_file = backing_file_open(file, flags, &lower_path, cred);
+ 	if (IS_ERR(lower_file)) {
+ 		err = PTR_ERR(lower_file);
+ 		goto out_err;
+diff --git a/fs/trimafs2/inode.c b/fs/trimafs2/inode.c
+index 9ce17e68d..a8694dc9c 100644
+--- a/fs/trimafs2/inode.c
++++ b/fs/trimafs2/inode.c
+@@ -879,7 +879,7 @@ static int trimafs2_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct f
+ 	if (err)
+ 		goto out_put;
+ 
+-	lower_file = backing_tmpfile_open(&file->f_path, file->f_flags, &lower_dir_path, mode,
++	lower_file = backing_tmpfile_open(file, file->f_flags, &lower_dir_path, mode,
+ 					  current_cred());
+ 	err = PTR_ERR(lower_file);
+ 	if (IS_ERR(lower_file))

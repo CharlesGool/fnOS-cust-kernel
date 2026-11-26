@@ -1,0 +1,38 @@
+From 4b7347efd6fb6ff5cfb53a9b64b9812b263ece78 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:10:34 +0000
+Subject: [PATCH 06/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-linux-?=
+ =?UTF-8?q?6.9-build.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+index f42f4a7..e563d98 100644
+--- a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -516,10 +516,17 @@ static const int rwnx_hwq2uapsd[NL80211_NUM_ACS] = {
+ #define P2P_ALIVE_TIME_MS       (1*1000)
+ #define P2P_ALIVE_TIME_COUNT    200
+ 
++//because android kernel 5.15 uses kernel 6.0 or 6.1 kernel api
+ #ifdef ANDROID_PLATFORM
+ #define HIGH_KERNEL_VERSION KERNEL_VERSION(5, 15, 41)
++#define HIGH_KERNEL_VERSION2 KERNEL_VERSION(5, 15, 41)
++#define HIGH_KERNEL_VERSION3 KERNEL_VERSION(5, 15, 104)
++#define HIGH_KERNEL_VERSION4 KERNEL_VERSION(6, 1, 0)
+ #else
+ #define HIGH_KERNEL_VERSION KERNEL_VERSION(6, 0, 0)
++#define HIGH_KERNEL_VERSION2 KERNEL_VERSION(6, 1, 0)
++#define HIGH_KERNEL_VERSION3 KERNEL_VERSION(6, 3, 0)
++#define HIGH_KERNEL_VERSION4 KERNEL_VERSION(6, 3, 0)
+ #endif
+ 
+ extern uint8_t scanning;

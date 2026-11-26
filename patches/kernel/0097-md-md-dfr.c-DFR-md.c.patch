@@ -1,0 +1,1083 @@
+From 52ccc8a8bdf85121b6492a3696d2d4e8d17f830b Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 07:25:05 +0000
+Subject: [PATCH 097/110] =?UTF-8?q?md:=20=E6=96=B0=E5=A2=9E=20md-dfr.c(?=
+ =?UTF-8?q?=E9=99=8D=E7=BA=A7=E5=85=8D=E6=81=A2=E5=A4=8D=20DFR)=E5=B9=B6?=
+ =?UTF-8?q?=E6=8E=A5=E5=85=A5=20md.c?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- md-dfr.c: Offline 成员盘保留槽位, 失败 IO 挂起(plug)、probe 线程探测盘回来或按槽位重新认领新盘, 超时后放行
+- sysfs: md/dfr/{dfr_stat,dfr_enable,dfr_timeout,start_dfr_by_slot}
+- md.c: init/exit、mddev_destroy、mddev_detach/do_md_stop、md_update_sb、super_written/md_write_metadata、md_do_sync 接入 DFR
+- md_init 补上 md_resync_hint_init
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/md/Makefile |   1 +
+ drivers/md/md-dfr.c | 885 ++++++++++++++++++++++++++++++++++++++++++++
+ drivers/md/md.c     |  51 ++-
+ 3 files changed, 926 insertions(+), 11 deletions(-)
+ create mode 100644 drivers/md/md-dfr.c
+
+diff --git a/drivers/md/Makefile b/drivers/md/Makefile
+index d1dcabf94..91bb0b05c 100644
+--- a/drivers/md/Makefile
++++ b/drivers/md/Makefile
+@@ -30,6 +30,7 @@ dm-zoned-y	+= dm-zoned-target.o dm-zoned-metadata.o dm-zoned-reclaim.o
+ md-mod-y	+= md.o md-resync-hint.o
+ md-mod-$(CONFIG_MD_BITMAP)	+= md-bitmap.o
+ md-mod-$(CONFIG_MD_LLBITMAP)	+= md-llbitmap.o
++md-mod-$(CONFIG_MD_DEGRADATION_FREE_RECOVER)	+= md-dfr.o
+ raid456-y	+= raid5.o raid5-cache.o raid5-ppl.o
+ linear-y       += md-linear.o
+ 
+diff --git a/drivers/md/md-dfr.c b/drivers/md/md-dfr.c
+new file mode 100644
+index 000000000..f26aeed12
+--- /dev/null
++++ b/drivers/md/md-dfr.c
+@@ -0,0 +1,885 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * md-dfr.c: degradation free recover (fnnas).
++ *
++ * When a member disk of a redundant array stops answering (cable glitch, disk
++ * reset), the array does not kick the disk out and degrade. Instead the disk
++ * is marked Offline, IO that fails on it is held (plugged) and the array keeps
++ * its slot. A probe thread checks whether the disk (or a disk that took its
++ * place on the same slot) is back; if so the held IO is resubmitted and only
++ * the data that changed in between is resynced (see md-llbitmap.c).
++ * If the disk does not come back in dfr_timeout seconds, the IO is resubmitted
++ * and the disk fails the normal way.
++ */
++
++#include <linux/blkdev.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++#include "md.h"
++#include "raid5.h"
++
++extern const struct device_type disk_type;
++
++static void md_dfr_probe(struct md_thread *thread);
++
++static struct workqueue_struct *dfr_wq;
++static struct workqueue_struct *dfr_wait_wq;
++
++static bool md_level_no_redundancy(struct mddev *mddev)
++{
++	/* LEVEL_LINEAR and raid0 */
++	return mddev->level == LEVEL_LINEAR || mddev->level == 0;
++}
++
++bool md_dfr_started(struct mddev *mddev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	return dfr && test_bit(DFR_F_PLUG, &dfr->flags);
++}
++
++void md_dfr_set_sync_takeover(struct mddev *mddev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	if (dfr)
++		set_bit(DFR_F_SYNC_TAKEOVER, &dfr->flags);
++}
++
++bool md_dfr_test_sync_takeover(struct mddev *mddev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	return dfr && test_bit(DFR_F_SYNC_TAKEOVER, &dfr->flags);
++}
++
++void md_dfr_clear_sync_takeover(struct mddev *mddev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	if (dfr)
++		clear_bit(DFR_F_SYNC_TAKEOVER, &dfr->flags);
++}
++
++bool md_rdev_in_dfr(struct mddev *mddev, struct md_rdev *rdev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	return dfr && test_bit(DFR_F_PLUG, &dfr->flags) &&
++	       test_bit(Offline, &rdev->flags);
++}
++
++/* The bio holds a reference on dfr->pending until it is plugged or ended. */
++void stripe_end_dfr(struct stripe_head *sh)
++{
++	struct md_degradation_free_recover *dfr = sh->raid_conf->mddev->dfr;
++
++	if (atomic_dec_and_test(&dfr->pending))
++		wake_up(&dfr->unplug_wait);
++}
++
++void stripe_end_bio(struct stripe_head *sh, struct bio *bio)
++{
++	if (test_bit(STRIPE_DFR, &sh->state)) {
++		struct md_io_clone *md_io_clone = bio->bi_private;
++
++		if (!md_io_clone->dfr_bio) {
++			atomic_inc(&md_io_clone->mddev->dfr->pending);
++			md_io_clone->dfr_bio = true;
++		}
++	}
++	bio_endio(bio);
++}
++
++/* Called with dfr->lock held. */
++static bool __md_start_dfr_locked(struct md_rdev *rdev)
++{
++	struct md_degradation_free_recover *dfr = rdev->mddev->dfr;
++
++	if (test_and_set_bit(Offline, &rdev->flags))
++		return test_bit(DFR_F_PLUG, &dfr->flags);
++
++	if (!test_and_set_bit(DFR_F_PLUG, &dfr->flags))
++		queue_work(dfr_wait_wq, &dfr->dfr_wait_work);
++
++	return test_bit(DFR_F_PLUG, &dfr->flags);
++}
++
++static void md_dfr_timeout_fn(struct timer_list *t)
++{
++	struct md_degradation_free_recover *dfr =
++		container_of(t, struct md_degradation_free_recover, dfr_timer);
++
++	queue_work(dfr_wq, &dfr->dfr_unplug_work);
++}
++
++/*
++ * Wait until no bio and no superblock write is pending on the offline disks,
++ * and take the plugged bios.
++ */
++static bool md_dfr_wait_bio(struct md_degradation_free_recover *dfr,
++			    struct bio_list *bios)
++{
++	if (atomic_read(&dfr->pending))
++		return false;
++
++	spin_lock_irq(&dfr->lock);
++	if (atomic_read(&dfr->pending)) {
++		spin_unlock_irq(&dfr->lock);
++		return false;
++	}
++
++	__clear_bit(DFR_F_PLUG, &dfr->flags);
++	__clear_bit(DFR_F_WAITED, &dfr->flags);
++	bio_list_merge_init(bios, &dfr->dfr_bios);
++	spin_unlock_irq(&dfr->lock);
++
++	md_wakeup_thread(dfr->mddev->thread);
++	wake_up(&dfr->unplug_wait);
++	return true;
++}
++
++/* The disk did not come back in time: stop the sync and let the probe retry. */
++static void md_dfr_wait_work_fn(struct work_struct *work)
++{
++	struct md_degradation_free_recover *dfr =
++		container_of(work, struct md_degradation_free_recover,
++			     dfr_wait_work);
++	struct mddev *mddev = dfr->mddev;
++
++	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
++		stop_sync_thread_nolock(mddev);
++	else
++		wake_up(&mddev->sb_wait);
++
++	mddev_suspend(mddev, false);
++	set_bit(DFR_F_WAITED, &dfr->flags);
++	md_wakeup_thread(dfr->probe);
++	mddev_resume(mddev);
++
++	mod_timer(&dfr->dfr_timer, jiffies + dfr->dfr_timeout * HZ);
++}
++
++/* Resubmit the plugged bios once nothing is pending on the offline disks. */
++static void md_dfr_unplug_work_fn(struct work_struct *work)
++{
++	struct md_degradation_free_recover *dfr =
++		container_of(work, struct md_degradation_free_recover,
++			     dfr_unplug_work);
++	struct bio_list bios = BIO_EMPTY_LIST;
++	struct bio *bio;
++
++	flush_work(&dfr->dfr_wait_work);
++	timer_delete_sync(&dfr->dfr_timer);
++
++	if (!test_bit(DFR_F_PLUG, &dfr->flags))
++		return;
++
++	might_sleep();
++	wait_event(dfr->unplug_wait, md_dfr_wait_bio(dfr, &bios));
++
++	while ((bio = bio_list_pop(&bios))) {
++		bio->bi_status = BLK_STS_OK;
++		submit_bio_noacct(bio);
++	}
++}
++
++/* Hold the original bio of a clone that failed on an offline disk. */
++static bool md_dfr_plug_bio(struct md_degradation_free_recover *dfr,
++			    struct bio *bio)
++{
++	struct md_io_clone *md_io_clone = bio->bi_private;
++	bool dfr_bio = md_io_clone->dfr_bio;
++	unsigned long flags;
++
++	if (!dfr_bio)
++		return false;
++
++	spin_lock_irqsave(&dfr->lock, flags);
++	WARN_ON(atomic_read(&dfr->pending) <= 0);
++	WARN_ON(!md_io_clone->dfr_bio);
++	if (atomic_dec_and_test(&dfr->pending))
++		wake_up(&dfr->unplug_wait);
++	bio_list_add(&dfr->dfr_bios, md_io_clone->orig_bio);
++	spin_unlock_irqrestore(&dfr->lock, flags);
++
++	return dfr_bio;
++}
++
++static ssize_t dfr_enable_show(struct mddev *mddev, char *page)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	return sprintf(page, "%d\n", dfr ? test_bit(DFR_F_ENABLED, &dfr->flags) : 0);
++}
++
++static ssize_t dfr_enable_store(struct mddev *mddev, const char *buf,
++				size_t len)
++{
++	struct md_degradation_free_recover *dfr;
++	unsigned long long val = 0;
++	int err;
++
++	err = kstrtoull(buf, 10, &val);
++	if (err)
++		return err;
++
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	if (test_bit(MD_DELETED, &mddev->flags)) {
++		mddev_unlock(mddev);
++		return -ENODEV;
++	}
++
++	dfr = mddev->dfr;
++	if (!val) {
++		if (dfr && test_bit(DFR_F_ENABLED, &dfr->flags))
++			clear_bit(DFR_F_ENABLED, &dfr->flags);
++		mddev_unlock(mddev);
++		return len;
++	}
++
++	if (!dfr) {
++		dfr = kzalloc(sizeof(*dfr), GFP_KERNEL);
++		if (!dfr) {
++			mddev_unlock(mddev);
++			return -ENOMEM;
++		}
++
++		dfr->probe = md_register_thread(md_dfr_probe, mddev,
++						"md_dfr_probe");
++		if (!dfr->probe) {
++			kfree(dfr);
++			mddev_unlock(mddev);
++			return -ENOMEM;
++		}
++
++		spin_lock_init(&dfr->lock);
++		bio_list_init(&dfr->dfr_bios);
++		init_waitqueue_head(&dfr->unplug_wait);
++		timer_setup(&dfr->dfr_timer, md_dfr_timeout_fn, 0);
++		dfr->mddev = mddev;
++		INIT_WORK(&dfr->dfr_unplug_work, md_dfr_unplug_work_fn);
++		INIT_WORK(&dfr->dfr_wait_work, md_dfr_wait_work_fn);
++		dfr->dfr_timeout = 10;
++		mddev->dfr = dfr;
++		atomic_set(&dfr->pending, 0);
++	}
++
++	set_bit(DFR_F_ENABLED, &dfr->flags);
++	mddev_unlock(mddev);
++	return len;
++}
++
++static ssize_t dfr_timeout_show(struct mddev *mddev, char *page)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	return sprintf(page, "%u\n", dfr ? dfr->dfr_timeout : 10);
++}
++
++static ssize_t dfr_timeout_store(struct mddev *mddev, const char *buf,
++				 size_t len)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++	unsigned long long val = 0;
++
++	if (!dfr)
++		return -EINVAL;
++	if (kstrtoull(buf, 10, &val))
++		return -EINVAL;
++	if (!val || val > 600)
++		return -EINVAL;
++
++	dfr->dfr_timeout = val;
++	return len;
++}
++
++static ssize_t dfr_stat_show(struct mddev *mddev, char *page)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++	struct md_rdev *rdev;
++	ssize_t len;
++
++	if (!dfr)
++		return sprintf(page, "plug 0 waited 0 pending 0\noffline: \n");
++
++	spin_lock_irq(&dfr->lock);
++	len = sprintf(page, "plug %d waited %d pending %d\noffline: ",
++		      test_bit(DFR_F_PLUG, &dfr->flags),
++		      test_bit(DFR_F_WAITED, &dfr->flags),
++		      atomic_read(&dfr->pending));
++	spin_unlock_irq(&dfr->lock);
++
++	rcu_read_lock();
++	rdev_for_each_rcu(rdev, mddev)
++		if (test_bit(Offline, &rdev->flags))
++			len += sprintf(page + len, "%pg ", rdev->bdev);
++	rcu_read_unlock();
++
++	page[len++] = '\n';
++	return len;
++}
++
++/*
++ * Whether a failed io on @rdev can be held instead of failing the disk:
++ * a disk that is in sync (or already offline) and an array that is not
++ * broken.
++ */
++static bool md_rdev_can_dfr(struct md_rdev *rdev)
++{
++	struct mddev *mddev = rdev->mddev;
++
++	if (test_bit(Offline, &rdev->flags)) {
++		struct md_degradation_free_recover *dfr = mddev->dfr;
++
++		if (!dfr)
++			return false;
++		if (!test_bit(DFR_F_PLUG, &dfr->flags))
++			return !test_bit(MD_BROKEN, &mddev->flags);
++	}
++
++	if (md_level_no_redundancy(mddev))
++		return !test_bit(MD_BROKEN, &mddev->flags);
++
++	return test_bit(In_sync, &rdev->flags);
++}
++
++/* returns 0 if the io of @bio should be held */
++static int md_start_dfr_rdev(struct md_rdev *rdev, struct bio *bio)
++{
++	struct mddev *mddev = rdev->mddev;
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++	unsigned long flags;
++	int ret = -EINVAL;
++
++	if (!dfr || !test_bit(DFR_F_ENABLED, &dfr->flags) ||
++	    mddev->reshape_position != MaxSector)
++		return -EINVAL;
++
++	spin_lock_irqsave(&dfr->lock, flags);
++	if (md_rdev_can_dfr(rdev) && __md_start_dfr_locked(rdev)) {
++		ret = 0;
++		if (bio) {
++			struct md_io_clone *md_io_clone = bio->bi_private;
++
++			if (!md_io_clone->dfr_bio) {
++				atomic_inc(&md_io_clone->mddev->dfr->pending);
++				md_io_clone->dfr_bio = true;
++			}
++		}
++	}
++	spin_unlock_irqrestore(&dfr->lock, flags);
++
++	return ret;
++}
++
++bool md_start_dfr(struct md_rdev *rdev, struct bio *bio)
++{
++	return md_start_dfr_rdev(rdev, bio) == 0;
++}
++
++static bool md_rdev_start_dfr(struct md_rdev *rdev)
++{
++	struct md_degradation_free_recover *dfr = rdev->mddev->dfr;
++	unsigned long flags;
++	bool ret = false;
++
++	spin_lock_irqsave(&dfr->lock, flags);
++	if (md_rdev_can_dfr(rdev))
++		ret = __md_start_dfr_locked(rdev);
++	spin_unlock_irqrestore(&dfr->lock, flags);
++
++	return ret;
++}
++
++bool stripe_start_dfr(struct md_rdev *rdev, struct stripe_head *sh)
++{
++	struct md_degradation_free_recover *dfr = rdev->mddev->dfr;
++	bool can_dfr;
++
++	if (!dfr || !test_bit(DFR_F_ENABLED, &dfr->flags) ||
++	    rdev->mddev->reshape_position != MaxSector)
++		return false;
++
++	can_dfr = md_rdev_can_dfr(rdev);
++	if (!can_dfr)
++		return false;
++
++	if (test_bit(STRIPE_SYNC_REQUESTED, &sh->state) ||
++	    test_bit(STRIPE_SYNCING, &sh->state)) {
++		/* sync io is not replayed, it just waits for the disk */
++		md_rdev_start_dfr(rdev);
++		return can_dfr;
++	}
++
++	if (test_bit(STRIPE_DFR, &sh->state)) {
++		WARN_ON(!test_bit(DFR_F_PLUG, &dfr->flags));
++		md_rdev_start_dfr(rdev);
++		return can_dfr;
++	}
++
++	if (!md_rdev_start_dfr(rdev))
++		return false;
++
++	if (!test_and_set_bit(STRIPE_DFR, &sh->state))
++		atomic_inc(&dfr->pending);
++	return can_dfr;
++}
++
++static ssize_t start_dfr_by_slot_store(struct mddev *mddev, const char *buf,
++				       size_t len)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++	struct md_rdev *rdev;
++	unsigned int slot = 0;
++	int err;
++
++	if (!dfr || !test_bit(DFR_F_ENABLED, &dfr->flags))
++		return -EINVAL;
++	if (kstrtouint(buf, 0, &slot))
++		return -EINVAL;
++
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	if (test_bit(MD_DELETED, &mddev->flags)) {
++		mddev_unlock(mddev);
++		return -ENODEV;
++	}
++
++	rdev_for_each(rdev, mddev)
++		if (rdev->desc_nr == slot)
++			break;
++	if (&rdev->same_set == &mddev->disks) {
++		mddev_unlock(mddev);
++		return -ENODEV;
++	}
++
++	err = md_start_dfr_rdev(rdev, NULL);
++	mddev_unlock(mddev);
++	return err ? err : len;
++}
++
++/*
++ * The disk is answering again, or its part of the superblock write finished.
++ * If no other disk is offline, let the held io go.
++ */
++void md_stop_dfr(struct md_rdev *rdev)
++{
++	struct mddev *mddev = rdev->mddev;
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++	struct md_rdev *tmp;
++	unsigned long flags;
++
++	if (!dfr)
++		return;
++	if (!test_bit(DFR_F_PLUG, &dfr->flags) &&
++	    !test_bit(DFR_F_WAITED, &dfr->flags))
++		return;
++
++	if (test_and_clear_bit(Offline, &rdev->flags)) {
++		clear_bit(WriteErrorSeen, &rdev->flags);
++		clear_bit(WantReplacement, &rdev->flags);
++		clear_bit(MD_RECOVERY_NEEDED, &mddev->recovery);
++	}
++
++	if (!mddev->dfr || !test_bit(DFR_F_PLUG, &mddev->dfr->flags))
++		return;
++
++	spin_lock_irqsave(&dfr->lock, flags);
++	if (mddev->dfr && test_bit(DFR_F_PLUG, &mddev->dfr->flags)) {
++		rcu_read_lock();
++		rdev_for_each_rcu(tmp, mddev) {
++			if (tmp != rdev && test_bit(Offline, &tmp->flags) &&
++			    !test_bit(Faulty, &tmp->flags) &&
++			    !test_bit(MD_BROKEN, &mddev->flags) &&
++			    tmp->raid_disk >= 0) {
++				/* another disk is still offline */
++				rcu_read_unlock();
++				goto unlock;
++			}
++		}
++		rcu_read_unlock();
++
++		if (!work_pending(&dfr->dfr_unplug_work))
++			queue_work(dfr_wq, &dfr->dfr_unplug_work);
++	}
++unlock:
++	spin_unlock_irqrestore(&dfr->lock, flags);
++}
++
++/* The clone @bio of an io on an offline disk is done. Return true if the orig bio is held. */
++bool md_dfr_end_clone_io(struct md_io_clone *md_io_clone, struct bio *bio)
++{
++	struct mddev *mddev = md_io_clone->mddev;
++	struct md_rdev *rdev = md_io_clone->rdev;
++
++	if (!md_level_no_redundancy(mddev))
++		return md_dfr_plug_bio(mddev->dfr, bio);
++
++	/* raid0 and linear have no personality code that starts the dfr */
++	if (!rdev)
++		return false;
++
++	if (!bio->bi_status) {
++		md_stop_dfr(rdev);
++		return false;
++	}
++
++	if (md_start_dfr_rdev(rdev, bio)) {
++		if (!disk_live(rdev->bdev->bd_disk))
++			md_error(mddev, rdev);
++		return false;
++	}
++
++	return md_dfr_plug_bio(mddev->dfr, bio);
++}
++
++void md_dfr_super_start(struct mddev *mddev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	if (dfr)
++		atomic_inc(&dfr->pending);
++}
++
++void md_dfr_super_end(struct mddev *mddev, struct md_rdev *rdev, bool failed)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	if (!dfr)
++		return;
++
++	if (!failed)
++		md_stop_dfr(rdev);
++
++	if (atomic_dec_and_test(&dfr->pending))
++		wake_up(&dfr->unplug_wait);
++}
++
++/*
++ * @devt is a disk (or partition) that appeared after the member disk of
++ * slot @slot went away. If it holds the superblock of that slot, take it
++ * over as the new backing device of the rdev.
++ */
++static bool md_dfr_readd_disk(struct mddev *mddev, dev_t devt, int slot)
++{
++	struct md_rdev new = {};
++	struct md_rdev *old, *rdev;
++	bool ret = false;
++	char name[32];
++	int err;
++
++	if (md_rdev_init(&new))
++		return false;
++
++	if (mutex_lock_interruptible(&mddev->reconfig_mutex))
++		goto clear;
++	if (test_bit(MD_DELETED, &mddev->flags)) {
++		mutex_unlock(&mddev->reconfig_mutex);
++		goto clear;
++	}
++
++	rcu_read_lock();
++	old = md_find_rdev_nr_rcu(mddev, slot);
++	if (!old || !old->bdev || disk_live(old->bdev->bd_disk) ||
++	    !md_rdev_in_dfr(mddev, old)) {
++		rcu_read_unlock();
++		mddev_unlock(mddev);
++		goto clear;
++	}
++
++	rdev_for_each_rcu(rdev, mddev)
++		if (rdev != old && rdev->bdev && rdev->bdev->bd_dev == devt) {
++			rcu_read_unlock();
++			goto out_unlock;
++		}
++	rcu_read_unlock();
++
++	rdev = list_first_entry_or_null(&mddev->disks, struct md_rdev, same_set);
++	if (!rdev)
++		goto out_unlock;
++
++	if (md_open_candidate(&new, devt, old, mddev->major_version,
++			      mddev->minor_version, rdev, true))
++		goto out_unlock;
++	if (validate_rdev_super(mddev, &new))
++		goto out_unlock;
++	if (new.raid_disk != old->raid_disk || new.desc_nr != slot)
++		goto out_unlock;
++
++	mddev_unlock(mddev);
++	if (mddev_suspend(mddev, true))
++		goto clear;
++	if (mutex_lock_interruptible(&mddev->reconfig_mutex)) {
++		mddev_resume(mddev);
++		goto clear;
++	}
++	if (test_bit(MD_DELETED, &mddev->flags)) {
++		mutex_unlock(&mddev->reconfig_mutex);
++		mddev_resume(mddev);
++		goto clear;
++	}
++
++	/* everything may have changed, check again */
++	rcu_read_lock();
++	old = md_find_rdev_nr_rcu(mddev, slot);
++	if (!old || !old->bdev || disk_live(old->bdev->bd_disk) ||
++	    !md_rdev_in_dfr(mddev, old)) {
++		rcu_read_unlock();
++		goto out_resume;
++	}
++
++	rdev_for_each_rcu(rdev, mddev)
++		if (rdev != old && rdev->bdev &&
++		    rdev->bdev->bd_dev == new.bdev->bd_dev) {
++			rcu_read_unlock();
++			goto out_resume;
++		}
++	rcu_read_unlock();
++
++	snprintf(name, sizeof(name), "dev-%pg", new.bdev);
++	strreplace(name, '/', '!');
++	err = kobject_rename(&old->kobj, name);
++	if (err) {
++		pr_warn("md: %s: DFR readd kobject_rename to %s failed, err=%d\n",
++			mdname(mddev), name, err);
++		goto out_resume;
++	}
++
++	bd_unlink_disk_holder(old->bdev, mddev->gendisk);
++	sysfs_remove_link(&old->kobj, "block");
++
++	swap(old->bdev_file, new.bdev_file);
++	swap(old->bdev, new.bdev);
++	swap(old->sb_page, new.sb_page);
++
++	err = sysfs_create_link(&old->kobj, bdev_kobj(old->bdev), "block");
++	if (err)
++		pr_warn("md: failed to create block link for %s\n",
++			mdname(mddev));
++	err = bd_link_disk_holder(old->bdev, mddev->gendisk);
++	if (err)
++		pr_warn("md: failed to create holder link for %s\n",
++			mdname(mddev));
++	ret = true;
++
++out_resume:
++	mddev_unlock(mddev);
++	mddev_resume(mddev);
++	goto clear;
++
++out_unlock:
++	mddev_unlock(mddev);
++clear:
++	if (new.bdev_file)
++		bdev_fput(new.bdev_file);
++	md_rdev_clear(&new);
++	return ret;
++}
++
++/* Try the partitions of @disk, return true if one of them was taken over. */
++static bool md_dfr_probe_parts(struct mddev *mddev, struct gendisk *disk,
++			       int slot)
++{
++	struct block_device *part;
++	unsigned long idx = 1;
++	dev_t devt;
++
++	rcu_read_lock();
++	part = xa_find(&disk->part_tbl, &idx, ULONG_MAX, XA_PRESENT);
++	while (part) {
++		if (md_level_no_redundancy(mddev) ||
++		    bdev_nr_sectors(part) >= mddev->dev_sectors) {
++			devt = part->bd_dev;
++			rcu_read_unlock();
++			if (md_dfr_readd_disk(mddev, devt, slot))
++				return true;
++			rcu_read_lock();
++		}
++		part = xa_find_after(&disk->part_tbl, &idx, ULONG_MAX,
++				     XA_PRESENT);
++	}
++	rcu_read_unlock();
++	return false;
++}
++
++/* Look for the disk of @slot among the disks that exist now. */
++static void md_dfr_scan_disks(struct mddev *mddev, int slot)
++{
++	struct class_dev_iter iter;
++	struct device *dev;
++
++	class_dev_iter_init(&iter, &block_class, NULL, &disk_type);
++	while ((dev = class_dev_iter_next(&iter))) {
++		struct gendisk *disk = dev_to_disk(dev);
++		unsigned long idx = 0;
++		bool has_part;
++
++		if (disk == mddev->gendisk || (disk->flags & GENHD_FL_HIDDEN))
++			continue;
++		if (!md_level_no_redundancy(mddev) &&
++		    bdev_nr_sectors(disk->part0) < mddev->dev_sectors)
++			continue;
++
++		rcu_read_lock();
++		has_part = xa_find_after(&disk->part_tbl, &idx, ULONG_MAX,
++					 XA_PRESENT);
++		rcu_read_unlock();
++		if (has_part) {
++			if (md_dfr_probe_parts(mddev, disk, slot))
++				break;
++			continue;
++		}
++
++		if (md_dfr_readd_disk(mddev, MKDEV(disk->major, disk->first_minor),
++				      slot))
++			break;
++	}
++	class_dev_iter_exit(&iter);
++}
++
++/*
++ * Probe thread: check that the offline disks are back. A disk that answers
++ * a read is online again; a disk that is gone for good may reappear as
++ * another device, look for the slot's superblock on new disks.
++ */
++static void md_dfr_probe(struct md_thread *thread)
++{
++	struct mddev *mddev = thread->mddev;
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++	struct md_rdev *rdev;
++	bool idle = true;
++	struct page *page;
++	int slot;
++
++	if (!dfr || !test_bit(DFR_F_PLUG, &dfr->flags) ||
++	    test_bit(MD_DELETED, &mddev->flags))
++		goto done;
++
++	if (!mutex_trylock(&mddev->reconfig_mutex))
++		goto retry;
++	if (test_bit(MD_DELETED, &mddev->flags)) {
++		mutex_unlock(&mddev->reconfig_mutex);
++		goto retry;
++	}
++
++	rdev_for_each(rdev, mddev) {
++		if (!mddev->dfr || !test_bit(DFR_F_PLUG, &mddev->dfr->flags))
++			continue;
++		if (!test_bit(Offline, &rdev->flags))
++			continue;
++
++		if (!disk_live(rdev->bdev->bd_disk)) {
++			slot = rdev->desc_nr;
++			mddev_unlock(mddev);
++			if (slot >= 0)
++				md_dfr_scan_disks(mddev, slot);
++			goto check;
++		}
++
++		page = alloc_page(GFP_KERNEL);
++		if (!page)
++			continue;
++		if (sync_page_io(rdev, 0, PAGE_SIZE, page, REQ_OP_READ, true))
++			md_stop_dfr(rdev);
++		put_page(page);
++		idle = false;
++	}
++	mddev_unlock(mddev);
++	if (idle)
++		goto done;
++check:
++	dfr = mddev->dfr;
++	if (dfr && test_bit(DFR_F_PLUG, &dfr->flags) &&
++	    !test_bit(MD_DELETED, &mddev->flags))
++		goto retry;
++done:
++	thread->timeout = MAX_SCHEDULE_TIMEOUT;
++	return;
++retry:
++	thread->timeout = 13;
++}
++
++void md_stop_dfr_probe(struct mddev *mddev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	if (!dfr)
++		return;
++
++	flush_work(&dfr->dfr_wait_work);
++	timer_delete_sync(&dfr->dfr_timer);
++	md_unregister_thread(mddev, &dfr->probe);
++}
++
++void md_free_dfr(struct mddev *mddev)
++{
++	struct md_degradation_free_recover *dfr = mddev->dfr;
++
++	if (!dfr)
++		return;
++
++	clear_bit(DFR_F_ENABLED, &dfr->flags);
++	flush_work(&dfr->dfr_wait_work);
++	timer_delete_sync(&dfr->dfr_timer);
++	flush_work(&dfr->dfr_unplug_work);
++	WARN_ON(dfr->dfr_bios.head);
++	WARN_ON(work_pending(&dfr->dfr_unplug_work));
++	WARN_ON(work_pending(&dfr->dfr_wait_work));
++	WARN_ON(atomic_read(&dfr->pending));
++	WARN_ON(dfr->probe);
++	kfree(dfr);
++	mddev->dfr = NULL;
++}
++
++int md_dfr_init(void)
++{
++	dfr_wq = alloc_workqueue("md_dfr_wq", WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
++	if (!dfr_wq)
++		return -ENOMEM;
++
++	dfr_wait_wq = alloc_workqueue("md_dfr_wait_wq", WQ_UNBOUND, 2);
++	if (!dfr_wait_wq) {
++		destroy_workqueue(dfr_wq);
++		dfr_wq = NULL;
++		return -ENOMEM;
++	}
++	return 0;
++}
++
++void md_dfr_exit(void)
++{
++	destroy_workqueue(dfr_wq);
++	dfr_wq = NULL;
++	destroy_workqueue(dfr_wait_wq);
++	dfr_wait_wq = NULL;
++}
++
++static struct md_sysfs_entry dfr_stat = __ATTR_RO(dfr_stat);
++static struct md_sysfs_entry dfr_enable =
++	__ATTR(dfr_enable, 0644, dfr_enable_show, dfr_enable_store);
++static struct md_sysfs_entry dfr_timeout =
++	__ATTR(dfr_timeout, 0644, dfr_timeout_show, dfr_timeout_store);
++static struct md_sysfs_entry start_dfr_by_slot =
++	__ATTR(start_dfr_by_slot, 0200, NULL, start_dfr_by_slot_store);
++
++static struct attribute *md_dfr_attrs[] = {
++	&dfr_stat.attr,
++	&dfr_enable.attr,
++	&dfr_timeout.attr,
++	&start_dfr_by_slot.attr,
++	NULL,
++};
++
++struct attribute_group md_dfr_group = {
++	.name = "dfr",
++	.attrs = md_dfr_attrs,
++};
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index e8ed4fd54..d500c8ece 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -1230,6 +1230,7 @@ void mddev_destroy(struct mddev *mddev)
+ 	bioset_exit(&mddev->bio_set);
+ 	bioset_exit(&mddev->sync_set);
+ 	bioset_exit(&mddev->io_clone_set);
++	md_free_dfr(mddev);
+ 	percpu_ref_exit(&mddev->active_io);
+ 	percpu_ref_exit(&mddev->writes_pending);
+ }
+@@ -1510,9 +1511,12 @@ static void super_written(struct bio *bio)
+ 	struct mddev *mddev = rdev->mddev;
+ 
+ 	if (bio->bi_status) {
+-		pr_err("md: %s gets error=%d\n", __func__,
+-		       blk_status_to_errno(bio->bi_status));
+-		md_error(mddev, rdev);
++		/* fnnas: dfr holds the superblock write for an offline disk */
++		if (!md_start_dfr(rdev, NULL)) {
++			pr_err("md: %s gets error=%d\n", __func__,
++			       blk_status_to_errno(bio->bi_status));
++			md_error(mddev, rdev);
++		}
+ 		if (!test_bit(Faulty, &rdev->flags)
+ 		    && (bio->bi_opf & MD_FAILFAST)) {
+ 			set_bit(MD_SB_NEED_REWRITE, &mddev->sb_flags);
+@@ -1521,6 +1525,7 @@ static void super_written(struct bio *bio)
+ 	} else
+ 		clear_bit(LastDev, &rdev->flags);
+ 
++	md_dfr_super_end(mddev, rdev, bio->bi_status != 0);
+ 	bio_put(bio);
+ 
+ 	rdev_dec_pending(rdev, mddev);
+@@ -1569,6 +1574,7 @@ void md_write_metadata(struct mddev *mddev, struct md_rdev *rdev,
+ 	__bio_add_page(bio, page, size, offset);
+ 	bio->bi_private = rdev;
+ 	bio->bi_end_io = super_written;
++	md_dfr_super_start(mddev);
+ 
+ 	if (test_bit(MD_FAILFAST_SUPPORTED, &mddev->flags) &&
+ 	    test_bit(FailFast, &rdev->flags) &&
+@@ -3248,7 +3254,8 @@ void md_update_sb(struct mddev *mddev, int force_change)
+ 	int any_badblocks_changed = 0;
+ 	int ret = -1;
+ 
+-	if (!md_is_rdwr(mddev)) {
++	/* fnnas: an offline disk holds the superblock write, retry later */
++	if (!md_is_rdwr(mddev) || md_dfr_started(mddev)) {
+ 		if (force_change)
+ 			set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
+ 		return;
+@@ -3374,7 +3381,7 @@ void md_update_sb(struct mddev *mddev, int force_change)
+ 
+ 	mddev_add_trace_msg(mddev, "md md_update_sb");
+ rewrite:
+-	if (md_bitmap_enabled(mddev, false))
++	if (!md_dfr_started(mddev) && md_bitmap_enabled(mddev, false))
+ 		mddev->bitmap_ops->update_sb(mddev->bitmap);
+ 	rdev_for_each(rdev, mddev) {
+ 		if (rdev->sb_loaded != 1)
+@@ -7743,6 +7750,7 @@ static void mddev_detach(struct mddev *mddev)
+ 		mddev->pers->quiesce(mddev, 1);
+ 		mddev->pers->quiesce(mddev, 0);
+ 	}
++	md_stop_dfr_probe(mddev);
+ 	md_unregister_thread(mddev, &mddev->thread);
+ 
+ 	/* the unplug fn references 'conf' */
+@@ -7840,6 +7848,7 @@ static int do_md_stop(struct mddev *mddev, int mode)
+ 	}
+ 
+ 	stop_sync_thread(mddev, true);
++	md_stop_dfr_probe(mddev);
+ 
+ 	if (mddev->sysfs_active ||
+ 	    test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
+@@ -10597,13 +10606,16 @@ void md_do_sync(struct md_thread *thread)
+ 			/* time to update curr_resync_completed */
+ 			wait_event(mddev->recovery_wait,
+ 				   atomic_read(&mddev->recovery_active) == 0);
+-			mddev->curr_resync_completed = j;
+-			if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
+-			    j > mddev->resync_offset)
+-				mddev->resync_offset = j;
++			/* fnnas: dfr took over the sync, it owns the progress */
++			if (!md_dfr_test_sync_takeover(mddev)) {
++				mddev->curr_resync_completed = j;
++				if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
++				    j > mddev->resync_offset)
++					mddev->resync_offset = j;
++				sysfs_notify_dirent_safe(mddev->sysfs_completed);
++			}
+ 			update_time = jiffies;
+ 			set_bit(MD_SB_CHANGE_CLEAN, &mddev->sb_flags);
+-			sysfs_notify_dirent_safe(mddev->sysfs_completed);
+ 		}
+ 
+ 		while (j >= mddev->resync_max &&
+@@ -10717,6 +10729,11 @@ void md_do_sync(struct md_thread *thread)
+ 	blk_finish_plug(&plug);
+ 	wait_event(mddev->recovery_wait, !atomic_read(&mddev->recovery_active));
+ 
++	if (md_dfr_test_sync_takeover(mddev)) {
++		mddev->curr_resync = mddev->curr_resync_completed;
++		md_dfr_clear_sync_takeover(mddev);
++	}
++
+ 	if (!test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
+ 	    !test_bit(MD_RECOVERY_INTR, &mddev->recovery) &&
+ 	    mddev->curr_resync >= MD_RESYNC_ACTIVE) {
+@@ -11465,8 +11482,12 @@ static void md_geninit(void)
+ 
+ static int __init md_init(void)
+ {
+-	int ret = md_bitmap_init();
++	int ret = md_resync_hint_init();
++
++	if (ret)
++		return ret;
+ 
++	ret = md_bitmap_init();
+ 	if (ret)
+ 		return ret;
+ 
+@@ -11474,6 +11495,10 @@ static int __init md_init(void)
+ 	if (ret)
+ 		goto err_bitmap;
+ 
++	ret = md_dfr_init();
++	if (ret)
++		goto err_dfr;
++
+ 	ret = -ENOMEM;
+ 	md_misc_wq = alloc_workqueue("md_misc", WQ_PERCPU, 0);
+ 	if (!md_misc_wq)
+@@ -11499,6 +11524,8 @@ static int __init md_init(void)
+ err_md:
+ 	destroy_workqueue(md_misc_wq);
+ err_misc_wq:
++	md_dfr_exit();
++err_dfr:
+ 	md_llbitmap_exit();
+ err_bitmap:
+ 	md_bitmap_exit();
+@@ -11807,7 +11834,9 @@ static __exit void md_exit(void)
+ 	spin_unlock(&all_mddevs_lock);
+ 
+ 	destroy_workqueue(md_misc_wq);
++	md_dfr_exit();
+ 	md_bitmap_exit();
++	md_resync_hint_exit();
+ }
+ 
+ subsys_initcall(md_init);

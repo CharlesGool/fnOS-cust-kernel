@@ -1,0 +1,292 @@
+From 916c51c8e18de5b3a9ca73ea21d859593d17c358 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:47:59 +0000
+Subject: [PATCH 087/110] =?UTF-8?q?md/raid1:=20=E9=A3=9E=E7=89=9B=E7=A7=81?=
+ =?UTF-8?q?=E6=9C=89=E6=94=B9=E5=8A=A8(DFR=E3=80=81UNUSED=5FHINT=E3=80=81?=
+ =?UTF-8?q?=E5=BF=AB=E9=80=9F=20resync=E3=80=81map=5Fsector=20=E5=9B=9E?=
+ =?UTF-8?q?=E8=B0=83)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按反汇编还原:
+- DFR(degradation free recover):
+  raid1_end_read_request 读错且需处理时先 md_start_dfr(rdev, master_bio), 成功则置
+  R1BIO_DFR 并按"成功"结束; 读成功 md_stop_dfr(rdev)。
+  raid1_end_write_request 写错且盘未 Faulty 时同样 md_start_dfr, 成功置 R1BIO_DFR、
+  释放该分支 bio, 不置 WriteError; 写成功(含忽略的错误)先 md_stop_dfr(rdev)。
+  r1_bio_write_done 遇 R1BIO_DFR 直接 close_write + raid_end_bio_io(不进 raid1d)。
+  call_bio_endio: 带 R1BIO_DFR 的 master bio 也以 BLK_STS_IOERR 结束, 由 md.c 的
+  md_end_clone_io 扣住并重试。
+  put_sync_write_buf: DFR 运行中且同步写失败 → put_buf + md_dfr_set_sync_takeover +
+  md_sync_error + md_done_sync。fix_sync_read_error: DFR 运行中直接返回失败。
+  raid1-10.c exceed_read_errors: DFR 运行中读错超阈值也不踢盘。
+- raid1_run: mddev->allow_fast_resync = 1; 非 md-cluster 置 MD_FAST_DISCARD, cluster 清掉;
+  blk_queue_flag_set(QUEUE_FLAG_UNUSED_HINT, gendisk->queue)(无 mddev_is_dm 判断, 照飞牛)。
+- raid1_sync_request: 入参 *skipped == 1 与 sector_nr >= max_sector 同样走结束路径;
+  start_sync 判断之后调 md_speedup_resync() 跳过文件系统报告未用的区域;
+  无处可写时若是 llbitmap 只跳过 start_sync 给出的 sync_blocks(与 min_bad 取小)。
+- raid1d: MD_SB_CHANGE_PENDING 判断改成 md_sb_pending(mddev)。
+- 新个性回调 map_sector(rdev->data_offset + offset)、align_chunk_addr_virt_to_dev(恒等)。
+比对(komp): raid1.ko 除 raid1_make_request/raid1_sync_request(≈, 只差寄存器)和
+raid1_end_write_request(调用/立即数集合相同, 只差一处尾部合并)外全部一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid1-10.c |   3 +-
+ drivers/md/raid1.c    | 112 +++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 101 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/md/raid1-10.c b/drivers/md/raid1-10.c
+index 98458957d..e07637b7c 100644
+--- a/drivers/md/raid1-10.c
++++ b/drivers/md/raid1-10.c
+@@ -208,7 +208,8 @@ static inline bool exceed_read_errors(struct mddev *mddev, struct md_rdev *rdev)
+ 
+ 	check_decay_read_errors(mddev, rdev);
+ 	read_errors =  atomic_inc_return(&rdev->read_errors);
+-	if (read_errors > max_read_errors) {
++	/* fnnas: don't fail the device while degradation free recover runs */
++	if (read_errors > max_read_errors && !md_dfr_started(mddev)) {
+ 		pr_notice("md/"RAID_1_10_NAME":%s: %pg: Raid device exceeded read_error threshold [cur %d:max %d]\n",
+ 			  mdname(mddev), rdev->bdev, read_errors, max_read_errors);
+ 		pr_notice("md/"RAID_1_10_NAME":%s: %pg: Failing raid device\n",
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index c479db199..d44aa29bf 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -300,7 +300,12 @@ static void call_bio_endio(struct r1bio *r1_bio)
+ {
+ 	struct bio *bio = r1_bio->master_bio;
+ 
+-	if (!test_bit(R1BIO_Uptodate, &r1_bio->state))
++	/*
++	 * fnnas: io that started degradation free recover is failed upwards,
++	 * md_end_clone_io() holds and retries it.
++	 */
++	if (!test_bit(R1BIO_Uptodate, &r1_bio->state) ||
++	    test_bit(R1BIO_DFR, &r1_bio->state))
+ 		bio->bi_status = BLK_STS_IOERR;
+ 
+ 	bio_endio(bio);
+@@ -374,6 +379,7 @@ static void raid1_end_read_request(struct bio *bio)
+ 
+ 	if (uptodate) {
+ 		set_bit(R1BIO_Uptodate, &r1_bio->state);
++		md_stop_dfr(rdev);
+ 	} else if (test_bit(FailFast, &rdev->flags) &&
+ 		 test_bit(R1BIO_FailFast, &r1_bio->state)) {
+ 		/* This was a fail-fast read so we definitely
+@@ -381,6 +387,10 @@ static void raid1_end_read_request(struct bio *bio)
+ 		;
+ 	} else if (!raid1_should_handle_error(bio)) {
+ 		uptodate = 1;
++	} else if (md_start_dfr(rdev, r1_bio->master_bio)) {
++		/* fnnas: rdev entered degradation free recover */
++		set_bit(R1BIO_DFR, &r1_bio->state);
++		uptodate = 1;
+ 	} else {
+ 		/* If all other devices have failed, we want to return
+ 		 * the error upwards rather than fail the last device.
+@@ -433,7 +443,11 @@ static void r1_bio_write_done(struct r1bio *r1_bio)
+ 	if (!atomic_dec_and_test(&r1_bio->remaining))
+ 		return;
+ 
+-	if (test_bit(R1BIO_WriteError, &r1_bio->state))
++	if (test_bit(R1BIO_DFR, &r1_bio->state)) {
++		/* fnnas: failed upwards, md_end_clone_io() retries it */
++		close_write(r1_bio);
++		raid_end_bio_io(r1_bio);
++	} else if (test_bit(R1BIO_WriteError, &r1_bio->state))
+ 		reschedule_retry(r1_bio);
+ 	else {
+ 		close_write(r1_bio);
+@@ -477,9 +491,15 @@ static void raid1_end_write_request(struct bio *bio)
+ 		 * When the device is faulty, it is not necessary to
+ 		 * handle write error.
+ 		 */
+-		if (!test_bit(Faulty, &rdev->flags))
+-			set_bit(R1BIO_WriteError, &r1_bio->state);
+-		else {
++		if (!test_bit(Faulty, &rdev->flags)) {
++			if (md_start_dfr(rdev, r1_bio->master_bio)) {
++				/* fnnas: rdev entered degradation free recover */
++				set_bit(R1BIO_DFR, &r1_bio->state);
++				r1_bio->bios[mirror] = NULL;
++				to_put = bio;
++			} else
++				set_bit(R1BIO_WriteError, &r1_bio->state);
++		} else {
+ 			/* Finished with this branch */
+ 			r1_bio->bios[mirror] = NULL;
+ 			to_put = bio;
+@@ -495,6 +515,7 @@ static void raid1_end_write_request(struct bio *bio)
+ 		 * to user-side. So if something waits for IO, then it
+ 		 * will wait for the 'master' bio.
+ 		 */
++		md_stop_dfr(rdev);
+ 		r1_bio->bios[mirror] = NULL;
+ 		to_put = bio;
+ 		/*
+@@ -2028,8 +2049,17 @@ static void put_sync_write_buf(struct r1bio *r1_bio, int uptodate)
+ 		struct mddev *mddev = r1_bio->mddev;
+ 		int s = r1_bio->sectors;
+ 
+-		if (test_bit(R1BIO_MadeGood, &r1_bio->state) ||
+-		    test_bit(R1BIO_WriteError, &r1_bio->state))
++		if (md_dfr_started(mddev) && !uptodate) {
++			/*
++			 * fnnas: degradation free recover is running, the
++			 * sync write failed, let dfr take over the sync.
++			 */
++			put_buf(r1_bio);
++			md_dfr_set_sync_takeover(mddev);
++			md_sync_error(mddev);
++			md_done_sync(mddev, s);
++		} else if (test_bit(R1BIO_MadeGood, &r1_bio->state) ||
++			   test_bit(R1BIO_WriteError, &r1_bio->state))
+ 			reschedule_retry(r1_bio);
+ 		else {
+ 			put_buf(r1_bio);
+@@ -2103,6 +2133,10 @@ static int fix_sync_read_error(struct r1bio *r1_bio)
+ 	int idx = 0;
+ 	struct md_rdev *rdev;
+ 
++	/* fnnas: degradation free recover takes over the failed sync */
++	if (md_dfr_started(mddev))
++		return 0;
++
+ 	rdev = conf->mirrors[r1_bio->read_disk].rdev;
+ 	if (test_bit(FailFast, &rdev->flags)) {
+ 		/* Don't try recovering from here - just fail it
+@@ -2639,10 +2673,10 @@ static void raid1d(struct md_thread *thread)
+ 	md_check_recovery(mddev);
+ 
+ 	if (!list_empty_careful(&conf->bio_end_io_list) &&
+-	    !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags)) {
++	    !md_sb_pending(mddev)) {
+ 		LIST_HEAD(tmp);
+ 		spin_lock_irqsave(&conf->device_lock, flags);
+-		if (!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
++		if (!md_sb_pending(mddev))
+ 			list_splice_init(&conf->bio_end_io_list, &tmp);
+ 		spin_unlock_irqrestore(&conf->device_lock, flags);
+ 		while (!list_empty(&tmp)) {
+@@ -2756,7 +2790,8 @@ static sector_t raid1_sync_request(struct mddev *mddev, sector_t sector_nr,
+ 		if (init_resync(conf))
+ 			return 0;
+ 
+-	if (sector_nr >= max_sector) {
++	/* fnnas: *skipped == 1 on entry means md_do_sync() is finishing */
++	if (sector_nr >= max_sector || *skipped == 1) {
+ 		/* If we aborted, we need to abort the
+ 		 * sync on the 'current' bitmap chunk (there will
+ 		 * only be one in raid1 resync.
+@@ -2796,6 +2831,13 @@ static sector_t raid1_sync_request(struct mddev *mddev, sector_t sector_nr,
+ 		return sync_blocks;
+ 	}
+ 
++	/* fnnas: skip ranges the filesystem reported as unused */
++	nr_sectors = md_speedup_resync(mddev, sector_nr);
++	if (nr_sectors) {
++		*skipped = 1;
++		return nr_sectors;
++	}
++
+ 	/*
+ 	 * If there is non-resync activity waiting for a turn, then let it
+ 	 * though before starting on this new sync request.
+@@ -2943,9 +2985,18 @@ static sector_t raid1_sync_request(struct mddev *mddev, sector_t sector_nr,
+ 		 * drives must be failed - so we are finished
+ 		 */
+ 		sector_t rv;
+-		if (min_bad > 0)
+-			max_sector = sector_nr + min_bad;
+-		rv = max_sector - sector_nr;
++
++		if (md_bitmap_enabled(mddev, false) &&
++		    mddev->bitmap_id == ID_LLBITMAP) {
++			/* fnnas: llbitmap, only skip what start_sync covered */
++			rv = sync_blocks;
++			if (min_bad > 0)
++				rv = min_t(sector_t, rv, min_bad);
++		} else {
++			if (min_bad > 0)
++				max_sector = sector_nr + min_bad;
++			rv = max_sector - sector_nr;
++		}
+ 		*skipped = 1;
+ 		put_buf(r1_bio);
+ 		return rv;
+@@ -3248,6 +3299,9 @@ static int raid1_run(struct mddev *mddev)
+ 		mdname(mddev), mddev->raid_disks - mddev->degraded,
+ 		mddev->raid_disks);
+ 
++	/* fnnas: raid1 can skip unused (never written) areas on resync */
++	mddev->allow_fast_resync = 1;
++
+ 	/*
+ 	 * Ok, everything is just fine now
+ 	 */
+@@ -3255,8 +3309,15 @@ static int raid1_run(struct mddev *mddev)
+ 	rcu_assign_pointer(conf->thread, NULL);
+ 	mddev->private = conf;
+ 	set_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
++	/* fnnas: fast discard is not supported by md-cluster */
++	if (mddev_is_clustered(mddev))
++		clear_bit(MD_FAST_DISCARD, &mddev->flags);
++	else
++		set_bit(MD_FAST_DISCARD, &mddev->flags);
+ 
+ 	md_set_array_sectors(mddev, raid1_size(mddev, 0, 0));
++	/* fnnas: accept REQ_OP_UNUSED_HINT from filesystems */
++	blk_queue_flag_set(QUEUE_FLAG_UNUSED_HINT, mddev->gendisk->queue);
+ 
+ 	ret = md_integrity_register(mddev);
+ 	if (ret)
+@@ -3438,6 +3499,29 @@ static void *raid1_takeover(struct mddev *mddev)
+ 	return ERR_PTR(-EINVAL);
+ }
+ 
++/* fnnas: map an array sector to the sector on @rdev */
++static sector_t raid1_map_sector(struct mddev *mddev, struct md_rdev *rdev,
++				 sector_t offset)
++{
++	return rdev->data_offset + offset;
++}
++
++/* fnnas: raid1 has no chunks, array address equals device address */
++static void raid1_align_chunk_addr_virt_to_dev(struct mddev *mddev,
++					       sector_t virt_start,
++					       sector_t virt_end,
++					       sector_t *dev_start,
++					       sector_t *dev_end)
++{
++	if (!dev_start && !dev_end)
++		return;
++
++	if (dev_start)
++		*dev_start = virt_start;
++	if (dev_end)
++		*dev_end = virt_end;
++}
++
+ static struct md_personality raid1_personality =
+ {
+ 	.head = {
+@@ -3448,6 +3532,7 @@ static struct md_personality raid1_personality =
+ 	},
+ 
+ 	.make_request	= raid1_make_request,
++	.map_sector	= raid1_map_sector,
+ 	.run		= raid1_run,
+ 	.free		= raid1_free,
+ 	.status		= raid1_status,
+@@ -3461,6 +3546,7 @@ static struct md_personality raid1_personality =
+ 	.check_reshape	= raid1_reshape,
+ 	.quiesce	= raid1_quiesce,
+ 	.takeover	= raid1_takeover,
++	.align_chunk_addr_virt_to_dev = raid1_align_chunk_addr_virt_to_dev,
+ };
+ 
+ static int __init raid1_init(void)

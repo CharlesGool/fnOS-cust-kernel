@@ -1,0 +1,121 @@
+From 35c61813dbb37f4c9e1bca4c30d274c5d6722059 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:28:31 +0700
+Subject: [PATCH 035/110] =?UTF-8?q?blkdev,=20ext4=20trace:=20unused=20hint?=
+ =?UTF-8?q?=20=E7=9A=84=E5=A3=B0=E6=98=8E=20(QUEUE=5FFLAG=5FUNUSED=5FHINT?=
+ =?UTF-8?q?=E3=80=81blkdev=5Fhint=5Funused=E3=80=81sb=5Fhint=5Funused?=
+ =?UTF-8?q?=E3=80=81ext4=5Funused=5Fhint=5Fblocks)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+第 7 步 ext4 的 FIHINTUNUSED / ext4_trim_fs(TRIM_SEND_HINT) 要用。
+内容逐字取自 hdr-private.patch 里 include/linux/blkdev.h 和
+include/trace/events/ext4.h 两段 (从飞牛 /usr/src 头文件得到),
+第 5 步 (md/block) 如果也打了 blkdev.h 这段, 合并时文本相同, 取一份即可。
+blkdev_hint_unused() 的实现在 block/ (第 5 步), 本树只有声明。
+另: block/blk-mq-debugfs.c 的 blk_queue_flag_name[] 补 QUEUE_FLAG_NAME(UNUSED_HINT)
+(多了一个 queue flag, 不补 BUILD_BUG_ON 编不过; 飞牛 vmlinux 里有 "UNUSED_HINT" 字符串)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ block/blk-mq-debugfs.c      |  1 +
+ include/linux/blkdev.h      | 16 ++++++++++++++++
+ include/trace/events/ext4.h | 24 ++++++++++++++++++++++++
+ 3 files changed, 41 insertions(+)
+
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index 553d93b88..d21ea08b2 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -97,6 +97,7 @@ static const char *const blk_queue_flag_name[] = {
+ 	QUEUE_FLAG_NAME(NO_ELV_SWITCH),
+ 	QUEUE_FLAG_NAME(QOS_ENABLED),
+ 	QUEUE_FLAG_NAME(BIO_ISSUE_TIME),
++	QUEUE_FLAG_NAME(UNUSED_HINT),
+ };
+ #undef QUEUE_FLAG_NAME
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 0299d6288..c2ea15988 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -662,6 +662,7 @@ enum {
+ 	QUEUE_FLAG_NO_ELV_SWITCH,	/* can't switch elevator any more */
+ 	QUEUE_FLAG_QOS_ENABLED,		/* qos is enabled */
+ 	QUEUE_FLAG_BIO_ISSUE_TIME,	/* record bio->issue_time_ns */
++	QUEUE_FLAG_UNUSED_HINT,		/* supports unused hint */
+ 	QUEUE_FLAG_MAX
+ };
+ 
+@@ -695,6 +696,7 @@ void blk_queue_flag_clear(unsigned int flag, struct request_queue *q);
+ #define blk_queue_pm_only(q)	atomic_read(&(q)->pm_only)
+ #define blk_queue_registered(q)	test_bit(QUEUE_FLAG_REGISTERED, &(q)->queue_flags)
+ #define blk_queue_sq_sched(q)	test_bit(QUEUE_FLAG_SQ_SCHED, &(q)->queue_flags)
++#define blk_queue_unused_hint(q) test_bit(QUEUE_FLAG_UNUSED_HINT, &(q)->queue_flags)
+ #define blk_queue_skip_tagset_quiesce(q) \
+ 	((q)->limits.features & BLK_FEAT_SKIP_TAGSET_QUIESCE)
+ #define blk_queue_disable_wbt(q)	\
+@@ -1246,6 +1248,9 @@ int __blkdev_issue_discard(struct block_device *bdev, sector_t sector,
+ int blkdev_issue_secure_erase(struct block_device *bdev, sector_t sector,
+ 		sector_t nr_sects, gfp_t gfp);
+ 
++extern int blkdev_hint_unused(struct block_device *bdev, sector_t sector,
++			      sector_t nr_sects, gfp_t gfp_mask);
++
+ #define BLKDEV_ZERO_NOUNMAP	(1 << 0)  /* do not free blocks */
+ #define BLKDEV_ZERO_NOFALLBACK	(1 << 1)  /* don't write explicit zeroes */
+ #define BLKDEV_ZERO_KILLABLE	(1 << 2)  /* interruptible by fatal signals */
+@@ -1277,6 +1282,17 @@ static inline int sb_issue_zeroout(struct super_block *sb, sector_t block,
+ 				    gfp_mask, 0);
+ }
+ 
++static inline int sb_hint_unused(struct super_block *sb, sector_t block,
++		sector_t nr_blocks, gfp_t gfp_mask)
++{
++	return blkdev_hint_unused(sb->s_bdev,
++				    block << (sb->s_blocksize_bits -
++					      SECTOR_SHIFT),
++				    nr_blocks << (sb->s_blocksize_bits -
++						  SECTOR_SHIFT),
++				    gfp_mask);
++}
++
+ static inline bool bdev_is_partition(struct block_device *bdev)
+ {
+ 	return bdev_partno(bdev) != 0;
+diff --git a/include/trace/events/ext4.h b/include/trace/events/ext4.h
+index a374e7ea7..7ff4bbef6 100644
+--- a/include/trace/events/ext4.h
++++ b/include/trace/events/ext4.h
+@@ -704,6 +704,30 @@ TRACE_EVENT(ext4_discard_blocks,
+ 		  __entry->blk, __entry->count)
+ );
+ 
++TRACE_EVENT(ext4_unused_hint_blocks,
++	TP_PROTO(struct super_block *sb, unsigned long long blk,
++			unsigned long long count),
++
++	TP_ARGS(sb, blk, count),
++
++	TP_STRUCT__entry(
++		__field(	dev_t,	dev			)
++		__field(	__u64,	blk			)
++		__field(	__u64,	count			)
++
++	),
++
++	TP_fast_assign(
++		__entry->dev	= sb->s_dev;
++		__entry->blk	= blk;
++		__entry->count	= count;
++	),
++
++	TP_printk("dev %d,%d blk %llu count %llu",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->blk, __entry->count)
++);
++
+ DECLARE_EVENT_CLASS(ext4__mb_new_pa,
+ 	TP_PROTO(struct ext4_allocation_context *ac,
+ 		 struct ext4_prealloc_space *pa),

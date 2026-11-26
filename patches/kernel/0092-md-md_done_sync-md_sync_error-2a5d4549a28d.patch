@@ -1,0 +1,105 @@
+From 2816338d7c897a39a8b33dbbc81b33cfc0023cd4 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:45:55 +0000
+Subject: [PATCH 092/110] =?UTF-8?q?md:=20=E6=8A=8A=20md=5Fdone=5Fsync=20?=
+ =?UTF-8?q?=E7=9A=84=E9=94=99=E8=AF=AF=E5=A4=84=E7=90=86=E6=8B=86=E6=88=90?=
+ =?UTF-8?q?=20md=5Fsync=5Ferror(=E4=B8=8A=E6=B8=B8=202a5d4549a28d)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+移植上游 "md: factor error handling out of md_done_sync into helper"。
+飞牛 raid456 的 handle_failed_sync 调用 md_sync_error, 需要这个接口。
+涉及 md.c/md.h/raid1.c/raid10.c(兄弟子任务可能也会移植同一补丁, 合并时
+取一份即可); raid1.c 一处 hunk 冲突手工处理。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.h    |  1 -
+ drivers/md/raid1.c |  6 +++---
+ drivers/md/raid5.c | 14 ++++++++------
+ 3 files changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 25ad097ae..b9ea0b123 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -1071,7 +1071,6 @@ struct md_rdev *md_find_rdev_nr_rcu(struct mddev *mddev, int nr);
+ struct md_rdev *md_find_rdev_rcu(struct mddev *mddev, dev_t dev);
+ 
+ /* md.c helpers used by raid456 (fnnas) */
+-extern void md_sync_error(struct mddev *mddev);
+ struct bio *mddev_bio_split_at_reshape_offset(struct mddev *mddev,
+ 					      struct bio *bio,
+ 					      unsigned int *max_sectors,
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index d44aa29bf..67dfa0a42 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -2043,7 +2043,7 @@ static void abort_sync_write(struct mddev *mddev, struct r1bio *r1_bio)
+ 	} while (sectors_to_go > 0);
+ }
+ 
+-static void put_sync_write_buf(struct r1bio *r1_bio, int uptodate)
++static void put_sync_write_buf(struct r1bio *r1_bio)
+ {
+ 	if (atomic_dec_and_test(&r1_bio->remaining)) {
+ 		struct mddev *mddev = r1_bio->mddev;
+@@ -2089,7 +2089,7 @@ static void end_sync_write(struct bio *bio)
+ 		set_bit(R1BIO_MadeGood, &r1_bio->state);
+ 	}
+ 
+-	put_sync_write_buf(r1_bio, uptodate);
++	put_sync_write_buf(r1_bio);
+ }
+ 
+ static int r1_sync_page_io(struct md_rdev *rdev, sector_t sector,
+@@ -2379,7 +2379,7 @@ static void sync_request_write(struct mddev *mddev, struct r1bio *r1_bio)
+ 		submit_bio_noacct(wbio);
+ 	}
+ 
+-	put_sync_write_buf(r1_bio, 1);
++	put_sync_write_buf(r1_bio);
+ }
+ 
+ /*
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 5e6c9ebe3..95dab1d27 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -3961,11 +3961,13 @@ handle_failed_sync(struct r5conf *conf, struct stripe_head *sh,
+ 						   RAID5_STRIPE_SECTORS(conf), 0))
+ 				abort = 1;
+ 		}
+-		if (abort)
+-			conf->recovery_disabled =
+-				conf->mddev->recovery_disabled;
+ 	}
+-	md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), !abort);
++	md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf));
++
++	if (abort) {
++		conf->recovery_disabled = conf->mddev->recovery_disabled;
++		md_sync_error(conf->mddev);
++	}
+ }
+ 
+ static int want_replace(struct stripe_head *sh, int disk_idx)
+@@ -5407,7 +5409,7 @@ static void handle_stripe(struct stripe_head *sh)
+ 	if ((s.syncing || s.replacing) && s.locked == 0 &&
+ 	    !test_bit(STRIPE_COMPUTE_RUN, &sh->state) &&
+ 	    test_bit(STRIPE_INSYNC, &sh->state)) {
+-		md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
++		md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf));
+ 		clear_bit(STRIPE_SYNCING, &sh->state);
+ 		if (test_and_clear_bit(R5_Overlap, &sh->dev[sh->pd_idx].flags))
+ 			wake_up_bit(&sh->dev[sh->pd_idx].flags, R5_Overlap);
+@@ -5474,7 +5476,7 @@ static void handle_stripe(struct stripe_head *sh)
+ 		clear_bit(STRIPE_EXPAND_READY, &sh->state);
+ 		atomic_dec(&conf->reshape_stripes);
+ 		wake_up(&conf->wait_for_reshape);
+-		md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf), 1);
++		md_done_sync(conf->mddev, RAID5_STRIPE_SECTORS(conf));
+ 	}
+ 
+ 	if (s.expanding && s.locked == 0 &&

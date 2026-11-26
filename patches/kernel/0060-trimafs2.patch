@@ -1,0 +1,92 @@
+From b99a40ba4525a15a09b6e3e0aa19a2d6e9f0cfdd Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:58:44 +0000
+Subject: [PATCH 060/110] =?UTF-8?q?trimafs2:=20=E6=8C=89=E9=A3=9E=E7=89=9B?=
+ =?UTF-8?q?=E4=BA=8C=E8=BF=9B=E5=88=B6=E4=BF=AE=E6=AD=A3=E5=87=A0=E5=A4=84?=
+ =?UTF-8?q?=E6=B5=81=E7=A8=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- drop_pinned_dentries 每轮重新加锁取第一个
+- read_iter/write_iter 先判断有无下层再判断长度为 0
+- branch_get_locked 不替调用者清 *upper_dentry
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/trimafs2/export.c | 2 +-
+ fs/trimafs2/file.c   | 8 ++++----
+ fs/trimafs2/super.c  | 7 ++++---
+ 3 files changed, 9 insertions(+), 8 deletions(-)
+
+diff --git a/fs/trimafs2/export.c b/fs/trimafs2/export.c
+index e19196a14..2d1d7410c 100644
+--- a/fs/trimafs2/export.c
++++ b/fs/trimafs2/export.c
+@@ -47,7 +47,7 @@ static struct trimafs2_branch *trimafs2_branch_get_locked(struct trimafs2_fs_inf
+ 		return NULL;
+ 
+ 	if (upper_dentry) {
+-		*upper_dentry = NULL;
++		/* *upper_dentry 由调用者置 NULL */
+ 		if (branch->upper_dentry) {
+ 			spin_lock(&branch->upper_dentry->d_lock);
+ 			*upper_dentry = dget_dlock(branch->upper_dentry);
+diff --git a/fs/trimafs2/file.c b/fs/trimafs2/file.c
+index e599d5d62..4ac45db40 100644
+--- a/fs/trimafs2/file.c
++++ b/fs/trimafs2/file.c
+@@ -297,10 +297,10 @@ static ssize_t trimafs2_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+ 	};
+ 	struct file *real;
+ 
+-	if (!iov_iter_count(iter))
+-		return 0;
+ 	if (!trimafs2_lower_file(file))
+ 		return generic_file_read_iter(iocb, iter);
++	if (!iov_iter_count(iter))
++		return 0;
+ 
+ 	real = trimafs2_real_file(file);
+ 	if (IS_ERR(real))
+@@ -408,10 +408,10 @@ static ssize_t trimafs2_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+ 	struct file *real;
+ 	ssize_t ret;
+ 
+-	if (!iov_iter_count(iter))
+-		return 0;
+ 	if (!trimafs2_lower_file(file))
+ 		return generic_file_write_iter(iocb, iter);
++	if (!iov_iter_count(iter))
++		return 0;
+ 
+ 	real = trimafs2_real_file(file);
+ 	if (IS_ERR(real))
+diff --git a/fs/trimafs2/super.c b/fs/trimafs2/super.c
+index fa031f68e..84ec3802b 100644
+--- a/fs/trimafs2/super.c
++++ b/fs/trimafs2/super.c
+@@ -648,11 +648,13 @@ void trimafs2_drop_pinned_dentries(struct super_block *sb)
+ {
+ 	struct trimafs2_fs_info *fsi = sb->s_fs_info;
+ 
+-	spin_lock(&fsi->pinned_lock);
+-	while (!list_empty(&fsi->pinned_dentries)) {
++	for (;;) {
+ 		struct trimafs2_dentry_info *di;
+ 		struct dentry *dentry;
+ 
++		spin_lock(&fsi->pinned_lock);
++		if (list_empty(&fsi->pinned_dentries))
++			break;
+ 		di = list_first_entry(&fsi->pinned_dentries, struct trimafs2_dentry_info,
+ 				      pinned_node);
+ 		dentry = di->dentry;
+@@ -660,7 +662,6 @@ void trimafs2_drop_pinned_dentries(struct super_block *sb)
+ 		di->pinned = false;
+ 		spin_unlock(&fsi->pinned_lock);
+ 		dput(dentry);
+-		spin_lock(&fsi->pinned_lock);
+ 	}
+ 	spin_unlock(&fsi->pinned_lock);
+ }

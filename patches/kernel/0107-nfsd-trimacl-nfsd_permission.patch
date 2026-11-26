@@ -1,0 +1,40 @@
+From 2a3fbcbecab01712773b11753bd3821ec53754bd Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 21:43:47 +0000
+Subject: [PATCH 107/110] =?UTF-8?q?nfsd:=20trimacl=20=E5=8D=B7=E4=B8=8A=20?=
+ =?UTF-8?q?nfsd=5Fpermission=20=E4=B9=9F=E6=A3=80=E6=9F=A5=E5=86=99/?=
+ =?UTF-8?q?=E6=89=A7=E8=A1=8C(=E5=AE=89=E5=85=A8=E4=BF=AE=E5=A4=8D)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题: nfsd_permission 的 trimacl 分支只要 acc 带 EXEC/WRITE/SATTR/TRUNC
+任一位就直接 return 0, 只检查纯读。nfsd 打开文件走 dentry_open, 不经
+may_open, 所以对已有文件的写/截断实际没人检查。
+
+修法: 去掉提前放行; 已算好的 mask(TRUNC 算 WRITE)非 0 时调
+trim_permission; mask 为 0(只有 SATTR 等)仍放行, 交给 notify_change,
+和非 trimacl 分支行为一致。owner override 与只读可执行文件的回退不变。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/nfsd/vfs.c | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 7e30d2147..ce1c0c837 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -2650,10 +2650,8 @@ nfsd_permission(struct svc_cred *cred, struct svc_export *exp,
+ 			mask |= MAY_WRITE;
+ 		if (acc & NFSD_MAY_READ)
+ 			mask |= MAY_READ;
+-		/* 写/执行/改属性/截断不在这里查, 交给 VFS 的 trimacl 钩子 */
+-		if (acc & (NFSD_MAY_EXEC | NFSD_MAY_WRITE | NFSD_MAY_SATTR | NFSD_MAY_TRUNC))
+-			return 0;
+-		err = trim_permission(&nop_mnt_idmap, dentry, mask);
++		/* mask 为 0(只有 SATTR 等)放行, 交给 notify_change; 其余都要查 */
++		err = mask ? trim_permission(&nop_mnt_idmap, dentry, mask) : 0;
+ 	} else {
+ 	// <--
+ 	if ((acc & NFSD_MAY_OWNER_OVERRIDE) &&

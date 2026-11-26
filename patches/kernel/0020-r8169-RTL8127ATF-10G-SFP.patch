@@ -1,0 +1,287 @@
+From 239fad6294afa3f2d928bc3f9e9b1e599b358d06 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:22:33 +0700
+Subject: [PATCH 020/110] =?UTF-8?q?r8169:=20=E7=A7=BB=E6=A4=8D=E4=B8=8A?=
+ =?UTF-8?q?=E6=B8=B8=20RTL8127ATF=2010G=20SFP=20=E6=A8=A1=E5=BC=8F?=
+ =?UTF-8?q?=E6=94=AF=E6=8C=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+RTL8127ATF (光口版 RTL8127) 在 SFP 模式下: MAC OCP 0xd006 低 8 位为 0x07
+时置 tp->sfp_mode, 读 PHYID2 时返回 PHY_ID_RTL_DUMMY_SFP 让 realtek PHY 驱动
+匹配到新加的 "Realtek SFP PHY Mode" 虚拟 PHY; init_phy 时初始化 SerDes
+(r8127_sfp_init_10g), down 时复位 SerDes; set_link_ksettings 在 SFP 模式下
+只接受固定速率。
+
+来源: 上游 Heiner Kallweit "r8169: add support for 10G SFP mode on
+RTL8127ATF" (2025-11 提出, 6.19-rc1 之后合入 7.0), r8169 部分原样取自
+src-7.3.6; 新增 include/net/phy/realtek_phy.h。
+realtek PHY 的 rtlgen_sfp_read_status 用的是早期版本写法
+rtlgen_read_vend2(phydev, RTL_VND2_PHYSR) (上游最终版改成
+phy_read(phydev, RTL_PHYSR), 飞牛二进制是前者)。
+
+比对: realtek.ko 新增 3 个 rtlgen_sfp_* 一致; r8169.ko 的
+r8127_sfp_init_10g / r8127_sfp_sds_phy_reset / r8168_phy_ocp_write 一致,
+r8168_phy_ocp_read / rtl8169_set_link_ksettings 只差结构体偏移
+(rtl8169_private 后面还要加 RSS 字段)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/realtek/r8169_main.c | 92 ++++++++++++++++++++++-
+ drivers/net/phy/realtek/realtek_main.c    | 54 +++++++++++++
+ include/net/phy/realtek_phy.h             |  7 ++
+ 3 files changed, 152 insertions(+), 1 deletion(-)
+ create mode 100644 include/net/phy/realtek_phy.h
+
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index 43a786ccf..400794e17 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -31,6 +31,7 @@
+ #include <linux/unaligned.h>
+ #include <net/ip6_checksum.h>
+ #include <net/netdev_queues.h>
++#include <net/phy/realtek_phy.h>
+ 
+ #include "r8169.h"
+ #include "r8169_firmware.h"
+@@ -729,6 +730,7 @@ struct rtl8169_private {
+ 	unsigned supports_gmii:1;
+ 	unsigned aspm_manageable:1;
+ 	unsigned dash_enabled:1;
++	bool sfp_mode:1;
+ 	dma_addr_t counters_phys_addr;
+ 	struct rtl8169_counters *counters;
+ 	struct rtl8169_tc_offsets tc_offset;
+@@ -1091,6 +1093,10 @@ static int r8168_phy_ocp_read(struct rtl8169_private *tp, u32 reg)
+ 	if (rtl_ocp_reg_failure(reg))
+ 		return 0;
+ 
++	/* Return dummy MII_PHYSID2 in SFP mode to match SFP PHY driver */
++	if (tp->sfp_mode && reg == (OCP_STD_PHY_BASE + 2 * MII_PHYSID2))
++		return PHY_ID_RTL_DUMMY_SFP & 0xffff;
++
+ 	RTL_W32(tp, GPHY_OCP, reg << 15);
+ 
+ 	return rtl_loop_wait_high(tp, &rtl_ocp_gphy_cond, 25, 10) ?
+@@ -1148,6 +1154,46 @@ static void r8168_mac_ocp_modify(struct rtl8169_private *tp, u32 reg, u16 mask,
+ 	raw_spin_unlock_irqrestore(&tp->mac_ocp_lock, flags);
+ }
+ 
++static void r8127_sfp_sds_phy_reset(struct rtl8169_private *tp)
++{
++	RTL_W8(tp, 0x2350, RTL_R8(tp, 0x2350) & ~BIT(0));
++	udelay(1);
++
++	RTL_W16(tp, 0x233a, 0x801f);
++	RTL_W8(tp, 0x2350, RTL_R8(tp, 0x2350) | BIT(0));
++	usleep_range(10, 20);
++}
++
++static void r8127_sfp_init_10g(struct rtl8169_private *tp)
++{
++	int val;
++
++	r8127_sfp_sds_phy_reset(tp);
++
++	RTL_W16(tp, 0x233a, 0x801a);
++	RTL_W16(tp, 0x233e, (RTL_R16(tp, 0x233e) & ~0x3003) | 0x1000);
++
++	r8168_phy_ocp_write(tp, 0xc40a, 0x0000);
++	r8168_phy_ocp_write(tp, 0xc466, 0x0003);
++	r8168_phy_ocp_write(tp, 0xc808, 0x0000);
++	r8168_phy_ocp_write(tp, 0xc80a, 0x0000);
++
++	val = r8168_phy_ocp_read(tp, 0xc804);
++	r8168_phy_ocp_write(tp, 0xc804, (val & ~0x000f) | 0x000c);
++}
++
++static void rtl_sfp_init(struct rtl8169_private *tp)
++{
++	if (tp->mac_version == RTL_GIGA_MAC_VER_80)
++		r8127_sfp_init_10g(tp);
++}
++
++static void rtl_sfp_reset(struct rtl8169_private *tp)
++{
++	if (tp->mac_version == RTL_GIGA_MAC_VER_80)
++		r8127_sfp_sds_phy_reset(tp);
++}
++
+ /* Work around a hw issue with RTL8168g PHY, the quirk disables
+  * PHY MCU interrupts before PHY power-down.
+  */
+@@ -2302,6 +2348,36 @@ static void rtl8169_get_eth_ctrl_stats(struct net_device *dev,
+ 		le32_to_cpu(tp->counters->rx_unknown_opcode);
+ }
+ 
++static int rtl8169_set_link_ksettings(struct net_device *ndev,
++				      const struct ethtool_link_ksettings *cmd)
++{
++	struct rtl8169_private *tp = netdev_priv(ndev);
++	struct phy_device *phydev = tp->phydev;
++	int duplex = cmd->base.duplex;
++	int speed = cmd->base.speed;
++
++	if (!tp->sfp_mode)
++		return phy_ethtool_ksettings_set(phydev, cmd);
++
++	if (cmd->base.autoneg != AUTONEG_DISABLE)
++		return -EINVAL;
++
++	if (!phy_check_valid(speed, duplex, phydev->supported))
++		return -EINVAL;
++
++	mutex_lock(&phydev->lock);
++
++	phydev->autoneg = AUTONEG_DISABLE;
++	phydev->speed = speed;
++	phydev->duplex = duplex;
++
++	rtl_sfp_init(tp);
++
++	mutex_unlock(&phydev->lock);
++
++	return 0;
++}
++
+ static const struct ethtool_ops rtl8169_ethtool_ops = {
+ 	.supported_coalesce_params = ETHTOOL_COALESCE_USECS |
+ 				     ETHTOOL_COALESCE_MAX_FRAMES,
+@@ -2321,7 +2397,7 @@ static const struct ethtool_ops rtl8169_ethtool_ops = {
+ 	.get_eee		= rtl8169_get_eee,
+ 	.set_eee		= rtl8169_set_eee,
+ 	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
+-	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
++	.set_link_ksettings	= rtl8169_set_link_ksettings,
+ 	.get_ringparam		= rtl8169_get_ringparam,
+ 	.get_pause_stats	= rtl8169_get_pause_stats,
+ 	.get_pauseparam		= rtl8169_get_pauseparam,
+@@ -2449,6 +2525,9 @@ static void rtl8169_init_phy(struct rtl8169_private *tp)
+ 	    tp->pci_dev->subsystem_device == 0xe000)
+ 		phy_write_paged(tp->phydev, 0x0001, 0x10, 0xf01b);
+ 
++	if (tp->sfp_mode)
++		rtl_sfp_init(tp);
++
+ 	/* We may have called phy_speed_down before */
+ 	phy_speed_up(tp->phydev);
+ 
+@@ -4795,6 +4874,10 @@ static void rtl8169_down(struct rtl8169_private *tp)
+ 
+ 	phy_stop(tp->phydev);
+ 
++	/* Reset SerDes PHY to bring down fiber link */
++	if (tp->sfp_mode)
++		rtl_sfp_reset(tp);
++
+ 	rtl8169_update_counters(tp);
+ 
+ 	pci_clear_master(tp->pci_dev);
+@@ -5462,6 +5545,13 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	}
+ 	tp->aspm_manageable = !rc;
+ 
++	if (rtl_is_8125(tp)) {
++		u16 data = r8168_mac_ocp_read(tp, 0xd006);
++
++		if ((data & 0xff) == 0x07)
++			tp->sfp_mode = true;
++	}
++
+ 	tp->dash_type = rtl_get_dash_type(tp);
+ 	tp->dash_enabled = rtl_dash_is_enabled(tp);
+ 
+diff --git a/drivers/net/phy/realtek/realtek_main.c b/drivers/net/phy/realtek/realtek_main.c
+index cc8606dd2..f1b4ca867 100644
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -16,6 +16,7 @@
+ #include <linux/delay.h>
+ #include <linux/clk.h>
+ #include <linux/string_choices.h>
++#include <net/phy/realtek_phy.h>
+ 
+ #include "realtek.h"
+ 
+@@ -1738,6 +1739,45 @@ static irqreturn_t rtl9000a_handle_interrupt(struct phy_device *phydev)
+ 	return IRQ_HANDLED;
+ }
+ 
++static int rtlgen_sfp_get_features(struct phy_device *phydev)
++{
++	linkmode_set_bit(ETHTOOL_LINK_MODE_10000baseT_Full_BIT,
++			 phydev->supported);
++
++	/* set default mode */
++	phydev->speed = SPEED_10000;
++	phydev->duplex = DUPLEX_FULL;
++
++	phydev->port = PORT_FIBRE;
++
++	return 0;
++}
++
++static int rtlgen_sfp_read_status(struct phy_device *phydev)
++{
++	int val, err;
++
++	err = genphy_update_link(phydev);
++	if (err)
++		return err;
++
++	if (!phydev->link)
++		return 0;
++
++	val = rtlgen_read_vend2(phydev, RTL_VND2_PHYSR);
++	if (val < 0)
++		return val;
++
++	rtlgen_decode_physr(phydev, val);
++
++	return 0;
++}
++
++static int rtlgen_sfp_config_aneg(struct phy_device *phydev)
++{
++	return 0;
++}
++
+ static struct phy_driver realtek_drvs[] = {
+ 	{
+ 		PHY_ID_MATCH_EXACT(0x00008201),
+@@ -1969,6 +2009,20 @@ static struct phy_driver realtek_drvs[] = {
+ 		.write_page     = rtl821x_write_page,
+ 		.read_mmd	= rtl822x_read_mmd,
+ 		.write_mmd	= rtl822x_write_mmd,
++	}, {
++		PHY_ID_MATCH_EXACT(PHY_ID_RTL_DUMMY_SFP),
++		.name		= "Realtek SFP PHY Mode",
++		.flags		= PHY_IS_INTERNAL,
++		.probe		= rtl822x_probe,
++		.get_features	= rtlgen_sfp_get_features,
++		.config_aneg	= rtlgen_sfp_config_aneg,
++		.read_status	= rtlgen_sfp_read_status,
++		.suspend	= genphy_suspend,
++		.resume		= rtlgen_resume,
++		.read_page	= rtl821x_read_page,
++		.write_page	= rtl821x_write_page,
++		.read_mmd	= rtl822x_read_mmd,
++		.write_mmd	= rtl822x_write_mmd,
+ 	}, {
+ 		PHY_ID_MATCH_EXACT(0x001ccad0),
+ 		.name		= "RTL8224 2.5Gbps PHY",
+diff --git a/include/net/phy/realtek_phy.h b/include/net/phy/realtek_phy.h
+new file mode 100644
+index 000000000..d683bc1b0
+--- /dev/null
++++ b/include/net/phy/realtek_phy.h
+@@ -0,0 +1,7 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _REALTEK_PHY_H
++#define _REALTEK_PHY_H
++
++#define	PHY_ID_RTL_DUMMY_SFP	0x001ccbff
++
++#endif /* _REALTEK_PHY_H */

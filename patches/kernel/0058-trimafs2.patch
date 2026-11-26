@@ -1,0 +1,669 @@
+From 8baab06add9c0641ac0f55feb7b0cab90439fb12 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:38 +0000
+Subject: [PATCH 058/110] =?UTF-8?q?trimafs2:=20=E6=96=87=E4=BB=B6=E6=93=8D?=
+ =?UTF-8?q?=E4=BD=9C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+桥下文件打开下层 backing file, 读写/mmap/splice/fallocate/
+copy_file_range/remap/ioctl 等全部转发(参照 overlayfs 的写法),
+readdir 时把下层 inode 号映射成上层 inode 号.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/trimafs2/file.c | 644 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 644 insertions(+)
+ create mode 100644 fs/trimafs2/file.c
+
+diff --git a/fs/trimafs2/file.c b/fs/trimafs2/file.c
+new file mode 100644
+index 000000000..e599d5d62
+--- /dev/null
++++ b/fs/trimafs2/file.c
+@@ -0,0 +1,644 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TRIM aggregate stacking filesystem: 文件操作
++ *
++ * 上层对象用 ramfs/libfs 的通用实现; 桥下对象打开一个下层 backing file,
++ * 所有读写转发给它(写法参照 overlayfs).
++ */
++#include <linux/slab.h>
++#include <linux/cred.h>
++#include <linux/uio.h>
++#include <linux/poll.h>
++#include <linux/fadvise.h>
++#include <linux/backing-file.h>
++#include <linux/splice.h>
++#include <linux/mm.h>
++#include "internal.h"
++
++/* fcntl(F_SETFL) 能改的标志 */
++#define TRIMAFS2_SETFL_MASK (O_APPEND | O_NONBLOCK | O_NDELAY | O_DIRECT | O_NOATIME)
++
++struct trimafs2_readdir_ctx {
++	struct dir_context ctx;
++	struct dir_context *caller;
++	struct file *file;
++	u64 branch_id;
++};
++
++int trimafs2_release(struct inode *inode, struct file *file)
++{
++	struct trimafs2_file_info *fi = file->private_data;
++
++	if (fi) {
++		if (fi->lower_file)
++			fput(fi->lower_file);
++		kfree(fi);
++		file->private_data = NULL;
++	}
++	return 0;
++}
++
++static void trimafs2_file_accessed(struct file *file)
++{
++	if (!(file->f_flags & O_NOATIME))
++		touch_atime(&file->f_path);
++}
++
++static bool trimafs2_filldir(struct dir_context *ctx, const char *name, int namelen,
++			     loff_t offset, u64 ino, unsigned int d_type)
++{
++	struct trimafs2_readdir_ctx *rctx = container_of(ctx, struct trimafs2_readdir_ctx, ctx);
++	struct dir_context *caller = rctx->caller;
++	bool ret;
++
++	if (namelen == 1 && name[0] == '.')
++		ino = file_inode(rctx->file)->i_ino;
++	else if (namelen == 2 && name[0] == '.' && name[1] == '.')
++		ino = d_parent_ino(rctx->file->f_path.dentry);
++	else if (ino)
++		ino = trimafs2_map_ino(rctx->file->f_path.dentry->d_sb, rctx->branch_id, ino);
++
++	caller->pos = ctx->pos;
++	ret = caller->actor(caller, name, namelen, offset, ino,
++			    d_type & (caller->dt_flags_mask | S_DT_MASK));
++	ctx->count = caller->count;
++	return ret;
++}
++
++int trimafs2_open(struct inode *inode, struct file *file)
++{
++	struct path lower_path = {};
++	struct trimafs2_file_info *fi;
++	const struct cred *cred;
++	struct file *lower_file;
++	int flags, err;
++
++	if (!trimafs2_has_lower(file->f_path.dentry))
++		return generic_file_open(inode, file);
++
++	fi = kzalloc(sizeof(*fi), GFP_KERNEL);
++	if (!fi)
++		return -ENOMEM;
++	file->private_data = fi;
++
++	trimafs2_get_lower_path(file->f_path.dentry, &lower_path);
++	flags = file->f_flags;
++	cred = current_cred();
++	err = trimafs2_validate_lower_runtime_path(&lower_path);
++	if (err)
++		goto out_err;
++
++	/* 不是属主就不许 O_NOATIME */
++	if (!inode_owner_or_capable(mnt_idmap(lower_path.mnt), d_inode(lower_path.dentry))) {
++		file->f_flags &= ~O_NOATIME;
++		flags &= ~O_NOATIME;
++	}
++	flags &= ~(O_CREAT | O_EXCL | O_NOCTTY);
++
++	lower_file = backing_file_open(file_user_path(file), flags, &lower_path, cred);
++	if (IS_ERR(lower_file)) {
++		err = PTR_ERR(lower_file);
++		goto out_err;
++	}
++	TRIMAFS2_F(file)->lower_file = lower_file;
++	path_put(&lower_path);
++	return 0;
++
++out_err:
++	path_put(&lower_path);
++	kfree(fi);
++	file->private_data = NULL;
++	return err;
++}
++
++int trimafs2_dir_open(struct inode *inode, struct file *file)
++{
++	struct path lower_path = {};
++	struct trimafs2_file_info *fi;
++	const struct cred *cred;
++	struct file *lower_file;
++	int flags, err;
++
++	if (!trimafs2_has_lower(file->f_path.dentry))
++		return dcache_dir_open(inode, file);
++
++	fi = kzalloc(sizeof(*fi), GFP_KERNEL);
++	if (!fi)
++		return -ENOMEM;
++	file->private_data = fi;
++
++	trimafs2_get_lower_path(file->f_path.dentry, &lower_path);
++	flags = file->f_flags;
++	cred = current_cred();
++	err = trimafs2_validate_lower_runtime_path(&lower_path);
++	if (err)
++		goto out_err;
++
++	/* 不是属主就不许 O_NOATIME */
++	if (!inode_owner_or_capable(mnt_idmap(lower_path.mnt), d_inode(lower_path.dentry))) {
++		file->f_flags &= ~O_NOATIME;
++		flags &= ~O_NOATIME;
++	}
++	flags &= ~(O_CREAT | O_EXCL | O_NOCTTY);
++
++	lower_file = dentry_open(&lower_path, flags, cred);
++	if (IS_ERR(lower_file)) {
++		err = PTR_ERR(lower_file);
++		goto out_err;
++	}
++	TRIMAFS2_F(file)->lower_file = lower_file;
++	path_put(&lower_path);
++	return 0;
++
++out_err:
++	path_put(&lower_path);
++	kfree(fi);
++	file->private_data = NULL;
++	return err;
++}
++
++int trimafs2_dir_release(struct inode *inode, struct file *file)
++{
++	if (!trimafs2_has_lower(file->f_path.dentry))
++		return dcache_dir_close(inode, file);
++	return trimafs2_release(inode, file);
++}
++
++/* 取下层文件, 并把上层 F_SETFL 改过的标志同步下去 */
++static struct file *trimafs2_real_file(struct file *file)
++{
++	struct file *real = trimafs2_lower_file(file);
++	unsigned int flags;
++	int err;
++
++	if (!real)
++		return NULL;
++	if (trimafs2_validate_lower_runtime_path(&real->f_path))
++		return ERR_PTR(-EOPNOTSUPP);
++
++	flags = file->f_flags;
++	if (!((flags ^ real->f_flags) & TRIMAFS2_SETFL_MASK))
++		return real;
++
++	flags &= TRIMAFS2_SETFL_MASK;
++	if ((flags & O_NOATIME) && !inode_owner_or_capable(file_mnt_idmap(real), file_inode(real))) {
++		spin_lock(&file->f_lock);
++		file->f_flags &= ~O_NOATIME;
++		file->f_iocb_flags = iocb_flags(file);
++		spin_unlock(&file->f_lock);
++		flags &= ~O_NOATIME;
++	}
++
++	err = -EPERM;
++	if (((flags ^ real->f_flags) & O_APPEND) && IS_APPEND(file_inode(real)))
++		goto out_err;
++	err = -EINVAL;
++	if ((flags & O_DIRECT) && !(real->f_mode & FMODE_CAN_ODIRECT))
++		goto out_err;
++	if (real->f_op->check_flags) {
++		err = real->f_op->check_flags(flags);
++		if (err)
++			goto out_err;
++	}
++
++	spin_lock(&real->f_lock);
++	real->f_flags = (real->f_flags & ~TRIMAFS2_SETFL_MASK) | flags;
++	real->f_iocb_flags = iocb_flags(real);
++	spin_unlock(&real->f_lock);
++	return real;
++
++out_err:
++	return ERR_PTR(err);
++}
++
++static int trimafs2_fsync(struct file *file, loff_t start, loff_t end, int datasync)
++{
++	struct file *real;
++
++	if (!trimafs2_lower_file(file))
++		return noop_fsync(file, start, end, datasync);
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	return vfs_fsync_range(real, start, end, datasync);
++}
++
++/* 写入后把下层的大小和时间同步上来 */
++static void trimafs2_file_modified(struct file *file)
++{
++	struct file *lower = trimafs2_lower_file(file);
++	struct inode *inode, *lower_inode;
++
++	if (!lower)
++		return;
++	inode = file_inode(file);
++	lower_inode = file_inode(lower);
++	fsstack_copy_inode_size(inode, lower_inode);
++	inode_set_atime_to_ts(inode, inode_get_atime(lower_inode));
++	inode_set_mtime_to_ts(inode, inode_get_mtime(lower_inode));
++	inode_set_ctime_to_ts(inode, inode_get_ctime(lower_inode));
++}
++
++static __poll_t trimafs2_poll(struct file *file, poll_table *wait)
++{
++	struct file *lower = trimafs2_lower_file(file);
++	struct file *real;
++
++	if (!lower || !lower->f_op->poll)
++		return DEFAULT_POLLMASK;
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return EPOLLERR;
++	return vfs_poll(real, wait);
++}
++
++static int trimafs2_mmap(struct file *file, struct vm_area_struct *vma)
++{
++	struct backing_file_ctx ctx = {
++		.accessed = trimafs2_file_accessed,
++	};
++	struct file *real;
++
++	if (!trimafs2_lower_file(file))
++		return generic_file_mmap(file, vma);
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	ctx.cred = real->f_cred;
++	return backing_file_mmap(real, vma, &ctx);
++}
++
++static int trimafs2_fadvise(struct file *file, loff_t offset, loff_t len, int advice)
++{
++	const struct cred *old_cred;
++	struct file *real;
++	int ret;
++
++	if (!trimafs2_lower_file(file))
++		return generic_fadvise(file, offset, len, advice);
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	old_cred = override_creds(real->f_cred);
++	ret = vfs_fadvise(real, offset, len, advice);
++	revert_creds(old_cred);
++	return ret;
++}
++
++static ssize_t trimafs2_read_iter(struct kiocb *iocb, struct iov_iter *iter)
++{
++	struct file *file = iocb->ki_filp;
++	struct backing_file_ctx ctx = {
++		.accessed = trimafs2_file_accessed,
++	};
++	struct file *real;
++
++	if (!iov_iter_count(iter))
++		return 0;
++	if (!trimafs2_lower_file(file))
++		return generic_file_read_iter(iocb, iter);
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	ctx.cred = real->f_cred;
++	return backing_file_read_iter(real, iter, iocb, iocb->ki_flags, &ctx);
++}
++
++static long trimafs2_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct file *lower = trimafs2_lower_file(file);
++	struct file *real;
++	long ret;
++
++	if (!lower || !lower->f_op->unlocked_ioctl)
++		return -ENOTTY;
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	if (!real->f_op->unlocked_ioctl)
++		return -ENOTTY;
++	ret = real->f_op->unlocked_ioctl(real, cmd, arg);
++	if (ret >= 0)
++		fsstack_copy_attr_all(file_inode(file), file_inode(real));
++	return ret;
++}
++
++#ifdef CONFIG_COMPAT
++static long trimafs2_compat_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct file *lower = trimafs2_lower_file(file);
++	struct file *real;
++	long ret;
++
++	if (!lower || !lower->f_op->compat_ioctl)
++		return -ENOIOCTLCMD;
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	if (!real->f_op->compat_ioctl)
++		return -ENOIOCTLCMD;
++	ret = real->f_op->compat_ioctl(real, cmd, arg);
++	if (ret >= 0)
++		fsstack_copy_attr_all(file_inode(file), file_inode(real));
++	return ret;
++}
++#endif
++
++static int trimafs2_flush(struct file *file, fl_owner_t id)
++{
++	struct file *lower = trimafs2_lower_file(file);
++	const struct cred *old_cred;
++	struct file *real;
++	int err;
++
++	if (!lower || !lower->f_op->flush)
++		return 0;
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	if (!real->f_op->flush)
++		return 0;
++	old_cred = override_creds(real->f_cred);
++	err = real->f_op->flush(real, id);
++	revert_creds(old_cred);
++	return err;
++}
++
++static loff_t trimafs2_llseek(struct file *file, loff_t offset, int whence)
++{
++	struct file *real;
++	loff_t ret;
++
++	if (!trimafs2_lower_file(file)) {
++		if (d_is_dir(file->f_path.dentry))
++			return dcache_dir_lseek(file, offset, whence);
++		return generic_file_llseek(file, offset, whence);
++	}
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	real->f_pos = file->f_pos;
++	ret = vfs_llseek(real, offset, whence);
++	file->f_pos = real->f_pos;
++	return ret;
++}
++
++static void trimafs2_file_end_write(struct kiocb *iocb, ssize_t ret)
++{
++	if (ret > 0)
++		trimafs2_file_modified(iocb->ki_filp);
++}
++
++static ssize_t trimafs2_write_iter(struct kiocb *iocb, struct iov_iter *iter)
++{
++	struct file *file = iocb->ki_filp;
++	struct inode *inode = file_inode(file);
++	struct backing_file_ctx ctx = {
++		.end_write = trimafs2_file_end_write,
++	};
++	struct file *real;
++	ssize_t ret;
++
++	if (!iov_iter_count(iter))
++		return 0;
++	if (!trimafs2_lower_file(file))
++		return generic_file_write_iter(iocb, iter);
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++
++	inode_lock(inode);
++	fsstack_copy_attr_all(inode, file_inode(real));
++	ctx.cred = real->f_cred;
++	ret = backing_file_write_iter(real, iter, iocb, iocb->ki_flags, &ctx);
++	inode_unlock(inode);
++	return ret;
++}
++
++static long trimafs2_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
++{
++	struct inode *inode = file_inode(file);
++	const struct cred *old_cred;
++	struct file *real;
++	long ret;
++
++	if (!trimafs2_lower_file(file))
++		return -EOPNOTSUPP;
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++
++	inode_lock(inode);
++	fsstack_copy_attr_all(inode, file_inode(real));
++	ret = file_remove_privs(file);
++	if (ret)
++		goto out_unlock;
++	old_cred = override_creds(real->f_cred);
++	ret = vfs_fallocate(real, mode, offset, len);
++	revert_creds(old_cred);
++	trimafs2_file_modified(file);
++out_unlock:
++	inode_unlock(inode);
++	return ret;
++}
++
++static int trimafs2_iterate_shared(struct file *file, struct dir_context *ctx)
++{
++	struct trimafs2_readdir_ctx rctx = {};
++	struct file *real;
++	int err;
++
++	if (!trimafs2_lower_file(file))
++		return dcache_readdir(file, ctx);
++
++	real = trimafs2_real_file(file);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++
++	rctx.ctx.actor = trimafs2_filldir;
++	rctx.ctx.pos = ctx->pos;
++	rctx.caller = ctx;
++	rctx.file = file;
++	rctx.branch_id = trimafs2_dentry_branch_id(file->f_path.dentry);
++	err = iterate_dir(real, &rctx.ctx);
++	ctx->pos = rctx.ctx.pos;
++	file->f_pos = real->f_pos;
++	if (!err)
++		inode_set_atime_to_ts(file_inode(file), inode_get_atime(file_inode(real)));
++	return err;
++}
++
++static ssize_t trimafs2_copy_file_range(struct file *file_in, loff_t pos_in,
++					struct file *file_out, loff_t pos_out,
++					size_t len, unsigned int flags)
++{
++	struct inode *inode_out = file_inode(file_out);
++	const struct cred *old_cred;
++	struct file *real_in, *real_out;
++	ssize_t ret;
++
++	if (!trimafs2_lower_file(file_in) || !trimafs2_lower_file(file_out))
++		return -EXDEV;
++
++	real_in = trimafs2_real_file(file_in);
++	if (IS_ERR(real_in))
++		return PTR_ERR(real_in);
++	real_out = trimafs2_real_file(file_out);
++	if (IS_ERR(real_out))
++		return PTR_ERR(real_out);
++
++	inode_lock(inode_out);
++	fsstack_copy_attr_all(inode_out, file_inode(real_out));
++	ret = file_remove_privs(file_out);
++	if (ret)
++		goto out_unlock;
++	old_cred = override_creds(real_out->f_cred);
++	ret = vfs_copy_file_range(real_in, pos_in, real_out, pos_out, len, flags);
++	revert_creds(old_cred);
++	if (ret > 0)
++		trimafs2_file_modified(file_out);
++out_unlock:
++	inode_unlock(inode_out);
++	return ret;
++}
++
++static ssize_t trimafs2_splice_read(struct file *in, loff_t *ppos, struct pipe_inode_info *pipe,
++				    size_t len, unsigned int flags)
++{
++	struct backing_file_ctx ctx = {
++		.accessed = trimafs2_file_accessed,
++	};
++	struct kiocb iocb = {};
++	struct file *real;
++	ssize_t ret;
++
++	if (!trimafs2_lower_file(in))
++		return filemap_splice_read(in, ppos, pipe, len, flags);
++
++	real = trimafs2_real_file(in);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++	init_sync_kiocb(&iocb, in);
++	iocb.ki_pos = *ppos;
++	ctx.cred = real->f_cred;
++	ret = backing_file_splice_read(real, &iocb, pipe, len, flags, &ctx);
++	*ppos = iocb.ki_pos;
++	return ret;
++}
++
++static loff_t trimafs2_remap_file_range(struct file *file_in, loff_t pos_in,
++					struct file *file_out, loff_t pos_out,
++					loff_t len, unsigned int remap_flags)
++{
++	struct inode *inode_out = file_inode(file_out);
++	const struct cred *old_cred;
++	struct file *real_in, *real_out;
++	loff_t ret;
++
++	if (!trimafs2_lower_file(file_in) || !trimafs2_lower_file(file_out))
++		return -EXDEV;
++
++	real_in = trimafs2_real_file(file_in);
++	if (IS_ERR(real_in))
++		return PTR_ERR(real_in);
++	real_out = trimafs2_real_file(file_out);
++	if (IS_ERR(real_out))
++		return PTR_ERR(real_out);
++
++	if (remap_flags & REMAP_FILE_DEDUP) {
++		old_cred = override_creds(real_out->f_cred);
++		ret = vfs_dedupe_file_range_one(real_in, pos_in, real_out, pos_out, len,
++						remap_flags);
++		revert_creds(old_cred);
++		return ret;
++	}
++
++	inode_lock(inode_out);
++	fsstack_copy_attr_all(inode_out, file_inode(real_out));
++	ret = file_remove_privs(file_out);
++	if (ret)
++		goto out_unlock;
++	old_cred = override_creds(real_out->f_cred);
++	ret = vfs_clone_file_range(real_in, pos_in, real_out, pos_out, len, remap_flags);
++	revert_creds(old_cred);
++	if (ret > 0)
++		trimafs2_file_modified(file_out);
++out_unlock:
++	inode_unlock(inode_out);
++	return ret;
++}
++
++static ssize_t trimafs2_splice_write(struct pipe_inode_info *pipe, struct file *out,
++				     loff_t *ppos, size_t len, unsigned int flags)
++{
++	struct inode *inode = file_inode(out);
++	struct backing_file_ctx ctx = {
++		.end_write = trimafs2_file_end_write,
++	};
++	struct kiocb iocb = {};
++	struct file *real;
++	ssize_t ret;
++
++	if (!trimafs2_lower_file(out))
++		return iter_file_splice_write(pipe, out, ppos, len, flags);
++
++	real = trimafs2_real_file(out);
++	if (IS_ERR(real))
++		return PTR_ERR(real);
++
++	ctx.cred = real->f_cred;
++	inode_lock(inode);
++	fsstack_copy_attr_all(inode, file_inode(real));
++	init_sync_kiocb(&iocb, out);
++	iocb.ki_pos = *ppos;
++	ret = backing_file_splice_write(pipe, real, &iocb, len, flags, &ctx);
++	*ppos = iocb.ki_pos;
++	inode_unlock(inode);
++	return ret;
++}
++
++const struct file_operations trimafs2_dir_fops = {
++	.llseek		= trimafs2_llseek,
++	.read		= generic_read_dir,
++	.iterate_shared	= trimafs2_iterate_shared,
++	.unlocked_ioctl	= trimafs2_unlocked_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl	= trimafs2_compat_ioctl,
++#endif
++	.open		= trimafs2_dir_open,
++	.release	= trimafs2_dir_release,
++	.fsync		= trimafs2_fsync,
++};
++
++const struct file_operations trimafs2_file_fops = {
++	.llseek		= trimafs2_llseek,
++	.read_iter	= trimafs2_read_iter,
++	.write_iter	= trimafs2_write_iter,
++	.poll		= trimafs2_poll,
++	.unlocked_ioctl	= trimafs2_unlocked_ioctl,
++#ifdef CONFIG_COMPAT
++	.compat_ioctl	= trimafs2_compat_ioctl,
++#endif
++	.mmap		= trimafs2_mmap,
++	.open		= trimafs2_open,
++	.flush		= trimafs2_flush,
++	.release	= trimafs2_release,
++	.fsync		= trimafs2_fsync,
++	.splice_write	= trimafs2_splice_write,
++	.splice_read	= trimafs2_splice_read,
++	.fallocate	= trimafs2_fallocate,
++	.copy_file_range = trimafs2_copy_file_range,
++	.remap_file_range = trimafs2_remap_file_range,
++	.fadvise	= trimafs2_fadvise,
++};

@@ -1,0 +1,31 @@
+From 4886cb0d07438889d1d99f86940f6287e928b3ba Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:48:42 +0000
+Subject: [PATCH 4/5] =?UTF-8?q?get=5Fstats64:=20=E6=8E=A5=E5=8F=A3=20DOWN?=
+ =?UTF-8?q?=20=E6=97=B6=E4=B8=8D=E5=86=8D=E8=AF=BB=20tally=20counter?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 r8126.ko 的 get_stats64 在 test_bit(R8126_FLAG_DOWN) 为 0 时才调用
+rtl8126_dump_tally_counter, 官方 r8126 无此判断(从 .ko 反汇编还原, 多 4 条指令)。
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/r8126_n.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/r8126_n.c b/src/r8126_n.c
+index 3b06438..7077c28 100755
+--- a/src/r8126_n.c
++++ b/src/r8126_n.c
+@@ -13437,7 +13437,8 @@ rtl8126_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+          * Fetch additional counter values missing in stats collected by driver
+          * from tally counters.
+          */
+-        rtl8126_dump_tally_counter(tp, paddr);
++        if (!test_bit(R8126_FLAG_DOWN, tp->task_flags))
++                rtl8126_dump_tally_counter(tp, paddr);
+ 
+         stats->tx_errors = le64_to_cpu(counters->tx_errors);
+         stats->collisions = le32_to_cpu(counters->tx_multi_collision);

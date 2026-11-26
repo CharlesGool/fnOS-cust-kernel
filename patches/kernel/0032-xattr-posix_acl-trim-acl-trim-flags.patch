@@ -1,0 +1,161 @@
+From bc9dd44e71d5b2b2d5b154fd5338faf15f289f80 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:56:48 +0700
+Subject: [PATCH 032/110] =?UTF-8?q?xattr,=20posix=5Facl:=20trim=20acl=20/?=
+ =?UTF-8?q?=20trim=20flags=20=E7=9A=84=E6=89=A9=E5=B1=95=E5=B1=9E=E6=80=A7?=
+ =?UTF-8?q?=E6=9D=83=E9=99=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- xattr_permission 改收 dentry: system.trim_acl 读写转 trim_xattr_permission
+  (写=MAY_WRITE_PERMISSION, 读=MAY_READ_PERMISSION, 其他 -EPERM);
+  最后 trimacl 文件系统走 trim_permission
+- __vfs_setxattr/__vfs_removexattr: system.trim_flags 在没实现
+  get/set_trim_flags 的文件系统上返回 -EOPNOTSUPP
+- set_posix_acl: 非属主时卷管理员/家目录主人 (vol_is_admin_or_homeowner) 也可设
+
+vmlinux fcmp: set_posix_acl、vfs_getxattr、vfs_getxattr_alloc、
+__vfs_setxattr_locked、__vfs_removexattr_locked 一致;
+xattr_permission 124/125、__vfs_setxattr 75/75、__vfs_removexattr 64/64
+只差 -EOPNOTSUPP/常量装载块的位置, 等价 (试过 switch、三目、拆 if 都更差)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/posix_acl.c |  5 ++++-
+ fs/xattr.c     | 41 +++++++++++++++++++++++++++++++++--------
+ 2 files changed, 37 insertions(+), 9 deletions(-)
+
+diff --git a/fs/posix_acl.c b/fs/posix_acl.c
+index 0d92d6a63..bb52178af 100644
+--- a/fs/posix_acl.c
++++ b/fs/posix_acl.c
+@@ -28,6 +28,7 @@
+ #include <linux/security.h>
+ #include <linux/fsnotify.h>
+ #include <linux/filelock.h>
++#include <linux/trimvfs.h>
+ 
+ #include "internal.h"
+ 
+@@ -950,7 +951,9 @@ set_posix_acl(struct mnt_idmap *idmap, struct dentry *dentry,
+ 
+ 	if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
+ 		return acl ? -EACCES : 0;
+-	if (!inode_owner_or_capable(idmap, inode))
++	/* fnOS: 卷管理员和家目录主人也可以改 */
++	if (!inode_owner_or_capable(idmap, inode) &&
++	    !vol_is_admin_or_homeowner(idmap, dentry))
+ 		return -EPERM;
+ 
+ 	if (acl) {
+diff --git a/fs/xattr.c b/fs/xattr.c
+index 733ee0a99..015d6e210 100644
+--- a/fs/xattr.c
++++ b/fs/xattr.c
+@@ -22,6 +22,8 @@
+ #include <linux/audit.h>
+ #include <linux/vmalloc.h>
+ #include <linux/posix_acl_xattr.h>
++#include <linux/trim_acl.h>
++#include <linux/trim_flags.h>
+ 
+ #include <linux/uaccess.h>
+ 
+@@ -110,9 +112,24 @@ int may_write_xattr(struct mnt_idmap *idmap, struct inode *inode)
+  * because different namespaces have very different rules.
+  */
+ static int
+-xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
++xattr_permission(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		 const char *name, int mask)
+ {
++	struct inode *inode = d_inode(dentry);
++
++	/* fnOS: system.trim_acl 读写要的是"读/写权限"这两种 trim 权限 */
++	if (!strcmp(name, TRIM_ACL_XATTR_ACCESS)) {
++		unsigned int perm;
++
++		if (mask == MAY_WRITE)
++			perm = MAY_WRITE_PERMISSION;
++		else if (mask == MAY_READ)
++			perm = MAY_READ_PERMISSION;
++		else
++			return -EPERM;
++		return trim_xattr_permission(idmap, name, dentry, perm);
++	}
++
+ 	if (mask & MAY_WRITE) {
+ 		int ret;
+ 
+@@ -152,7 +169,15 @@ xattr_permission(struct mnt_idmap *idmap, struct inode *inode,
+ 			return -EPERM;
+ 	}
+ 
+-	return inode_permission(idmap, inode, mask);
++	return IS_TRIMACL(dentry) ? trim_permission(idmap, dentry, mask) :
++				    inode_permission(idmap, inode, mask);
++}
++
++/* fnOS: system.trim_flags 只在实现了 get/set_trim_flags 的文件系统上可用 */
++static inline bool trim_flags_xattr_unsupported(struct inode *inode, const char *name)
++{
++	return !strcmp(name, TRIM_INODE_FLAGS_XATTR) &&
++	       (!inode->i_op->get_trim_flags || !inode->i_op->set_trim_flags);
+ }
+ 
+ /*
+@@ -187,7 +212,7 @@ __vfs_setxattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ {
+ 	const struct xattr_handler *handler;
+ 
+-	if (is_posix_acl_xattr(name))
++	if (trim_flags_xattr_unsupported(inode, name) || is_posix_acl_xattr(name))
+ 		return -EOPNOTSUPP;
+ 
+ 	handler = xattr_resolve_name(inode, &name);
+@@ -279,7 +304,7 @@ __vfs_setxattr_locked(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	struct inode *inode = dentry->d_inode;
+ 	int error;
+ 
+-	error = xattr_permission(idmap, inode, name, MAY_WRITE);
++	error = xattr_permission(idmap, dentry, name, MAY_WRITE);
+ 	if (error)
+ 		return error;
+ 
+@@ -381,7 +406,7 @@ vfs_getxattr_alloc(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	char *value = *xattr_value;
+ 	int error;
+ 
+-	error = xattr_permission(idmap, inode, name, MAY_READ);
++	error = xattr_permission(idmap, dentry, name, MAY_READ);
+ 	if (error)
+ 		return error;
+ 
+@@ -431,7 +456,7 @@ vfs_getxattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	struct inode *inode = dentry->d_inode;
+ 	int error;
+ 
+-	error = xattr_permission(idmap, inode, name, MAY_READ);
++	error = xattr_permission(idmap, dentry, name, MAY_READ);
+ 	if (error)
+ 		return error;
+ 
+@@ -507,7 +532,7 @@ __vfs_removexattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	struct inode *inode = d_inode(dentry);
+ 	const struct xattr_handler *handler;
+ 
+-	if (is_posix_acl_xattr(name))
++	if (trim_flags_xattr_unsupported(inode, name) || is_posix_acl_xattr(name))
+ 		return -EOPNOTSUPP;
+ 
+ 	handler = xattr_resolve_name(inode, &name);
+@@ -538,7 +563,7 @@ __vfs_removexattr_locked(struct mnt_idmap *idmap,
+ 	struct inode *inode = dentry->d_inode;
+ 	int error;
+ 
+-	error = xattr_permission(idmap, inode, name, MAY_WRITE);
++	error = xattr_permission(idmap, dentry, name, MAY_WRITE);
+ 	if (error)
+ 		return error;
+ 

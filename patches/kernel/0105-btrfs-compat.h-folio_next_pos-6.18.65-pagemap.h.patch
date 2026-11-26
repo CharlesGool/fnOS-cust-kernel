@@ -1,0 +1,30 @@
+From 8ccfb91b400659647233ea7f68548b638a60f5b8 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:23:39 +0700
+Subject: [PATCH 105/110] =?UTF-8?q?btrfs:=20compat.h=20=E5=8E=BB=E6=8E=89?=
+ =?UTF-8?q?=20folio=5Fnext=5Fpos=20(6.18.65=20pagemap.h=20=E5=B7=B2?=
+ =?UTF-8?q?=E6=8F=90=E4=BE=9B)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/compat.h | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/compat.h b/fs/btrfs/compat.h
+index 32c37c9be..0d110a351 100644
+--- a/fs/btrfs/compat.h
++++ b/fs/btrfs/compat.h
+@@ -42,9 +42,6 @@
+ #define kvzalloc_flex(P, F, N, ...) __alloc_flex(kvzalloc, default_gfp(__VA_ARGS__), typeof(P), F, N)
+ #endif
+ 
+-static inline loff_t folio_next_pos(const struct folio *folio)
+-{
+-	return (loff_t)folio_next_index(folio) << PAGE_SHIFT;
+-}
++/* folio_next_pos(): 6.18.65 的 pagemap.h 已有 */
+ 
+ #endif

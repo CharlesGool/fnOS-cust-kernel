@@ -1,0 +1,68 @@
+From 59a3faaa19b27ae322a75b99938bb3c3cbce1e93 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:25:00 +0000
+Subject: [PATCH 083/110] =?UTF-8?q?md/raid0:=20=E5=85=88=E8=AE=BE=20queue?=
+ =?UTF-8?q?=20limits=20=E5=86=8D=E5=BB=BA=20r0conf(=E4=B8=8A=E6=B8=B8=2001?=
+ =?UTF-8?q?2)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 2107457e31fa "md/raid0: Move queue limit setup before r0conf initialization" 原样移植:
+create_strip_zones 的 blksize 直接取 queue_logical_block_size(mddev->gendisk->queue)。
+飞牛没有后续的 015(46f21952c492, dm-raid 下 gendisk 为 NULL 的修复), create_strip_zones
+直接解引用 mddev->gendisk, 与飞牛一致(dm-raid 跑 raid0 时会空指针, 见 r1.md 遗留)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid0.c | 16 +++++++---------
+ 1 file changed, 7 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index f629350a0..981313ef6 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -70,7 +70,7 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
+ 	struct strip_zone *zone;
+ 	int cnt;
+ 	struct r0conf *conf = kzalloc(sizeof(*conf), GFP_KERNEL);
+-	unsigned blksize = 512;
++	unsigned int blksize = queue_logical_block_size(mddev->gendisk->queue);
+ 
+ 	*private_conf = ERR_PTR(-ENOMEM);
+ 	if (!conf)
+@@ -86,9 +86,6 @@ static int create_strip_zones(struct mddev *mddev, struct r0conf **private_conf)
+ 		sector_div(sectors, mddev->chunk_sectors);
+ 		rdev1->sectors = sectors * mddev->chunk_sectors;
+ 
+-		blksize = max(blksize, queue_logical_block_size(
+-				      rdev1->bdev->bd_disk->queue));
+-
+ 		rdev_for_each(rdev2, mddev) {
+ 			pr_debug("md/raid0:%s:   comparing %pg(%llu)"
+ 				 " with %pg(%llu)\n",
+@@ -409,6 +406,12 @@ static int raid0_run(struct mddev *mddev)
+ 	if (md_check_no_bitmap(mddev))
+ 		return -EINVAL;
+ 
++	if (!mddev_is_dm(mddev)) {
++		ret = raid0_set_limits(mddev);
++		if (ret)
++			return ret;
++	}
++
+ 	/* if private is not null, we are here after takeover */
+ 	if (mddev->private == NULL) {
+ 		ret = create_strip_zones(mddev, &conf);
+@@ -417,11 +420,6 @@ static int raid0_run(struct mddev *mddev)
+ 		mddev->private = conf;
+ 	}
+ 	conf = mddev->private;
+-	if (!mddev_is_dm(mddev)) {
+-		ret = raid0_set_limits(mddev);
+-		if (ret)
+-			return ret;
+-	}
+ 
+ 	/* calculate array device size */
+ 	md_set_array_sectors(mddev, raid0_size(mddev, 0, 0));

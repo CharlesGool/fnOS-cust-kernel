@@ -1,0 +1,83 @@
+From fbea80882c333a0b9717ec939ef9cc77eee112ff Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:47:11 +0000
+Subject: [PATCH 094/110] =?UTF-8?q?md/raid5:=20=E8=AF=BB=E5=86=99/?=
+ =?UTF-8?q?=E5=AF=B9=E9=BD=90=E8=AF=BB=E5=AE=8C=E6=88=90=E8=B7=AF=E5=BE=84?=
+ =?UTF-8?q?=E6=8E=A5=E5=85=A5=20DFR?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- raid5_end_read_request / raid5_end_write_request: 成功时 md_stop_dfr;
+  出错时先尝试 stripe_start_dfr, 成功则不按错误处理; DFR 期间不清
+  read_errors, 读错超限时不踢盘(md_dfr_started)。
+- raid5_align_endio: 出错时 md_start_dfr 接管则正常完成, 不再重试。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid5.c | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 437af5042..16a6bfadc 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -2974,7 +2974,9 @@ static void raid5_end_read_request(struct bio * bi)
+ 		s = sh->sector + rdev->new_data_offset;
+ 	else
+ 		s = sh->sector + rdev->data_offset;
+-	if (!bi->bi_status) {
++	if (!bi->bi_status)
++		md_stop_dfr(rdev);
++	if (!bi->bi_status || stripe_start_dfr(rdev, sh)) {
+ 		set_bit(R5_UPTODATE, &sh->dev[i].flags);
+ 		if (test_bit(R5_ReadError, &sh->dev[i].flags)) {
+ 			/* Note that this cannot happen on a
+@@ -2999,7 +3001,8 @@ static void raid5_end_read_request(struct bio * bi)
+ 			 */
+ 			set_bit(R5_OrigPageUPTDODATE, &sh->dev[i].flags);
+ 
+-		if (atomic_read(&rdev->read_errors))
++		if (atomic_read(&rdev->read_errors) &&
++		    !md_rdev_in_dfr(rdev->mddev, rdev))
+ 			atomic_set(&rdev->read_errors, 0);
+ 	} else {
+ 		int retry = 0;
+@@ -3030,7 +3033,8 @@ static void raid5_end_read_request(struct bio * bi)
+ 				(unsigned long long)s,
+ 				rdev->bdev);
+ 		} else if (atomic_read(&rdev->read_errors)
+-			 > conf->max_nr_stripes) {
++			 > conf->max_nr_stripes &&
++			   !md_dfr_started(rdev->mddev)) {
+ 			if (!test_bit(Faulty, &rdev->flags)) {
+ 				pr_warn("md/raid:%s: %d read_errors > %d stripes\n",
+ 				    mdname(conf->mddev),
+@@ -3103,6 +3107,9 @@ static void raid5_end_write_request(struct bio *bi)
+ 		return;
+ 	}
+ 
++	if (!bi->bi_status)
++		md_stop_dfr(rdev);
++
+ 	if (replacement) {
+ 		if (bi->bi_status)
+ 			md_error(conf->mddev, rdev);
+@@ -3110,7 +3117,7 @@ static void raid5_end_write_request(struct bio *bi)
+ 					   RAID5_STRIPE_SECTORS(conf)))
+ 			set_bit(R5_MadeGoodRepl, &sh->dev[i].flags);
+ 	} else {
+-		if (bi->bi_status) {
++		if (bi->bi_status && !stripe_start_dfr(rdev, sh)) {
+ 			set_bit(WriteErrorSeen, &rdev->flags);
+ 			set_bit(R5_WriteError, &sh->dev[i].flags);
+ 			if (!test_and_set_bit(WantReplacement, &rdev->flags))
+@@ -5750,7 +5757,7 @@ static void raid5_align_endio(struct bio *bi)
+ 	raid_bi->bi_next = NULL;
+ 	rdev_dec_pending(rdev, conf->mddev);
+ 
+-	if (!error) {
++	if (!error || md_start_dfr(rdev, raid_bi)) {
+ 		bio_endio(raid_bi);
+ 		if (atomic_dec_and_test(&conf->active_aligned_reads))
+ 			wake_up(&conf->wait_for_quiescent);

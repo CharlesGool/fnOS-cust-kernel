@@ -1,0 +1,25 @@
+From 67dd55d0c67e0e0a40b6d3379071f8d3e416471d Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:08:00 +0700
+Subject: [PATCH 8/8] =?UTF-8?q?=E7=89=88=E6=9C=AC:=20ZFS=5FMETA=5FGITREV?=
+ =?UTF-8?q?=20=E6=94=B9=E6=88=90=E9=A3=9E=E7=89=9B=E7=9A=84=20"f5d61fe"?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 zfs.ko 里的 gitrev 是 f5d61fe(飞牛私有仓库的提交,
+openzfs 里没有这个提交); 官方 release 包是 "1c702dd-dist"。
+只影响版本字符串(spa_history_log_version 等)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/zfs_gitrev.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/zfs_gitrev.h b/include/zfs_gitrev.h
+index 3181ad4..744878a 100644
+--- a/include/zfs_gitrev.h
++++ b/include/zfs_gitrev.h
+@@ -1 +1 @@
+-#define	ZFS_META_GITREV "1c702dd-dist"
++#define	ZFS_META_GITREV "f5d61fe"

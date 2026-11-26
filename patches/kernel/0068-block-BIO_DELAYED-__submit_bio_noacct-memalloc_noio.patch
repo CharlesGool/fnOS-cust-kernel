@@ -1,0 +1,84 @@
+From 35b1698dc0434a8b1eeda3c65004054c9eabe886 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:25 +0000
+Subject: [PATCH 068/110] =?UTF-8?q?block:=20BIO=5FDELAYED=20=E6=8E=92?=
+ =?UTF-8?q?=E5=BA=8F,=20=5F=5Fsubmit=5Fbio=5Fnoacct=20=E6=9C=9F=E9=97=B4?=
+ =?UTF-8?q?=20memalloc=5Fnoio?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛私有。
+- submit_bio_noacct_nocheck: current->bio_list 存在时, 带 BIO_DELAYED 的 bio 先清掉标志;
+  若是 bio 驱动(fops->submit_bio, 如 md)就加到 bio_list[1] 头部, 否则照常加到 bio_list[0] 尾部。
+  效果(__submit_bio_noacct 的排序): 下层 bio -> 同层 bio -> BIO_DELAYED(后进先出) -> 之前积压的 bio。
+- bio_submit_split_bioset: 切分后把剩余部分(原 bio)打上 BIO_DELAYED 再重提交,
+  使先切下来的前半段派生的 bio 先处理。
+- __submit_bio_noacct: 整个循环包在 memalloc_noio_save/restore 里(bio 驱动的 ->submit_bio
+  里分配内存不再递归进 IO)。mq 路径 __submit_bio_noacct_mq 不变。
+
+比对: submit_bio_noacct_nocheck、bio_submit_split_bioset、__submit_bio OK。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ block/blk-core.c  | 16 +++++++++++++++-
+ block/blk-merge.c |  2 ++
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 37403845f..6ed5c6187 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -672,9 +672,11 @@ static void __submit_bio(struct bio *bio)
+ static void __submit_bio_noacct(struct bio *bio)
+ {
+ 	struct bio_list bio_list_on_stack[2];
++	unsigned int noio_flag;
+ 
+ 	BUG_ON(bio->bi_next);
+ 
++	noio_flag = memalloc_noio_save();
+ 	bio_list_init(&bio_list_on_stack[0]);
+ 	current->bio_list = bio_list_on_stack;
+ 
+@@ -711,6 +713,7 @@ static void __submit_bio_noacct(struct bio *bio)
+ 	} while ((bio = bio_list_pop(&bio_list_on_stack[0])));
+ 
+ 	current->bio_list = NULL;
++	memalloc_noio_restore(noio_flag);
+ }
+ 
+ static void __submit_bio_noacct_mq(struct bio *bio)
+@@ -746,7 +749,18 @@ void submit_bio_noacct_nocheck(struct bio *bio, bool split)
+ 	 * it is active, and then process them after it returned.
+ 	 */
+ 	if (current->bio_list) {
+-		if (split)
++		if (bio_flagged(bio, BIO_DELAYED)) {
++			bio_clear_flag(bio, BIO_DELAYED);
++			/*
++			 * Only bio based drivers sort the bios, see
++			 * __submit_bio_noacct(): put the bio in front of the
++			 * bios that were pending before current ->submit_bio.
++			 */
++			if (bio->bi_bdev->bd_disk->fops->submit_bio)
++				bio_list_add_head(&current->bio_list[1], bio);
++			else
++				bio_list_add(&current->bio_list[0], bio);
++		} else if (split)
+ 			bio_list_add_head(&current->bio_list[0], bio);
+ 		else
+ 			bio_list_add(&current->bio_list[0], bio);
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 61feab8f4..83cb4ceef 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -129,6 +129,8 @@ struct bio *bio_submit_split_bioset(struct bio *bio, unsigned int split_sectors,
+ 	bio_chain(split, bio);
+ 	trace_block_split(split, bio->bi_iter.bi_sector);
+ 	WARN_ON_ONCE(bio_zone_write_plugging(bio));
++	/* sort the remainder behind the bios submitted for @split */
++	bio_set_flag(bio, BIO_DELAYED);
+ 
+ 	if (should_fail_bio(bio))
+ 		bio_io_error(bio);

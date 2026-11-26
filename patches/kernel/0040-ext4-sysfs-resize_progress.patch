@@ -1,0 +1,177 @@
+From 641ccc451ae3848e86c8f1993a4879dd8a3d4328 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:51:20 +0700
+Subject: [PATCH 040/110] =?UTF-8?q?ext4:=20=E5=9C=A8=E7=BA=BF=E6=89=A9?=
+ =?UTF-8?q?=E5=AE=B9=E8=BF=9B=E5=BA=A6=20sysfs=20resize=5Fprogress=20(?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ext4_sb_info 末尾加 s_rsz_prg_status/total/cur (偏移 2208/2216/2224, 与飞牛 BTF 一致)。
+- EXT4_IOC_RESIZE_FS: 开始时 status=1, 结束时按结果置 0 / -1 (带 smp_mb)
+- ext4_resize_fs: 开头清零; total = 新块数 - 原块数; 每加一组 cur 增加,
+  最后一组按实际块数修正; 完成后 cur = total
+- /sys/fs/ext4/<dev>/resize_progress: 读出 "百分比 状态",
+  写 "reset" 清零 (attr_resize_progress = 21, 在 generic show 里处理)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/ext4/ext4.h   |  5 +++++
+ fs/ext4/ioctl.c  |  4 ++++
+ fs/ext4/resize.c | 12 ++++++++++++
+ fs/ext4/sysfs.c  | 25 +++++++++++++++++++++++++
+ 4 files changed, 46 insertions(+)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 97a754640..d485a0ce7 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1788,6 +1788,11 @@ struct ext4_sb_info {
+ 	int s_fc_debug_max_replay;
+ #endif
+ 	struct ext4_fc_replay_state s_fc_replay_state;
++
++	/* shasure - 在线扩容进度 (sysfs resize_progress) */
++	int s_rsz_prg_status;		/* 1 进行中, 0 完成, -1 出错 */
++	__u64 s_rsz_prg_total;		/* 要加的块数 */
++	__u64 s_rsz_prg_cur;		/* 已加的块数 */
+ };
+ 
+ static inline struct ext4_sb_info *EXT4_SB(struct super_block *sb)
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index cc85786be..be9055b08 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -1749,6 +1749,8 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		if (err)
+ 			goto resizefs_out;
+ 
++		EXT4_SB(sb)->s_rsz_prg_status = 1;
++		smp_mb();
+ 		err = ext4_resize_fs(sb, n_blocks_count);
+ 		if (EXT4_SB(sb)->s_journal) {
+ 			ext4_fc_mark_ineligible(sb, EXT4_FC_REASON_RESIZE, NULL);
+@@ -1768,6 +1770,8 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		err2 = ext4_resize_end(sb, true);
+ 		if (err == 0)
+ 			err = err2;
++		EXT4_SB(sb)->s_rsz_prg_status = err ? -1 : 0;
++		smp_mb();
+ 		return err;
+ 	}
+ 
+diff --git a/fs/ext4/resize.c b/fs/ext4/resize.c
+index 050f26168..6191f8d3f 100644
+--- a/fs/ext4/resize.c
++++ b/fs/ext4/resize.c
+@@ -1670,6 +1670,7 @@ static int ext4_setup_next_flex_gd(struct super_block *sb,
+ 				flex_gd->bg_flags[i] |= EXT4_BG_INODE_ZEROED;
+ 		} else
+ 			flex_gd->bg_flags[i] = EXT4_BG_INODE_ZEROED;
++		sbi->s_rsz_prg_cur += EXT4_BLOCKS_PER_GROUP(sb);
+ 	}
+ 
+ 	if (last_group == n_group && ext4_has_group_desc_csum(sb))
+@@ -1680,6 +1681,8 @@ static int ext4_setup_next_flex_gd(struct super_block *sb,
+ 		group_data[i - 1].blocks_count = EXT4_C2B(sbi, last + 1);
+ 		group_data[i - 1].free_clusters_count -= clusters_per_group -
+ 						       last - 1;
++		sbi->s_rsz_prg_cur -= EXT4_BLOCKS_PER_GROUP(sb);
++		sbi->s_rsz_prg_cur += group_data[i - 1].blocks_count;
+ 	}
+ 
+ 	return 1;
+@@ -2013,6 +2016,9 @@ int ext4_resize_fs(struct super_block *sb, ext4_fsblk_t n_blocks_count)
+ 	int meta_bg;
+ 	unsigned int flexbg_size = ext4_flex_bg_size(sbi);
+ 
++	sbi->s_rsz_prg_total = 0;
++	sbi->s_rsz_prg_cur = 0;
++
+ 	/* See if the device is actually as big as what was requested */
+ 	bh = ext4_sb_bread(sb, n_blocks_count - 1, 0);
+ 	if (IS_ERR(bh)) {
+@@ -2031,6 +2037,10 @@ int ext4_resize_fs(struct super_block *sb, ext4_fsblk_t n_blocks_count)
+ 	if (ext4_has_feature_bigalloc(sb))
+ 		n_blocks_count &= ~((1 << EXT4_CLUSTER_BITS(sb)) - 1);
+ 
++	if (ext4_blocks_count(es) < n_blocks_count)
++		sbi->s_rsz_prg_total = n_blocks_count -
++				       ext4_blocks_count(es);
++
+ retry:
+ 	o_blocks_count = ext4_blocks_count(es);
+ 
+@@ -2189,5 +2199,7 @@ int ext4_resize_fs(struct super_block *sb, ext4_fsblk_t n_blocks_count)
+ 			     "file system resize", err);
+ 	ext4_msg(sb, KERN_INFO, "resized filesystem to %llu",
+ 		 ext4_blocks_count(es));
++	if (sbi->s_rsz_prg_total)
++		sbi->s_rsz_prg_cur = sbi->s_rsz_prg_total;
+ 	return err;
+ }
+diff --git a/fs/ext4/sysfs.c b/fs/ext4/sysfs.c
+index 3ec79a33d..2a212eb08 100644
+--- a/fs/ext4/sysfs.c
++++ b/fs/ext4/sysfs.c
+@@ -40,6 +40,7 @@ typedef enum {
+ 	attr_pointer_string,
+ 	attr_pointer_atomic,
+ 	attr_journal_task,
++	attr_resize_progress,
+ } attr_id_t;
+ 
+ typedef enum {
+@@ -217,6 +218,8 @@ EXT4_ATTR_OFFSET(mb_group_prealloc, 0644, clusters_in_group,
+ 		 ext4_sb_info, s_mb_group_prealloc);
+ EXT4_ATTR_OFFSET(mb_best_avail_max_trim_order, 0644, mb_order,
+ 		 ext4_sb_info, s_mb_best_avail_max_trim_order);
++EXT4_ATTR_OFFSET(resize_progress, 0644, resize_progress,
++		 ext4_sb_info, s_rsz_prg_status);
+ EXT4_RW_ATTR_SBI_UI(inode_goal, s_inode_goal);
+ EXT4_RW_ATTR_SBI_UI(mb_stats, s_mb_stats);
+ EXT4_RW_ATTR_SBI_UI(mb_max_to_scan, s_mb_max_to_scan);
+@@ -309,6 +312,7 @@ static struct attribute *ext4_attrs[] = {
+ 	ATTR_LIST(last_trim_minblks),
+ 	ATTR_LIST(sb_update_sec),
+ 	ATTR_LIST(sb_update_kb),
++	ATTR_LIST(resize_progress),
+ 	NULL,
+ };
+ ATTRIBUTE_GROUPS(ext4);
+@@ -407,6 +411,18 @@ static ssize_t ext4_generic_attr_show(struct ext4_attr *a,
+ 		return sysfs_emit(buf, "%.*s\n", a->attr_size, (char *) ptr);
+ 	case attr_pointer_atomic:
+ 		return sysfs_emit(buf, "%d\n", atomic_read((atomic_t *) ptr));
++	case attr_resize_progress: {
++		/* "百分比 状态" */
++		u64 total, cur, percent;
++		int status;
++
++		smp_mb();
++		status = sbi->s_rsz_prg_status;
++		total = sbi->s_rsz_prg_total;
++		cur = sbi->s_rsz_prg_cur;
++		percent = total ? cur * 100 / total : 0;
++		return sysfs_emit(buf, "%llu %d\n", percent, status);
++	}
+ 	}
+ 	return 0;
+ }
+@@ -519,6 +535,15 @@ static ssize_t ext4_attr_store(struct kobject *kobj,
+ 		return inode_readahead_blks_store(sbi, buf, len);
+ 	case attr_trigger_test_error:
+ 		return trigger_test_error(sbi, buf, len);
++	case attr_resize_progress:
++		/* 只接受 "reset": 清零进度 */
++		buf = skip_spaces(buf);
++		if (!buf || strnlen(buf, 6) < 5 || strncmp(buf, "reset", 5))
++			return -EINVAL;
++		sbi->s_rsz_prg_status = 0;
++		sbi->s_rsz_prg_total = 0;
++		sbi->s_rsz_prg_cur = 0;
++		return len;
+ 	default:
+ 		return ext4_generic_attr_store(a, sbi, buf, len);
+ 	}

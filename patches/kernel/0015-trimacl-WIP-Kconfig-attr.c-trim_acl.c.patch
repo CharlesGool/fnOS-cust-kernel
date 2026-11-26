@@ -1,0 +1,2977 @@
+From 36eceb653710434caf2aaed51fec2b1dd09b8327 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:00:28 +0700
+Subject: [PATCH 015/110] =?UTF-8?q?trimacl=20(WIP):=20=E5=A4=B4=E6=96=87?=
+ =?UTF-8?q?=E4=BB=B6=E3=80=81Kconfig=E3=80=81attr.c=20=E9=92=A9=E5=AD=90?=
+ =?UTF-8?q?=E3=80=81trim=5Facl.c=20=E5=88=9D=E7=89=88=E3=80=81=E4=B8=B4?=
+ =?UTF-8?q?=E6=97=B6=E6=A1=A9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- include: fs.h/fanotify/fsnotify/syscalls 与飞牛原版头文件一致, 新增 trim_acl.h、trimvfs.h、trim_flags.h 等
+- fs/Kconfig: FS_TRIM_ACL; fs/Makefile: trimvfs.o、trim_acl.o
+- fs/attr.c: may_setattr 改传 dentry, setattr_prepare 卷管理员/属主放行和取得所有权
+- fs/notify: FS_DELETE_PERM 后位数检查 26->27、24->25
+- fs/trim_stub.c: __weak 临时桩, 第 6 步完成后删除
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/Kconfig                             |    9 +
+ fs/Makefile                            |    3 +
+ fs/attr.c                              |   66 +-
+ fs/gfs2/inode.c                        |    2 +-
+ fs/notify/fanotify/fanotify.c          |    2 +-
+ fs/notify/fsnotify.c                   |    2 +-
+ fs/trim_acl.c                          | 1861 ++++++++++++++++++++++++
+ fs/trim_stub.c                         |   69 +
+ fs/trimvfs.c                           |    5 +
+ include/linux/fanotify.h               |    2 +-
+ include/linux/fs.h                     |   81 +-
+ include/linux/fsnotify.h               |   19 +
+ include/linux/fsnotify_backend.h       |    3 +-
+ include/linux/syscalls.h               |    4 +
+ include/linux/trim_acl.h               |  126 ++
+ include/linux/trim_acl_xattr.h         |   21 +
+ include/linux/trim_flags.h             |   34 +
+ include/linux/trimvfs.h                |  132 ++
+ include/uapi/linux/fanotify.h          |    1 +
+ include/uapi/linux/fs.h                |    6 +
+ include/uapi/linux/trim_acl.h          |   95 ++
+ include/uapi/linux/trim_acl_xattr_ds.h |   12 +
+ include/uapi/linux/trim_flags.h        |   19 +
+ 23 files changed, 2561 insertions(+), 13 deletions(-)
+ create mode 100755 fs/trim_acl.c
+ create mode 100755 fs/trim_stub.c
+ create mode 100644 fs/trimvfs.c
+ create mode 100644 include/linux/trim_acl.h
+ create mode 100644 include/linux/trim_acl_xattr.h
+ create mode 100644 include/linux/trim_flags.h
+ create mode 100644 include/linux/trimvfs.h
+ create mode 100644 include/uapi/linux/trim_acl.h
+ create mode 100644 include/uapi/linux/trim_acl_xattr_ds.h
+ create mode 100644 include/uapi/linux/trim_flags.h
+
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 0bfdaecaa..21dc5d64e 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -102,6 +102,15 @@ config FS_DAX_PMD
+ config FS_POSIX_ACL
+ 	def_bool n
+ 
++config FS_TRIM_ACL
++	bool "TRIM ACL support"
++	depends on FS_POSIX_ACL
++	default y
++	help
++	  fnOS TRIM ACL: NT-style ACLs stored in the system.trim_acl xattr,
++	  volume-aware permission checks, the trim faccessat2 channel and
++	  the recycle bin device.
++
+ config EXPORTFS
+ 	tristate
+ 
+diff --git a/fs/Makefile b/fs/Makefile
+index e3523ab2e..6db0d973e 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -17,6 +17,8 @@ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		fs_types.o fs_context.o fs_parser.o fsopen.o init.o \
+ 		kernel_read_file.o mnt_idmapping.o remap_range.o pidfs.o \
+ 		file_attr.o
++obj-$(CONFIG_FS_TRIM_ACL)	+= trimvfs.o
++obj-$(CONFIG_FS_TRIM_ACL)	+= trim_stub.o	# 临时桩, 第 6 步完成后删除
+ 
+ obj-$(CONFIG_BUFFER_HEAD)	+= buffer.o mpage.o
+ obj-$(CONFIG_PROC_FS)		+= proc_namespace.o
+@@ -43,6 +45,7 @@ obj-$(CONFIG_BINFMT_FLAT)	+= binfmt_flat.o
+ obj-$(CONFIG_FS_STACK)		+= backing-file.o
+ obj-$(CONFIG_FS_MBCACHE)	+= mbcache.o
+ obj-$(CONFIG_FS_POSIX_ACL)	+= posix_acl.o
++obj-$(CONFIG_FS_TRIM_ACL)	+= trim_acl.o
+ obj-$(CONFIG_NFS_COMMON)	+= nfs_common/
+ obj-$(CONFIG_COREDUMP)		+= coredump.o
+ obj-$(CONFIG_SYSCTL)		+= drop_caches.o sysctls.o
+diff --git a/fs/attr.c b/fs/attr.c
+index 3f2cce4e4..acada3a44 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -16,6 +16,7 @@
+ #include <linux/fcntl.h>
+ #include <linux/filelock.h>
+ #include <linux/security.h>
++#include <linux/trim_acl.h>
+ 
+ /**
+  * setattr_should_drop_sgid - determine whether the setgid bit needs to be
+@@ -106,6 +107,26 @@ static bool chown_ok(struct mnt_idmap *idmap,
+ 	return false;
+ }
+ 
++/*
++ * trim_chown_ok - chown check used for volume admins/home owners
++ *
++ * Unlike chown_ok(), the caller may take ownership (chown to itself)
++ * even when it does not own the inode yet.
++ */
++static bool trim_chown_ok(struct mnt_idmap *idmap,
++			  const struct inode *inode, vfsuid_t ia_vfsuid)
++{
++	vfsuid_t vfsuid = i_uid_into_vfsuid(idmap, inode);
++	if (vfsuid_eq_kuid(ia_vfsuid, current_fsuid()))
++		return true;
++	if (capable_wrt_inode_uidgid(idmap, inode, CAP_CHOWN))
++		return true;
++	if (!vfsuid_valid(vfsuid) &&
++	    ns_capable(inode->i_sb->s_user_ns, CAP_CHOWN))
++		return true;
++	return false;
++}
++
+ /**
+  * chgrp_ok - verify permissions to chgrp inode
+  * @idmap:	idmap of the mount @inode was found from
+@@ -163,6 +184,7 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
+ {
+ 	struct inode *inode = d_inode(dentry);
+ 	unsigned int ia_valid = attr->ia_valid;
++	int ret;
+ 
+ 	/*
+ 	 * First check size constraints.  These can't be overriden using
+@@ -184,6 +206,34 @@ int setattr_prepare(struct mnt_idmap *idmap, struct dentry *dentry,
+ 			return error;
+ 	}
+ 
++	/* Volume admins and home owners skip the owner checks below. */
++	ret = vol_is_admin_or_homeowner(idmap, dentry);
++	if (ret) {
++		if (ret != 1) {
++			if ((ia_valid & ATTR_UID) &&
++			    !trim_chown_ok(idmap, inode, attr->ia_vfsuid))
++				return -EPERM;
++			if ((ia_valid & ATTR_GID) &&
++			    !chgrp_ok(idmap, inode, attr->ia_vfsgid))
++				return -EPERM;
++		}
++		ia_valid |= ATTR_FORCE;
++	}
++
++	/* Taking ownership is allowed by the MAY_GET_OWNER_SHIP ACL right. */
++	if (IS_TRIMACL(dentry)) {
++		enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++		int error = trimacl_resolve_policy(dentry, 0, &policy);
++
++		if (error)
++			return error;
++		if (policy == TRIMACL_POLICY_TRIM &&
++		    (ia_valid & (ATTR_UID | ATTR_FORCE)) == ATTR_UID &&
++		    trim_chown_ok(idmap, inode, attr->ia_vfsuid) &&
++		    !trimacl_check_acl(idmap, dentry, MAY_GET_OWNER_SHIP, NULL))
++			ia_valid &= ~ATTR_UID;
++	}
++
+ 	/* If force is set do it anyway. */
+ 	if (ia_valid & ATTR_FORCE)
+ 		goto kill_priv;
+@@ -369,9 +419,10 @@ void setattr_copy(struct mnt_idmap *idmap, struct inode *inode,
+ }
+ EXPORT_SYMBOL(setattr_copy);
+ 
+-int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
++int may_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		unsigned int ia_valid)
+ {
++	struct inode *inode = d_inode(dentry);
+ 	int error;
+ 
+ 	if (ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID | ATTR_TIMES_SET)) {
+@@ -387,6 +438,17 @@ int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
+ 		if (IS_IMMUTABLE(inode))
+ 			return -EPERM;
+ 
++		if (IS_TRIMACL_INODE(inode)) {
++			enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++
++			error = trimacl_resolve_policy(dentry, 0, &policy);
++			if (error)
++				return error;
++			if (policy == TRIMACL_POLICY_TRIM)
++				return trim_permission(idmap, dentry,
++						       MAY_WRITE_ATTR | MAY_WRITE_EXT_ATTR);
++		}
++
+ 		if (!inode_owner_or_capable(idmap, inode)) {
+ 			error = inode_permission(idmap, inode, MAY_WRITE);
+ 			if (error)
+@@ -435,7 +497,7 @@ int notify_change(struct mnt_idmap *idmap, struct dentry *dentry,
+ 
+ 	WARN_ON_ONCE(!inode_is_locked(inode));
+ 
+-	error = may_setattr(idmap, inode, ia_valid);
++	error = may_setattr(idmap, dentry, ia_valid);
+ 	if (error)
+ 		return error;
+ 
+diff --git a/fs/gfs2/inode.c b/fs/gfs2/inode.c
+index 3a9190054..b020379d8 100644
+--- a/fs/gfs2/inode.c
++++ b/fs/gfs2/inode.c
+@@ -2109,7 +2109,7 @@ static int gfs2_setattr(struct mnt_idmap *idmap,
+ 	if (error)
+ 		goto out;
+ 
+-	error = may_setattr(&nop_mnt_idmap, inode, attr->ia_valid);
++	error = may_setattr(&nop_mnt_idmap, dentry, attr->ia_valid);
+ 	if (error)
+ 		goto error;
+ 
+diff --git a/fs/notify/fanotify/fanotify.c b/fs/notify/fanotify/fanotify.c
+index bb12baebd..a857ed03c 100644
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@ -960,7 +960,7 @@ static int fanotify_handle_event(struct fsnotify_group *group, u32 mask,
+ 	BUILD_BUG_ON(FAN_RENAME != FS_RENAME);
+ 	BUILD_BUG_ON(FAN_PRE_ACCESS != FS_PRE_ACCESS);
+ 
+-	BUILD_BUG_ON(HWEIGHT32(ALL_FANOTIFY_EVENT_BITS) != 24);
++	BUILD_BUG_ON(HWEIGHT32(ALL_FANOTIFY_EVENT_BITS) != 25);
+ 
+ 	mask = fanotify_group_event_mask(group, iter_info, &match_mask,
+ 					 mask, data, data_type, dir);
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index cae0adce6..ba5b12e89 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -771,7 +771,7 @@ static __init int fsnotify_init(void)
+ {
+ 	int ret;
+ 
+-	BUILD_BUG_ON(HWEIGHT32(ALL_FSNOTIFY_BITS) != 26);
++	BUILD_BUG_ON(HWEIGHT32(ALL_FSNOTIFY_BITS) != 27);
+ 
+ 	ret = init_srcu_struct(&fsnotify_mark_srcu);
+ 	if (ret)
+diff --git a/fs/trim_acl.c b/fs/trim_acl.c
+new file mode 100755
+index 000000000..4bf33fa6b
+--- /dev/null
++++ b/fs/trim_acl.c
+@@ -0,0 +1,1861 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) T.R.I.M Inc.
++ *
++ * fnOS TRIM ACL core. Reconstructed from the fnOS 6.18.18.c1186-trim binary.
++ */
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/atomic.h>
++#include <linux/fs.h>
++#include <linux/sched.h>
++#include <linux/cred.h>
++#include <linux/namei.h>
++#include <linux/mnt_idmapping.h>
++#include <linux/posix_acl.h>
++#include <linux/posix_acl_xattr.h>
++#include <linux/xattr.h>
++#include <linux/export.h>
++#include <linux/uaccess.h>
++#include <linux/debugfs.h>
++#include <linux/device_cgroup.h>
++#include <linux/trim_acl.h>
++#include <linux/trim_acl_xattr.h>
++#include <linux/trim_flags.h>
++#include <linux/trimvfs.h>
++
++/*
++ * Allocate a new ACL with the specified number of entries.
++ */
++struct trim_acl *trim_acl_alloc(int count, gfp_t flags)
++{
++	const size_t size = sizeof(struct trim_acl) + count * sizeof(struct trim_acl_entry);
++	struct trim_acl *acl = kmalloc(size, flags);
++
++	if (acl) {
++		refcount_set(&acl->a_refcount, 1);
++		acl->a_count = count;
++	}
++	return acl;
++}
++EXPORT_SYMBOL(trim_acl_alloc);
++
++/*
++ * Check if an acl is valid. Returns 0 if it is, or -E... otherwise.
++ */
++int trim_acl_valid(const struct trim_acl *acl)
++{
++	const struct trim_acl_entry *pa, *pe;
++
++	if (!acl)
++		return -EINVAL;
++
++	FOREACH_TRIMACL_ENTRY(pa, acl, pe) {
++		if (pa->e_perm & ~(TRIM_PERM_FULL_CONTROL))
++			return -EINVAL;
++		if (pa->e_tag > TRIM_ACL_TAG_ALL)
++			return -EINVAL;
++		if (pa->e_allow != TRIM_ACL_ALLOW && pa->e_allow != TRIM_ACL_DENY)
++			return -EINVAL;
++		if (pa->e_inherit & ~TRIM_ACL_INHERIT_ALL)
++			return -EINVAL;
++	}
++	return 0;
++}
++EXPORT_SYMBOL(trim_acl_valid);
++
++/*
++ * Convert from in-memory to extended attribute representation.
++ */
++int trim_acl_to_xattr(const struct trim_acl *acl, void *buffer, size_t size)
++{
++	trim_acl_xattr_header *ext_acl = buffer;
++	trim_acl_xattr_entry *ext_entry;
++	int real_size, n;
++	unsigned short tag;
++
++	if (!acl)
++		return 0;
++
++	real_size = trim_acl_xattr_size(acl->a_count);
++	if (!buffer)
++		return real_size;
++	if (real_size > size)
++		return -ERANGE;
++
++	ext_entry = ext_acl->a_entries;
++	ext_acl->a_version = cpu_to_le16(TRIM_ACL_XATTR_VERSION);
++
++	for (n = 0; n < acl->a_count; n++, ext_entry++) {
++		const struct trim_acl_entry *acl_e = &acl->a_entries[n];
++
++		switch (acl_e->e_tag) {
++		case TRIM_ACL_USER:
++			tag = TRIM_ACL_XATTR_TAG_ID_USER;
++			break;
++		case TRIM_ACL_GROUP:
++			tag = TRIM_ACL_XATTR_TAG_ID_GROUP;
++			break;
++		case TRIM_ACL_EVERYONE:
++			tag = TRIM_ACL_XATTR_TAG_ID_EVERYONE;
++			break;
++		case TRIM_ACL_OWNER:
++			tag = TRIM_ACL_XATTR_TAG_ID_OWNER;
++			break;
++		case TRIM_ACL_AUTHENTICATEDUSER:
++			tag = TRIM_ACL_XATTR_TAG_ID_AUTHENTICATEDUSER;
++			break;
++		case TRIM_ACL_SYSTEM:
++			tag = TRIM_ACL_XATTR_TAG_ID_SYSTEM;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		switch (acl_e->e_allow) {
++		case TRIM_ACL_ALLOW:
++			tag |= TRIM_ACL_XATTR_TAG_IS_ALLOW;
++			break;
++		case TRIM_ACL_DENY:
++			tag |= TRIM_ACL_XATTR_TAG_IS_DENY;
++			break;
++		default:
++			return -EINVAL;
++		}
++
++		ext_entry->e_tag = cpu_to_le16(tag);
++		ext_entry->e_inherit = cpu_to_le16(acl_e->e_inherit);
++		ext_entry->e_perm = cpu_to_le32(acl_e->e_perm);
++		ext_entry->e_id = cpu_to_le32(acl_e->e_id);
++		ext_entry->e_level = cpu_to_le32(acl_e->e_level);
++	}
++	return real_size;
++}
++EXPORT_SYMBOL(trim_acl_to_xattr);
++
++struct trim_acl *trim_acl_clone(const struct trim_acl *acl, gfp_t flags)
++{
++	struct trim_acl *clone = NULL;
++
++	if (acl) {
++		clone = kmemdup(acl, sizeof(struct trim_acl) + acl->a_count * sizeof(struct trim_acl_entry), flags);
++		if (clone)
++			refcount_set(&clone->a_refcount, 1);
++	}
++	return clone;
++}
++EXPORT_SYMBOL(trim_acl_clone);
++
++struct trim_acl *trim_acl_realloc(struct trim_acl *acl, unsigned int counts, gfp_t flags)
++{
++	struct trim_acl *new_acl;
++
++	if (!acl)
++		return NULL;
++
++	if (refcount_read(&acl->a_refcount) != 1) {
++		printk(KERN_ERR " acl reference count: %d \n ", refcount_read(&acl->a_refcount));
++		return NULL;
++	}
++
++	new_acl = krealloc(acl, sizeof(struct trim_acl) + counts * sizeof(struct trim_acl_entry), flags);
++	if (new_acl)
++		new_acl->a_count = counts;
++	return new_acl;
++}
++EXPORT_SYMBOL(trim_acl_realloc);
++
++/*
++ * Convert from in-memory to filesystem representation.
++ */
++void *trim_acl_to_disk(const struct trim_acl *acl, size_t *size)
++{
++	trim_acl_header_t *ext_acl;
++	char *e;
++	size_t n;
++	unsigned short tag;
++
++	*size = sizeof(trim_acl_header_t) + acl->a_count * sizeof(trim_acl_entry_t);
++	ext_acl = kmalloc(*size, GFP_NOFS);
++	if (!ext_acl)
++		return ERR_PTR(-ENOMEM);
++	ext_acl->a_version = cpu_to_le16(TRIM_ACL_VERSION);
++	e = (char *)ext_acl + sizeof(trim_acl_header_t);
++	for (n = 0; n < acl->a_count; n++) {
++		const struct trim_acl_entry *acl_e = &acl->a_entries[n];
++		trim_acl_entry_t *entry = (trim_acl_entry_t *)e;
++
++		switch (acl_e->e_tag) {
++		case TRIM_ACL_USER:
++			tag = TRIM_ACL_XATTR_TAG_ID_USER;
++			break;
++		case TRIM_ACL_GROUP:
++			tag = TRIM_ACL_XATTR_TAG_ID_GROUP;
++			break;
++		case TRIM_ACL_EVERYONE:
++			tag = TRIM_ACL_XATTR_TAG_ID_EVERYONE;
++			break;
++		case TRIM_ACL_OWNER:
++			tag = TRIM_ACL_XATTR_TAG_ID_OWNER;
++			break;
++		case TRIM_ACL_AUTHENTICATEDUSER:
++			tag = TRIM_ACL_XATTR_TAG_ID_AUTHENTICATEDUSER;
++			break;
++		case TRIM_ACL_SYSTEM:
++			tag = TRIM_ACL_XATTR_TAG_ID_SYSTEM;
++			break;
++		default:
++			goto fail;
++		}
++
++		switch (acl_e->e_allow) {
++		case TRIM_ACL_ALLOW:
++			tag |= TRIM_ACL_XATTR_TAG_IS_ALLOW;
++			break;
++		case TRIM_ACL_DENY:
++			tag |= TRIM_ACL_XATTR_TAG_IS_DENY;
++			break;
++		default:
++			goto fail;
++		}
++
++		entry->e_tag = cpu_to_le16(tag);
++		entry->e_inherit = cpu_to_le16(acl_e->e_inherit);
++		entry->e_perm = cpu_to_le32(acl_e->e_perm);
++		entry->e_id = cpu_to_le32(acl_e->e_id);
++		e += sizeof(trim_acl_entry_t);
++	}
++	return (char *)ext_acl;
++
++fail:
++	kfree(ext_acl);
++	return ERR_PTR(-EINVAL);
++}
++EXPORT_SYMBOL(trim_acl_to_disk);
++
++struct trim_acl *get_cached_trim_acl(struct inode *inode)
++{
++	struct trim_acl **p = &inode->i_trim_acl, *acl;
++
++	for (;;) {
++		rcu_read_lock();
++		acl = rcu_dereference(*p);
++		if (!acl || is_uncached_trim_acl(acl) || refcount_inc_not_zero(&acl->a_refcount))
++			break;
++		rcu_read_unlock();
++		cpu_relax();
++	}
++	rcu_read_unlock();
++	return acl;
++}
++EXPORT_SYMBOL(get_cached_trim_acl);
++
++void forget_cached_trim_acl(struct inode *inode)
++{
++	struct trim_acl *old;
++
++	old = xchg(&inode->i_trim_acl, ACL_NOT_CACHED);
++	if (!is_uncached_trim_acl(old))
++		trim_acl_release(old);
++}
++EXPORT_SYMBOL(forget_cached_trim_acl);
++
++void set_cached_trim_acl(struct inode *inode, struct trim_acl *acl)
++{
++	struct trim_acl *old;
++
++	old = xchg(&inode->i_trim_acl, trim_acl_dup(acl));
++	if (!is_uncached_trim_acl(old))
++		trim_acl_release(old);
++}
++EXPORT_SYMBOL(set_cached_trim_acl);
++
++/*
++ * Convert from extended attribute to in-memory representation.
++ */
++struct trim_acl *trim_acl_from_xattr(const void *value, size_t size)
++{
++	const trim_acl_xattr_header *header = value;
++	const trim_acl_xattr_entry *entry = (const void *)(header + 1), *end;
++	int count;
++	struct trim_acl *acl;
++	struct trim_acl_entry *acl_e;
++	unsigned short tag;
++
++	if (!value)
++		return NULL;
++	if (size < sizeof(trim_acl_xattr_header))
++		return ERR_PTR(-EINVAL);
++	if (header->a_version != cpu_to_le16(TRIM_ACL_XATTR_VERSION))
++		return ERR_PTR(-EOPNOTSUPP);
++
++	count = trim_acl_xattr_count(size);
++	if (count < 0)
++		return ERR_PTR(-EINVAL);
++	if (count == 0)
++		return NULL;
++
++	acl = trim_acl_alloc(count, GFP_KERNEL);
++	if (!acl)
++		return ERR_PTR(-ENOMEM);
++	acl_e = acl->a_entries;
++
++	for (end = entry + count; entry != end; acl_e++, entry++) {
++		tag = le16_to_cpu(entry->e_tag);
++
++		if (tag & TRIM_ACL_XATTR_TAG_ID_USER) {
++			acl_e->e_tag = TRIM_ACL_USER;
++			acl_e->e_id = le32_to_cpu(entry->e_id);
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_GROUP) {
++			acl_e->e_tag = TRIM_ACL_GROUP;
++			acl_e->e_id = le32_to_cpu(entry->e_id);
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_EVERYONE) {
++			acl_e->e_tag = TRIM_ACL_EVERYONE;
++			acl_e->e_id = TRIM_ACL_UNDEFINED_ID;
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_OWNER) {
++			acl_e->e_tag = TRIM_ACL_OWNER;
++			acl_e->e_id = TRIM_ACL_UNDEFINED_ID;
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_AUTHENTICATEDUSER) {
++			acl_e->e_tag = TRIM_ACL_AUTHENTICATEDUSER;
++			acl_e->e_id = TRIM_ACL_UNDEFINED_ID;
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_SYSTEM) {
++			acl_e->e_tag = TRIM_ACL_SYSTEM;
++			acl_e->e_id = TRIM_ACL_UNDEFINED_ID;
++		} else {
++			goto fail;
++		}
++
++		if (tag & TRIM_ACL_XATTR_TAG_IS_ALLOW)
++			acl_e->e_allow = TRIM_ACL_ALLOW;
++		else if (tag & TRIM_ACL_XATTR_TAG_IS_DENY)
++			acl_e->e_allow = TRIM_ACL_DENY;
++		else
++			goto fail;
++
++		acl_e->e_perm = le32_to_cpu(entry->e_perm);
++		acl_e->e_inherit = le16_to_cpu(entry->e_inherit);
++		acl_e->e_level = le32_to_cpu(entry->e_level);
++	}
++	return acl;
++
++fail:
++	trim_acl_release(acl);
++	return ERR_PTR(-EINVAL);
++}
++EXPORT_SYMBOL(trim_acl_from_xattr);
++
++static inline int trim_acl_count(size_t size)
++{
++	size -= sizeof(trim_acl_header_t);
++	if (size % sizeof(trim_acl_entry_t))
++		return -1;
++	return size / sizeof(trim_acl_entry_t);
++}
++
++/*
++ * Convert from filesystem to in-memory representation.
++ */
++struct trim_acl *trim_acl_from_disk(const void *value, size_t size)
++{
++	int n, count;
++	struct trim_acl *acl;
++	unsigned short tag;
++
++	if (!value)
++		return NULL;
++	if (size < sizeof(trim_acl_header_t))
++		return ERR_PTR(-EINVAL);
++	if (((trim_acl_header_t *)value)->a_version != cpu_to_le16(TRIM_ACL_VERSION))
++		return ERR_PTR(-EINVAL);
++	value = (char *)value + sizeof(trim_acl_header_t);
++	count = trim_acl_count(size);
++	if (count < 0)
++		return ERR_PTR(-EINVAL);
++	if (count == 0)
++		return NULL;
++	acl = trim_acl_alloc(count, GFP_NOFS);
++	if (!acl)
++		return ERR_PTR(-ENOMEM);
++	for (n = 0; n < count; n++) {
++		trim_acl_entry_t *entry = (trim_acl_entry_t *)value;
++
++		tag = le16_to_cpu(entry->e_tag);
++		if (tag & TRIM_ACL_XATTR_TAG_ID_USER) {
++			acl->a_entries[n].e_tag = TRIM_ACL_USER;
++			acl->a_entries[n].e_id = le32_to_cpu(entry->e_id);
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_GROUP) {
++			acl->a_entries[n].e_tag = TRIM_ACL_GROUP;
++			acl->a_entries[n].e_id = le32_to_cpu(entry->e_id);
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_EVERYONE) {
++			acl->a_entries[n].e_tag = TRIM_ACL_EVERYONE;
++			acl->a_entries[n].e_id = TRIM_ACL_UNDEFINED_ID;
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_OWNER) {
++			acl->a_entries[n].e_tag = TRIM_ACL_OWNER;
++			acl->a_entries[n].e_id = TRIM_ACL_UNDEFINED_ID;
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_AUTHENTICATEDUSER) {
++			acl->a_entries[n].e_tag = TRIM_ACL_AUTHENTICATEDUSER;
++			acl->a_entries[n].e_id = TRIM_ACL_UNDEFINED_ID;
++		} else if (tag & TRIM_ACL_XATTR_TAG_ID_SYSTEM) {
++			acl->a_entries[n].e_tag = TRIM_ACL_SYSTEM;
++			acl->a_entries[n].e_id = TRIM_ACL_UNDEFINED_ID;
++		} else {
++			goto fail;
++		}
++
++		if (tag & TRIM_ACL_XATTR_TAG_IS_ALLOW)
++			acl->a_entries[n].e_allow = TRIM_ACL_ALLOW;
++		else if (tag & TRIM_ACL_XATTR_TAG_IS_DENY)
++			acl->a_entries[n].e_allow = TRIM_ACL_DENY;
++		else
++			goto fail;
++
++		acl->a_entries[n].e_perm = le32_to_cpu(entry->e_perm);
++		acl->a_entries[n].e_inherit = le16_to_cpu(entry->e_inherit);
++		acl->a_entries[n].e_level = 0;
++		value = (char *)value + sizeof(trim_acl_entry_t);
++	}
++	return acl;
++
++fail:
++	trim_acl_release(acl);
++	return ERR_PTR(-EINVAL);
++}
++EXPORT_SYMBOL(trim_acl_from_disk);
++
++static struct trim_acl *get_inode_trim_acl(struct inode *inode)
++{
++	void *sentinel;
++	struct trim_acl **p;
++	struct trim_acl *acl;
++
++	acl = get_cached_trim_acl(inode);
++	if (!is_uncached_trim_acl(acl))
++		return acl;
++
++	if (!IS_TRIMACL_INODE(inode))
++		return NULL;
++
++	sentinel = uncached_acl_sentinel(current);
++	p = &inode->i_trim_acl;
++
++	/*
++	 * Same protocol as __get_acl(): mark the cache slot with a
++	 * per-task sentinel so a concurrent set/forget invalidates us.
++	 */
++	cmpxchg(p, ACL_NOT_CACHED, sentinel);
++
++	if (!inode->i_op->get_trim_acl) {
++		set_cached_trim_acl(inode, NULL);
++		return NULL;
++	}
++
++	acl = inode->i_op->get_trim_acl(&nop_mnt_idmap, inode);
++	if (IS_ERR(acl)) {
++		cmpxchg(p, sentinel, ACL_NOT_CACHED);
++		return acl;
++	}
++
++	trim_acl_dup(acl);
++	if (unlikely(!try_cmpxchg(p, &sentinel, acl)))
++		trim_acl_release(acl);
++	return acl;
++}
++
++/* -------------------------------------------------------------------------- */
++
++static int trimacl_debug_level;
++
++#define trimacl_debug(fmt, ...)							\
++	do {									\
++		if (trimacl_debug_level)					\
++			printk(KERN_INFO "[trimacl]" fmt, ##__VA_ARGS__);	\
++	} while (0)
++
++/* Debug output with the dentry path as the first %s */
++#define trimacl_debug_path(dentry, fmt, ...)					\
++	do {									\
++		if (trimacl_debug_level > 0) {					\
++			char *__buf = kmalloc(PATH_MAX, GFP_NOFS);		\
++			if (__buf) {						\
++				char *__p = dentry_path_raw(dentry, __buf, PATH_MAX); \
++				trimacl_debug(fmt, IS_ERR(__p) ?		\
++					      (char *)(dentry)->d_name.name : __p, \
++					      ##__VA_ARGS__);			\
++				kfree(__buf);					\
++			}							\
++		}								\
++	} while (0)
++
++/* fnOS Administrators group and system user */
++#define TRIM_ADMIN_GID		1000
++#define TRIM_SYSTEM_UID		712
++/* is_vol_d(): external disk */
++#define TRIM_VOL_TYPE_EXTERNAL	0x110
++/* is_user_dir_d() results */
++#define TRIM_USER_DIR_READONLY	0x01
++#define TRIM_USER_DIR_READ	0x11
++#define TRIM_USER_DIR_FULL	0x12
++
++#define TA_UID(ta)	(TA_NOT_CURRENT(ta) ? (ta)->uid : __kuid_val(current_fsuid()))
++
++static inline bool ta_vfsuid_eq(struct trim_access_t *ta, vfsuid_t vfsuid)
++{
++	return vfsuid_eq_kuid(vfsuid, KUIDT_INIT(TA_UID(ta)));
++}
++
++static inline bool ta_vfsgid_in_group(struct trim_access_t *ta, vfsgid_t vfsgid)
++{
++	if (TA_NOT_CURRENT(ta))
++		return trim_is_in_group(__vfsgid_val(vfsgid), ta->gid_count, ta->gids);
++	return vfsgid_in_group_p(vfsgid);
++}
++
++static inline bool ta_in_group(struct mnt_idmap *idmap, struct user_namespace *ns, struct trim_access_t *ta,
++			       gid_t gid)
++{
++	if (TA_NOT_CURRENT(ta))
++		return trim_is_in_group(gid, ta->gid_count, ta->gids);
++	return vfsgid_in_group_p(make_vfsgid(idmap, ns, make_kgid(ns, gid)));
++}
++
++static inline bool ta_is_root(struct mnt_idmap *idmap, struct inode *inode, struct trim_access_t *ta)
++{
++	return (!TA_NOT_CURRENT(ta) && capable_wrt_inode_uidgid(idmap, inode, CAP_DAC_OVERRIDE)) ||
++	       (TA_NOT_CURRENT(ta) && ta->uid == 0);
++}
++
++/*
++ * Does the entry apply at this level?  Level 0 is the object itself,
++ * higher levels are inherited from the ancestors.
++ */
++static inline bool trimacl_entry_applies(const struct trim_acl_entry *pa, int level, umode_t type)
++{
++	if ((pa->e_inherit & TRIM_ACL_INHERIT_NO_PROPAGATE) && level > 1)
++		return false;
++	if (level == 0)
++		return type != S_IFDIR || (pa->e_inherit & TRIM_ACL_INHERIT_SELF);
++	if (type == S_IFDIR)
++		return pa->e_inherit & TRIM_ACL_INHERIT_DIR;
++	return pa->e_inherit & TRIM_ACL_INHERIT_FILE;
++}
++
++/* POSIX rwx (3 bits) -> trim permission */
++static inline unsigned int trimacl_rwx_to_perm(umode_t mode)
++{
++	unsigned int perm = mode & S_IXOTH;
++
++	if (mode & S_IWOTH)
++		perm |= TRIM_PERM_WRITABLE;
++	if (mode & S_IROTH)
++		perm |= TRIM_PERM_READABLE;
++	return perm;
++}
++
++/* trim permission -> POSIX rwx (3 bits) */
++static inline unsigned int trimacl_perm_to_rwx(unsigned int perm)
++{
++	unsigned int mode = 0;
++
++	if ((perm & TRIM_PERM_READABLE) == TRIM_PERM_READABLE)
++		mode |= S_IROTH;
++	if ((perm & TRIM_PERM_WRITABLE) == TRIM_PERM_WRITABLE)
++		mode |= S_IWOTH;
++	if (perm & MAY_EXEC)
++		mode |= S_IXOTH;
++	return mode;
++}
++
++static inline void trimacl_set_entry(struct trim_acl_entry *pa, unsigned short tag, unsigned int id,
++				     unsigned int perm, unsigned short inherit)
++{
++	pa->e_tag = tag;
++	pa->e_id = id;
++	pa->e_perm = perm;
++	pa->e_inherit = inherit;
++	pa->e_allow = TRIM_ACL_ALLOW;
++}
++
++/*
++ * Build the ACL that represents a POSIX mode: owner, owning group and
++ * everyone entries plus a terminating EXCLUDE entry that stops
++ * inheritance from the ancestors.
++ */
++static struct trim_acl *trim_acl_from_mode(struct inode *inode, umode_t mode, unsigned int o_perm,
++					   unsigned int g_perm, unsigned int e_perm)
++{
++	unsigned short inherit = S_ISDIR(mode) ? TRIM_ACL_INHERIT_TYPE : 0;
++	struct trim_acl *acl;
++	gid_t gid = -1;
++	int count = 1, n = 0;
++
++	if (o_perm)
++		count++;
++	if (g_perm) {
++		count++;
++		gid = from_kgid(i_user_ns(inode), inode->i_gid);
++		if (gid == (gid_t)-1)
++			return ERR_PTR(-EOVERFLOW);
++	}
++	if (e_perm)
++		count++;
++
++	acl = trim_acl_alloc(count, GFP_KERNEL);
++	if (!acl)
++		return ERR_PTR(-ENOMEM);
++
++	if (o_perm)
++		trimacl_set_entry(&acl->a_entries[n++], TRIM_ACL_OWNER, TRIM_ACL_UNDEFINED_ID, o_perm, inherit);
++	if (g_perm)
++		trimacl_set_entry(&acl->a_entries[n++], TRIM_ACL_GROUP, gid, g_perm, inherit);
++	if (e_perm)
++		trimacl_set_entry(&acl->a_entries[n++], TRIM_ACL_EVERYONE, TRIM_ACL_UNDEFINED_ID, e_perm, inherit);
++	trimacl_set_entry(&acl->a_entries[n], TRIM_ACL_EVERYONE, TRIM_ACL_UNDEFINED_ID, 0,
++			  TRIM_ACL_INHERIT_EXCLUDE);
++	return acl;
++}
++
++int trim_acl_chmod(struct mnt_idmap *idmap, struct dentry *dentry, umode_t mode)
++{
++	enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++	struct inode *inode;
++	struct trim_acl *acl;
++	unsigned int o_perm, g_perm, e_perm;
++	int ret;
++
++	ret = trimacl_resolve_policy(dentry, 0, &policy);
++	if (ret)
++		return ret;
++	if (policy == TRIMACL_POLICY_POSIX)
++		return posix_acl_chmod(idmap, dentry, mode);
++
++	inode = d_inode(dentry);
++	if (!IS_TRIMACL_INODE(inode))
++		return 0;
++	if (!inode->i_op->set_trim_acl)
++		return -EOPNOTSUPP;
++
++	acl = get_inode_trim_acl(inode);
++	if (IS_ERR(acl)) {
++		if (PTR_ERR(acl) == -EOPNOTSUPP)
++			return 0;
++		return PTR_ERR(acl);
++	}
++
++	o_perm = trimacl_rwx_to_perm(mode >> 6);
++	g_perm = trimacl_rwx_to_perm(mode >> 3);
++	e_perm = trimacl_rwx_to_perm(mode);
++
++	if (acl) {
++		struct user_namespace *ns = i_user_ns(inode);
++		unsigned int found = 0, others = 0, protected = 0, n;
++
++		/* Nothing to do if the ACL already is exactly the mode */
++		for (n = 0; n < acl->a_count; n++) {
++			struct trim_acl_entry *pa = &acl->a_entries[n];
++
++			switch (pa->e_tag) {
++			case TRIM_ACL_OWNER:
++				if (pa->e_allow == TRIM_ACL_ALLOW && pa->e_perm == o_perm &&
++				    (!S_ISDIR(mode) || pa->e_inherit == TRIM_ACL_INHERIT_TYPE)) {
++					found |= TRIM_ACL_OWNER;
++					continue;
++				}
++				break;
++			case TRIM_ACL_GROUP:
++				if (pa->e_allow == TRIM_ACL_ALLOW && pa->e_perm == g_perm &&
++				    (!S_ISDIR(mode) || pa->e_inherit == TRIM_ACL_INHERIT_TYPE)) {
++					kgid_t gid = make_kgid(ns, pa->e_id);
++
++					if (gid_valid(gid) && gid_eq(gid, inode->i_gid)) {
++						found |= TRIM_ACL_GROUP;
++						continue;
++					}
++				}
++				break;
++			case TRIM_ACL_EVERYONE:
++				if (pa->e_allow == TRIM_ACL_ALLOW && pa->e_perm == e_perm &&
++				    (!S_ISDIR(mode) || pa->e_inherit == TRIM_ACL_INHERIT_TYPE)) {
++					found |= TRIM_ACL_EVERYONE;
++					continue;
++				}
++				break;
++			}
++			if (pa->e_inherit & TRIM_ACL_INHERIT_EXCLUDE)
++				protected = 1;
++			else
++				others++;
++		}
++		if (!(found & TRIM_ACL_OWNER) && !o_perm)
++			found |= TRIM_ACL_OWNER;
++		if (!(found & TRIM_ACL_GROUP) && !g_perm)
++			found |= TRIM_ACL_GROUP;
++		if (!(found & TRIM_ACL_EVERYONE) && !e_perm)
++			found |= TRIM_ACL_EVERYONE;
++		if (found == (TRIM_ACL_OWNER | TRIM_ACL_GROUP | TRIM_ACL_EVERYONE) && !others && protected) {
++			trim_acl_release(acl);
++			return 0;
++		}
++		trim_acl_release(acl);
++	}
++
++	acl = trim_acl_from_mode(inode, mode, o_perm, g_perm, e_perm);
++	if (IS_ERR(acl))
++		return PTR_ERR(acl);
++
++	ret = inode->i_op->set_trim_acl(idmap, inode, acl);
++	trim_acl_release(acl);
++	trimacl_debug("trim_acl_chmod: '%s', mode=%u, acl=%p, return %d\n", dentry->d_name.name, mode, acl, ret);
++	return ret;
++}
++EXPORT_SYMBOL(trim_acl_chmod);
++
++int aclv2_mode_to_posix_mode(int mask)
++{
++	int mode = 0;
++
++	if (mask & TRIM_PERM_READABLE)
++		mode |= MAY_READ;
++	if (mask & TRIM_PERM_FULL_WRITABLE)
++		mode |= MAY_WRITE;
++	if (mask & MAY_EXEC)
++		mode |= MAY_EXEC;
++	return mode | (mask & ~TRIM_PERM_FULL_CONTROL);
++}
++
++/*
++ * Evaluate one ACL for @want.  Returns 0 when everything is allowed,
++ * -EACCES when denied, 1 when the ancestors have to be checked.
++ */
++static int trimacl_acl_permission(struct mnt_idmap *idmap, struct inode *inode, struct trim_acl *acl,
++				  umode_t type, vfsuid_t owner, unsigned int want, int level,
++				  struct trim_access_t *ta, unsigned int *allowed_out)
++{
++	struct user_namespace *ns = i_user_ns(inode);
++	const struct trim_acl_entry *pa, *pe;
++	unsigned int allowed = 0, perm;
++	int excluded = 0;
++	bool match;
++
++	FOREACH_TRIMACL_ENTRY(pa, acl, pe) {
++		if (pa->e_inherit & TRIM_ACL_INHERIT_EXCLUDE) {
++			excluded = 1;
++			continue;
++		}
++		if (!trimacl_entry_applies(pa, level, type))
++			continue;
++
++		perm = pa->e_perm & TRIM_PERM_FULL_CONTROL;
++		switch (pa->e_tag) {
++		case TRIM_ACL_EVERYONE:
++			match = true;
++			break;
++		case TRIM_ACL_USER:
++			match = ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id)));
++			break;
++		case TRIM_ACL_GROUP:
++			match = ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id)));
++			break;
++		case TRIM_ACL_OWNER:
++			match = ta_vfsuid_eq(ta, owner);
++			break;
++		default:
++			return -EIO;
++		}
++		if (!match)
++			continue;
++		if (pa->e_allow & TRIM_ACL_ALLOW)
++			allowed |= perm;
++		else if (perm & want)
++			return -EACCES;
++	}
++
++	allowed &= want;
++	*allowed_out = allowed;
++	if (allowed == want)
++		return 0;
++	return excluded ? -EACCES : 1;
++}
++
++/*
++ * Check @mask against the ACL of @dentry and, for what is not decided
++ * yet, against the inheritable entries of its ancestors.
++ */
++int trimacl_check_acl(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta)
++{
++	struct inode *inode = d_inode(dentry);
++	struct trim_acl *acl;
++	unsigned int want, allowed;
++	umode_t type;
++	vfsuid_t owner;
++	int level = 0, ret;
++
++	if (!inode)
++		return -ENOENT;
++
++	type = inode->i_mode & S_IFMT;
++	owner = i_uid_into_vfsuid(idmap, inode);
++	want = mask & TRIM_PERM_FULL_CONTROL;
++	if (!want)
++		return 0;
++
++	dentry = dget(dentry);
++	for (;;) {
++		inode = d_inode(dentry);
++		if (!inode) {
++			ret = -ENOENT;
++			break;
++		}
++		acl = get_inode_trim_acl(inode);
++		if (IS_ERR(acl)) {
++			ret = PTR_ERR(acl);
++			break;
++		}
++		if (acl) {
++			allowed = 0;
++			ret = trimacl_acl_permission(idmap, inode, acl, type, owner, want, level, ta, &allowed);
++			trim_acl_release(acl);
++			trimacl_debug("    '%s' trimacl_acl_permission: mask=%X allowed=%X return %d\n",
++				      dentry->d_name.name, want, allowed, ret);
++			if (ret <= 0)
++				break;
++			want &= ~allowed;
++			if (!want) {
++				ret = 0;
++				break;
++			}
++		}
++		if (IS_ROOT(dentry)) {
++			ret = -EACCES;
++			break;
++		}
++		level++;
++		{
++			struct dentry *parent = dget_parent(dentry);
++
++			dput(dentry);
++			dentry = parent;
++		}
++	}
++	dput(dentry);
++	return ret;
++}
++
++int trim_generic_permission_ta(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta)
++{
++	enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++	struct inode *inode;
++	int ret, vol_type, access;
++
++	ret = trimacl_resolve_policy(dentry, mask, &policy);
++	if (ret)
++		return ret;
++
++	if (policy == TRIMACL_POLICY_POSIX) {
++		mask = aclv2_mode_to_posix_mode(mask);
++		if (ta)
++			return posixacl_access_permission_check(idmap, d_inode(dentry), mask, ta);
++		return inode_permission(idmap, d_inode(dentry), mask);
++	}
++
++	if (ta_is_root(idmap, d_inode(dentry), ta))
++		goto full_access;
++
++	vol_type = is_vol_d(dentry);
++	if (!vol_type)
++		goto check;
++
++	inode = d_inode(dentry);
++	/* Traversing directories on a volume is always allowed */
++	if (S_ISDIR(inode->i_mode))
++		mask &= ~MAY_EXEC;
++	if (!(mask & TRIM_PERM_FULL_CONTROL))
++		return 0;
++
++	if (TA_UID(ta) == TRIM_SYSTEM_UID)
++		goto read_access;
++
++	/* External disks are for administrators unless enabled for everyone */
++	if (vol_type == TRIM_VOL_TYPE_EXTERNAL && !g_external_disk_access &&
++	    !ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID))
++		return -EACCES;
++
++	if (!(ta && (ta->flags & TRIM_ACCESS_FLAG_IGNORE_ADMINS)) &&
++	    ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID))
++		goto full_access;
++
++	switch (is_user_dir_d(dentry, TA_UID(ta), vol_type)) {
++	case TRIM_USER_DIR_FULL:
++		goto full_access;
++	case TRIM_USER_DIR_READ:
++		if (mask & TRIM_PERM_FULL_WRITABLE)
++			return -EACCES;
++		goto read_access;
++	case TRIM_USER_DIR_READONLY:
++		if (mask & TRIM_PERM_FULL_WRITABLE)
++			return -EACCES;
++		return trimacl_check_acl(idmap, dentry, mask, ta);
++	}
++
++	access = 0;
++	if (is_team_trashbin_dir_and_check_acl_d(dentry, mask, idmap, ta, &access))
++		return access;
++	return trimacl_check_acl(idmap, dentry, mask, ta);
++
++full_access:
++	if (S_ISDIR(d_inode(dentry)->i_mode))
++		return ret;
++	mask &= ~(TRIM_PERM_FULL_CONTROL & ~MAY_EXEC);
++	goto check;
++
++read_access:
++	mask &= ~(TRIM_PERM_READABLE | (S_ISDIR(d_inode(dentry)->i_mode) ? MAY_EXEC : 0));
++
++check:
++	if (!(mask & TRIM_PERM_FULL_CONTROL))
++		return ret;
++	return trimacl_check_acl(idmap, dentry, mask, ta);
++}
++
++int trim_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask)
++{
++	struct inode *inode = d_inode(dentry);
++	int retval;
++
++	trimacl_debug_path(dentry, "trim_permission: '%s', uid=%u, mask=%X\n",
++			   __kuid_val(current_fsuid()), mask);
++
++	if (mask & TRIM_PERM_FULL_WRITABLE) {
++		struct super_block *sb = inode->i_sb;
++		umode_t mode = inode->i_mode;
++
++		/* Nobody gets write access to a read-only fs. */
++		if ((sb_rdonly(sb) || (sb->s_flags & SB_TRIM_RO)) &&
++		    (S_ISREG(mode) || S_ISDIR(mode) || S_ISLNK(mode)))
++			return -EROFS;
++	}
++
++	if (mask & MAY_WRITE) {
++		/* Nobody gets write access to an immutable file. */
++		if (IS_IMMUTABLE(inode))
++			return -EPERM;
++		if (HAS_UNMAPPED_ID(idmap, inode))
++			return -EACCES;
++	}
++
++	if (mask & MAY_NOT_BLOCK)
++		return -ECHILD;
++
++	if (inode->i_op->trim_permission)
++		retval = inode->i_op->trim_permission(idmap, dentry, mask);
++	else
++		retval = trim_generic_permission(idmap, dentry, mask);
++	if (!retval)
++		retval = devcgroup_inode_permission(inode, mask);
++
++	trimacl_debug_path(dentry, "trim_permission: '%s', uid=%u, mask=%X, return %d\n",
++			   __kuid_val(current_fsuid()), mask, retval);
++	return retval;
++}
++EXPORT_SYMBOL(trim_permission);
++
++int trim_xattr_permission(struct mnt_idmap *idmap, const char *name, struct dentry *dentry, unsigned int perm)
++{
++	if (!name || strcmp(name, TRIM_ACL_XATTR_ACCESS))
++		return 0;
++	if (perm != MAY_READ_PERMISSION && perm != MAY_WRITE_PERMISSION)
++		return 0;
++	if (!IS_TRIMACL(dentry))
++		return -EOPNOTSUPP;
++	if (inode_owner_or_capable(idmap, d_inode(dentry)))
++		return 0;
++	return trim_permission(idmap, dentry, perm);
++}
++EXPORT_SYMBOL(trim_xattr_permission);
++
++/*
++ * Collect the ACL entries of @dentry and the inheritable entries of its
++ * ancestors.  e_level is the distance to @dentry, negative once a
++ * protected (EXCLUDE) ACL was passed with FORCE_INHERIT.
++ */
++int trimacl_get_trimacl_xattr_all(struct mnt_idmap *idmap, struct dentry *dentry, unsigned flags,
++				  void __user *buffer, size_t buffer_size)
++{
++	struct inode *inode = d_inode(dentry);
++	struct trim_acl *all, *acl;
++	unsigned int cap = 0;
++	bool excluded = false;
++	umode_t type;
++	int level = 0, ret, size;
++	void *kbuf;
++
++	if (!inode)
++		return -ENOENT;
++	if (!IS_TRIMACL_INODE(inode))
++		return -EPERM;
++
++	ret = trim_xattr_permission(idmap, TRIM_ACL_XATTR_ACCESS, dentry, MAY_READ_PERMISSION);
++	if (ret)
++		return ret;
++
++	type = inode->i_mode & S_IFMT;
++	all = trim_acl_alloc(0, GFP_KERNEL);
++	if (!all)
++		return -ENOMEM;
++
++	dentry = dget(dentry);
++	for (;;) {
++		inode = d_inode(dentry);
++		if (!inode) {
++			ret = -ENOENT;
++			goto out;
++		}
++		acl = get_inode_trim_acl(inode);
++		if (IS_ERR(acl)) {
++			ret = PTR_ERR(acl);
++			goto out;
++		}
++		if (acl) {
++			const struct trim_acl_entry *pa, *pe;
++			unsigned int e_level = excluded ? -level : level;
++			bool new_excluded = false;
++
++			ret = 0;
++			FOREACH_TRIMACL_ENTRY(pa, acl, pe) {
++				struct trim_acl_entry *e;
++				unsigned int count;
++
++				if (pa->e_inherit & TRIM_ACL_INHERIT_EXCLUDE) {
++					if (level) {
++						ret = 1;
++						continue;
++					}
++					if (flags & TRIM_GET_TRIMACL_XATTR_FLAG_FORCE_INHERIT)
++						new_excluded = true;
++					else
++						ret = 1;
++				} else if (level && !trimacl_entry_applies(pa, level, type)) {
++					continue;
++				}
++
++				if (all->a_count == UINT_MAX) {
++					ret = -EOVERFLOW;
++					break;
++				}
++				count = all->a_count + 1;
++				if (count > cap) {
++					unsigned int new_cap = cap ? cap : 16;
++					struct trim_acl *new_all;
++
++					while (new_cap < count) {
++						if ((int)new_cap < 0) {
++							new_cap = UINT_MAX;
++							break;
++						}
++						new_cap <<= 1;
++					}
++					new_all = kvrealloc(all, sizeof(struct trim_acl) +
++							    new_cap * sizeof(struct trim_acl_entry), GFP_KERNEL);
++					if (!new_all) {
++						ret = -ENOMEM;
++						break;
++					}
++					all = new_all;
++					cap = new_cap;
++				}
++				e = &all->a_entries[all->a_count];
++				e->e_level = e_level;
++				e->e_allow = pa->e_allow;
++				e->e_id = pa->e_id;
++				e->e_inherit = pa->e_inherit;
++				e->e_perm = pa->e_perm;
++				e->e_tag = pa->e_tag;
++				all->a_count = count;
++			}
++			if (new_excluded)
++				excluded = new_excluded;
++			trim_acl_release(acl);
++			trimacl_debug(" '%s' __trimacl_get_acl_xattr: return %d\n", dentry->d_name.name, ret);
++			if (ret == 1)
++				break;
++			if (ret)
++				goto out;
++		}
++		if (IS_ROOT(dentry))
++			break;
++		level++;
++		{
++			struct dentry *parent = dget_parent(dentry);
++
++			dput(dentry);
++			dentry = parent;
++		}
++	}
++
++	if (!all->a_count) {
++		ret = 0;
++		goto out;
++	}
++	size = trim_acl_xattr_size(all->a_count);
++	ret = size;
++	if (size <= 0 || !buffer)
++		goto out;
++	if (buffer_size < size) {
++		ret = -ERANGE;
++		goto out;
++	}
++	kbuf = kmalloc(size, GFP_KERNEL);
++	if (!kbuf) {
++		ret = -ENOMEM;
++		goto out;
++	}
++	ret = trim_acl_to_xattr(all, kbuf, size);
++	if (ret > 0 && copy_to_user(buffer, kbuf, ret))
++		ret = -EFAULT;
++	kfree(kbuf);
++out:
++	dput(dentry);
++	trim_acl_release(all);
++	return ret;
++}
++EXPORT_SYMBOL(trimacl_get_trimacl_xattr_all);
++
++int trim_may_delete(struct mnt_idmap *idmap, struct dentry *victim, struct inode *dir)
++{
++	enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++	enum trimacl_policy victim_policy = TRIMACL_POLICY_TRIM;
++	int error;
++
++	error = trimacl_resolve_policy(victim->d_parent, 0, &policy);
++	if (error)
++		return error;
++	if (policy == TRIMACL_POLICY_POSIX)
++		return inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
++
++	error = trimacl_resolve_policy(victim, 0, &victim_policy);
++	if (error)
++		return error;
++	if (victim_policy == TRIMACL_POLICY_POSIX)
++		goto parent;
++
++	if (dir->i_op->trim_may_delete)
++		return dir->i_op->trim_may_delete(idmap, victim, dir);
++
++	/* MAY_DEL on the victim or MAY_DEL_CHILD on the parent */
++	error = trim_permission(idmap, victim, MAY_DEL);
++	if (!error)
++		return 0;
++parent:
++	return trim_permission(idmap, victim->d_parent, MAY_DEL_CHILD);
++}
++EXPORT_SYMBOL(trim_may_delete);
++
++int trim_generic_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask)
++{
++	return trim_generic_permission_ta(idmap, dentry, mask, NULL);
++}
++
++/*
++ * One ACL: what it allows and denies for @mask (bits not decided yet).
++ * Returns 1 to continue with the ancestors, 0 when the ACL is protected.
++ */
++static int __trimacl_calc_permission(struct mnt_idmap *idmap, struct inode *inode, struct trim_acl *acl,
++				     umode_t type, vfsuid_t owner, unsigned int mask, int level,
++				     struct trim_access_t *ta, unsigned int *allow_out, unsigned int *deny_out)
++{
++	struct user_namespace *ns = i_user_ns(inode);
++	const struct trim_acl_entry *pa, *pe;
++	unsigned int allow = 0, deny = 0, perm;
++	int excluded = 0, ret;
++	bool match;
++
++	FOREACH_TRIMACL_ENTRY(pa, acl, pe) {
++		if (pa->e_inherit & TRIM_ACL_INHERIT_EXCLUDE) {
++			excluded = 1;
++			continue;
++		}
++		if (!trimacl_entry_applies(pa, level, type))
++			continue;
++
++		perm = pa->e_perm & TRIM_PERM_FULL_CONTROL;
++		switch (pa->e_tag) {
++		case TRIM_ACL_EVERYONE:
++			match = true;
++			break;
++		case TRIM_ACL_USER:
++			match = ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id)));
++			break;
++		case TRIM_ACL_GROUP:
++			match = ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id)));
++			break;
++		case TRIM_ACL_OWNER:
++			match = ta_vfsuid_eq(ta, owner);
++			break;
++		default:
++			ret = -EIO;
++			goto out;
++		}
++		if (!match)
++			continue;
++		if (pa->e_allow & TRIM_ACL_ALLOW)
++			allow |= perm;
++		else
++			deny |= perm;
++	}
++	ret = excluded ? 0 : 1;
++out:
++	allow &= mask;
++	deny &= mask;
++	*deny_out = deny;
++	*allow_out = allow & ~deny;
++	return ret;
++}
++
++unsigned int trimacl_calc_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta)
++{
++	struct inode *inode = d_inode(dentry);
++	unsigned int allowed = 0, denied = 0, allow, deny;
++	struct trim_acl *acl;
++	umode_t type;
++	vfsuid_t owner;
++	int level = 0, ret;
++
++	if (!inode)
++		return 0;
++
++	type = inode->i_mode & S_IFMT;
++	owner = i_uid_into_vfsuid(idmap, inode);
++
++	dentry = dget(dentry);
++	for (;;) {
++		inode = d_inode(dentry);
++		if (!inode)
++			goto fail;
++		acl = get_inode_trim_acl(inode);
++		if (IS_ERR(acl))
++			goto fail;
++		if (acl) {
++			ret = __trimacl_calc_permission(idmap, inode, acl, type, owner, ~(allowed | denied),
++							level, ta, &allow, &deny);
++			denied |= deny;
++			allowed |= allow;
++			trim_acl_release(acl);
++			trimacl_debug("    '%s' __trimacl_calc_permission: uid=%u (allow: %X, deny: %X) return %d\n",
++				      dentry->d_name.name, TA_UID(ta), allow, deny, ret);
++			if (!ret || (allowed | denied) == TRIM_PERM_FULL_CONTROL)
++				break;
++			if (ret < 0)
++				goto fail;
++		}
++		if (IS_ROOT(dentry))
++			break;
++		level++;
++		{
++			struct dentry *parent = dget_parent(dentry);
++
++			dput(dentry);
++			dentry = parent;
++		}
++	}
++	dput(dentry);
++	return allowed;
++
++fail:
++	dput(dentry);
++	return 0;
++}
++
++int trimacl_get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta)
++{
++	enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++	unsigned int granted = 0, limit = ~0U, perm;
++	struct inode *inode;
++	int ret, vol_type;
++
++	ret = trimacl_resolve_policy(dentry, 0, &policy);
++	if (ret)
++		return ret;
++	if (policy == TRIMACL_POLICY_POSIX)
++		return posixacl_get_permission(idmap, d_inode(dentry), ta);
++
++	if (ta_is_root(idmap, d_inode(dentry), ta))
++		goto full_access;
++
++	vol_type = is_vol_d(dentry);
++	if (!vol_type)
++		goto calc;
++
++	inode = d_inode(dentry);
++	/* Traversing directories on a volume is always allowed */
++	granted = S_ISDIR(inode->i_mode) ? MAY_EXEC : 0;
++
++	if (TA_UID(ta) == TRIM_SYSTEM_UID) {
++		granted |= TRIM_PERM_READABLE;
++		goto calc;
++	}
++
++	if (vol_type == TRIM_VOL_TYPE_EXTERNAL && !g_external_disk_access &&
++	    !ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID))
++		return ret;
++
++	if (!(ta && (ta->flags & TRIM_ACCESS_FLAG_IGNORE_ADMINS)) &&
++	    ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID))
++		goto full_access;
++
++	switch (is_user_dir_d(dentry, TA_UID(ta), vol_type)) {
++	case TRIM_USER_DIR_FULL:
++		goto full_access;
++	case TRIM_USER_DIR_READ:
++		granted |= TRIM_PERM_READABLE;
++		limit = ~TRIM_PERM_FULL_WRITABLE;
++		goto calc;
++	case TRIM_USER_DIR_READONLY:
++		limit = ~TRIM_PERM_FULL_WRITABLE;
++		goto calc;
++	}
++
++	perm = 0;
++	if (is_team_trashbin_dir_and_get_permission_d(dentry, idmap, ta, &perm))
++		return perm;
++	goto calc;
++
++full_access:
++	if (S_ISDIR(d_inode(dentry)->i_mode))
++		return TRIM_PERM_FULL_CONTROL;
++	granted = TRIM_PERM_FULL_CONTROL & ~MAY_EXEC;
++	limit = ~0U;
++
++calc:
++	perm = (trimacl_calc_permission(idmap, dentry, ta) | granted) & limit;
++	trimacl_debug("'%s' trimacl_get_permission: uid=%u return %X\n", dentry->d_name.name, TA_UID(ta), perm);
++	return perm;
++}
++
++struct trimacl_mode_perm {
++	unsigned int o_allow, o_deny;
++	unsigned int g_allow, g_deny;
++	unsigned int e_allow, e_deny;
++};
++
++static int __trimacl_to_mode(struct inode *owner_inode, struct trim_acl *acl, umode_t type, int level,
++			     const struct trimacl_mode_perm *mp, struct trimacl_mode_perm *cur)
++{
++	struct user_namespace *ns = i_user_ns(owner_inode);
++	unsigned int o_mask = ~(mp->o_allow | mp->o_deny);
++	unsigned int g_mask = ~(mp->g_allow | mp->g_deny);
++	unsigned int e_mask = ~(mp->e_allow | mp->e_deny);
++	unsigned int o_allow = 0, o_deny = 0, g_allow = 0, g_deny = 0, e_allow = 0, e_deny = 0, perm;
++	const struct trim_acl_entry *pa, *pe;
++	int excluded = 0, ret;
++	kgid_t gid;
++
++	FOREACH_TRIMACL_ENTRY(pa, acl, pe) {
++		if (pa->e_inherit & TRIM_ACL_INHERIT_EXCLUDE) {
++			excluded = 1;
++			continue;
++		}
++		if (!trimacl_entry_applies(pa, level, type))
++			continue;
++
++		perm = pa->e_perm & TRIM_PERM_FULL_CONTROL;
++		switch (pa->e_tag) {
++		case TRIM_ACL_EVERYONE:
++			if (pa->e_allow & TRIM_ACL_ALLOW)
++				e_allow |= perm;
++			else
++				e_deny |= perm;
++			break;
++		case TRIM_ACL_OWNER:
++			if (pa->e_allow & TRIM_ACL_ALLOW)
++				o_allow |= perm;
++			else
++				o_deny |= perm;
++			break;
++		case TRIM_ACL_GROUP:
++			gid = make_kgid(ns, pa->e_id);
++			if (!gid_valid(gid) || !gid_eq(gid, owner_inode->i_gid))
++				break;
++			if (pa->e_allow & TRIM_ACL_ALLOW)
++				g_allow |= perm;
++			else
++				g_deny |= perm;
++			break;
++		case TRIM_ACL_USER:
++			break;
++		default:
++			ret = -EIO;
++			goto out;
++		}
++	}
++	ret = excluded ? 0 : 1;
++out:
++	cur->o_deny = o_deny & o_mask;
++	cur->o_allow = o_allow & o_mask & ~o_deny;
++	cur->g_deny = g_deny & g_mask;
++	cur->g_allow = g_allow & g_mask & ~g_deny;
++	cur->e_deny = e_deny & e_mask;
++	cur->e_allow = e_allow & e_mask & ~e_deny;
++	return ret;
++}
++
++unsigned int trimacl_to_mode(struct mnt_idmap *idmap, struct dentry *dentry)
++{
++	struct inode *owner_inode = d_inode(dentry), *inode;
++	struct trimacl_mode_perm mp = {}, cur;
++	struct trim_acl *acl;
++	unsigned int mode;
++	umode_t type;
++	int level = 0, ret;
++
++	if (!owner_inode)
++		return 0;
++	type = owner_inode->i_mode & S_IFMT;
++
++	dentry = dget(dentry);
++	for (;;) {
++		inode = d_inode(dentry);
++		if (!inode) {
++			ret = -ENOENT;
++			goto fail;
++		}
++		acl = get_inode_trim_acl(inode);
++		if (IS_ERR(acl)) {
++			ret = PTR_ERR(acl);
++			goto fail;
++		}
++		if (acl) {
++			ret = __trimacl_to_mode(owner_inode, acl, type, level, &mp, &cur);
++			mp.o_allow |= cur.o_allow;
++			mp.o_deny |= cur.o_deny;
++			mp.g_allow |= cur.g_allow;
++			mp.g_deny |= cur.g_deny;
++			mp.e_allow |= cur.e_allow;
++			mp.e_deny |= cur.e_deny;
++			trim_acl_release(acl);
++			trimacl_debug(" '%s' __trimacl_to_mode: (o_allow: %X, o_deny: %X, e_allow: %X, e_deny: %X) return %d\n",
++				      dentry->d_name.name, cur.o_allow, cur.o_deny, cur.e_allow, cur.e_deny, ret);
++			if (!ret)
++				break;
++			if ((mp.o_allow | mp.o_deny) == TRIM_PERM_FULL_CONTROL &&
++			    (mp.g_allow | mp.g_deny) == TRIM_PERM_FULL_CONTROL &&
++			    (mp.e_allow | mp.e_deny) == TRIM_PERM_FULL_CONTROL)
++				break;
++			if (ret < 0)
++				goto fail;
++		}
++		if (IS_ROOT(dentry))
++			break;
++		level++;
++		{
++			struct dentry *parent = dget_parent(dentry);
++
++			dput(dentry);
++			dentry = parent;
++		}
++	}
++
++	mode = trimacl_perm_to_rwx(mp.o_allow) << 6 | trimacl_perm_to_rwx(mp.g_allow) << 3 |
++	       trimacl_perm_to_rwx(mp.e_allow);
++	trimacl_debug("'%s' trimacl_to_mode: %o\n", dentry->d_name.name, mode);
++	dput(dentry);
++	return mode;
++
++fail:
++	trimacl_debug("'%s' trimacl_to_mode: %o [error: %d]\n", dentry->d_name.name, 0, ret);
++	dput(dentry);
++	return 0;
++}
++
++int trim_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *stat)
++{
++	struct inode *inode = d_inode(dentry);
++	enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++	int error;
++
++	if (inode->i_op->trim_acl_to_mode)
++		return inode->i_op->trim_acl_to_mode(idmap, dentry, stat);
++
++	error = trimacl_resolve_policy(dentry, 0, &policy);
++	if (error || policy == TRIMACL_POLICY_POSIX)
++		return error;
++
++	stat->mode = (stat->mode & ~S_IRWXUGO) | (trimacl_to_mode(idmap, dentry) & S_IRWXUGO);
++	return 0;
++}
++EXPORT_SYMBOL(trim_to_mode);
++
++/* -------------------------------------------------------------------------- */
++/* system.trim_flags: per-inode flags, cached in the inode */
++
++void trim_inode_flags_forget(struct inode *inode)
++{
++	spin_lock(&inode->i_lock);
++	inode->i_trim_flags_generation++;
++	inode->i_trim_flags_state = TRIM_INODE_FLAGS_UNKNOWN;
++	spin_unlock(&inode->i_lock);
++}
++EXPORT_SYMBOL(trim_inode_flags_forget);
++
++void trim_inode_flags_init_new(struct inode *inode)
++{
++	if (!IS_TRIMACL_INODE(inode))
++		return;
++
++	spin_lock(&inode->i_lock);
++	if (inode->i_trim_flags_state == TRIM_INODE_FLAGS_UNKNOWN) {
++		inode->i_trim_flags_generation++;
++		atomic64_set(&inode->i_trim_flags, 0);
++		inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
++	}
++	spin_unlock(&inode->i_lock);
++}
++EXPORT_SYMBOL(trim_inode_flags_init_new);
++
++static int trim_inode_flags_read_disk(struct inode *inode, u64 *flags, bool *found, bool *unsupported)
++{
++	struct trim_inode_flags_xattr_v1 *buf;
++	int retries = 3;
++	ssize_t size;
++	int ret;
++
++	if (!inode->i_op->get_trim_flags)
++		return -EOPNOTSUPP;
++retry:
++	size = inode->i_op->get_trim_flags(inode, NULL, 0);
++	if (size == -ENODATA || size == -ENOENT)
++		return 0;
++	if (size < 0)
++		return size;
++	if (size == 0 || size > XATTR_SIZE_MAX)
++		return -EUCLEAN;
++
++	buf = kmalloc(size, GFP_NOFS);
++	if (!buf)
++		return -ENOMEM;
++
++	size = inode->i_op->get_trim_flags(inode, buf, size);
++	if (size == -ERANGE) {
++		kfree(buf);
++		if (--retries)
++			goto retry;
++		return -EAGAIN;
++	}
++	if (size == -ENODATA || size == -ENOENT) {
++		ret = 0;
++		goto out;
++	}
++	if (size < 0) {
++		ret = size;
++		goto out;
++	}
++
++	*found = true;
++	if (size < sizeof(*buf)) {
++		ret = -EUCLEAN;
++		goto out;
++	}
++	if (le16_to_cpu(buf->version) != TRIM_INODE_FLAGS_XATTR_VERSION) {
++		if (unsupported)
++			*unsupported = true;
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	if (le16_to_cpu(buf->size) != sizeof(*buf) || size != sizeof(*buf) || buf->reserved) {
++		ret = -EUCLEAN;
++		goto out;
++	}
++	*flags = le64_to_cpu(buf->flags);
++	ret = 0;
++out:
++	kfree(buf);
++	return ret;
++}
++
++static int trim_inode_flags_xattr_get(const struct xattr_handler *handler, struct dentry *unused,
++				      struct inode *inode, const char *name, void *buffer, size_t size)
++{
++	struct trim_inode_flags_xattr_v1 *xattr = buffer;
++	bool found = false;
++	u64 flags = 0;
++	int ret;
++
++	ret = trim_inode_flags_read_disk(inode, &flags, &found, NULL);
++	if (ret)
++		return ret;
++	if (!found)
++		return -ENODATA;
++	if (!buffer)
++		return sizeof(*xattr);
++	if (size < sizeof(*xattr))
++		return -ERANGE;
++
++	xattr->version = cpu_to_le16(TRIM_INODE_FLAGS_XATTR_VERSION);
++	xattr->size = cpu_to_le16(sizeof(*xattr));
++	xattr->reserved = 0;
++	xattr->flags = cpu_to_le64(flags);
++	return sizeof(*xattr);
++}
++
++int trim_inode_flags_load(struct inode *inode, u64 *flags)
++{
++	bool found = false, unsupported = false;
++	u64 disk_flags = 0;
++	unsigned int gen;
++	int ret;
++
++	for (;;) {
++		switch (READ_ONCE(inode->i_trim_flags_state)) {
++		case TRIM_INODE_FLAGS_VALID:
++			*flags = atomic64_read(&inode->i_trim_flags);
++			return 0;
++		case TRIM_INODE_FLAGS_CORRUPT:
++			return -EUCLEAN;
++		case TRIM_INODE_FLAGS_UNSUPPORTED:
++			return -EOPNOTSUPP;
++		}
++
++		found = false;
++		disk_flags = 0;
++		unsupported = false;
++		gen = READ_ONCE(inode->i_trim_flags_generation);
++		ret = trim_inode_flags_read_disk(inode, &disk_flags, &found, &unsupported);
++
++		spin_lock(&inode->i_lock);
++		if (inode->i_trim_flags_generation != gen ||
++		    inode->i_trim_flags_state != TRIM_INODE_FLAGS_UNKNOWN) {
++			/* Raced with an update, look again */
++			spin_unlock(&inode->i_lock);
++			continue;
++		}
++		if (!ret) {
++			atomic64_set(&inode->i_trim_flags, disk_flags);
++			inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
++			*flags = disk_flags;
++		} else if (ret == -EUCLEAN) {
++			atomic64_set(&inode->i_trim_flags, 0);
++			inode->i_trim_flags_state = TRIM_INODE_FLAGS_CORRUPT;
++		} else if (ret == -EOPNOTSUPP && unsupported) {
++			atomic64_set(&inode->i_trim_flags, 0);
++			inode->i_trim_flags_state = TRIM_INODE_FLAGS_UNSUPPORTED;
++		}
++		spin_unlock(&inode->i_lock);
++		return ret;
++	}
++}
++EXPORT_SYMBOL(trim_inode_flags_load);
++
++/* Top-level directories of a volume that always use POSIX ACLs */
++static bool trimacl_is_posix_top_dir(const char *name)
++{
++	return !strcmp(name, "docker") || !strcmp(name, "@appcenter") || !strcmp(name, "@appconf") ||
++	       !strcmp(name, "@appdata") || !strcmp(name, "@apphome") || !strcmp(name, "@appmeta") ||
++	       !strcmp(name, "@apptemp") || name[0] == '_';
++}
++
++/*
++ * Find the directory right below the root of the filesystem that
++ * contains @dentry (and the one below that).  Called under RCU.
++ */
++static void trimacl_top_dirs(struct dentry *dentry, struct dentry **top, struct dentry **second)
++{
++	struct dentry *root = dentry->d_sb->s_root;
++	struct dentry *d = dentry, *child = NULL, *grandchild = NULL;
++
++	if (!root)
++		return;
++	if (dentry && dentry != root) {
++		while (!IS_ROOT(d)) {
++			struct dentry *parent = d->d_parent;
++
++			grandchild = child;
++			child = d;
++			d = parent;
++			if (!parent || parent == root)
++				break;
++		}
++	}
++	if (d != root)
++		return;
++	*top = child;
++	*second = grandchild;
++}
++
++/*
++ * TRIM ACL or POSIX ACL for @dentry?  The filesystem can decide with
++ * ->is_trimacl, otherwise app/docker directories are POSIX and the
++ * TRIM_INODE_F_POSIX_ACL flag of the nearest ancestor decides.
++ */
++int trimacl_resolve_policy(struct dentry *dentry, unsigned int flags, enum trimacl_policy *policy)
++{
++	struct inode *inode = d_inode(dentry);
++	struct dentry *d, *top, *second;
++	unsigned int seq;
++	u64 tflags;
++	int ret;
++
++	if (!inode)
++		return -ENOENT;
++	if (!IS_TRIMACL_INODE(inode))
++		goto posix;
++
++	if (inode->i_op->is_trimacl) {
++		if (flags & MAY_NOT_BLOCK)
++			return -ECHILD;
++		ret = inode->i_op->is_trimacl(dentry);
++		if (ret < 0)
++			return ret;
++		*policy = ret ? TRIMACL_POLICY_TRIM : TRIMACL_POLICY_POSIX;
++		return 0;
++	}
++
++	for (;;) {
++		bool posix_dir = false;
++
++		top = second = NULL;
++		rcu_read_lock();
++		seq = read_seqbegin(&rename_lock);
++		trimacl_top_dirs(dentry, &top, &second);
++		if (top && d_is_dir(top))
++			posix_dir = trimacl_is_posix_top_dir(top->d_name.name);
++		if (!read_seqretry(&rename_lock, seq)) {
++			rcu_read_unlock();
++			if (posix_dir)
++				goto posix;
++			break;
++		}
++		rcu_read_unlock();
++	}
++
++retry:
++	tflags = 0;
++	*policy = TRIMACL_POLICY_TRIM;
++	rcu_read_lock();
++	seq = read_seqbegin(&rename_lock);
++	ret = 0;
++	for (d = dentry;; d = d->d_parent) {
++		inode = d_inode(d);
++		if (!inode) {
++			ret = -ESTALE;
++			break;
++		}
++		if (inode->i_op->get_trim_flags) {
++			switch (READ_ONCE(inode->i_trim_flags_state)) {
++			case TRIM_INODE_FLAGS_UNKNOWN:
++				/* Load the flags outside RCU and look again */
++				if (flags & MAY_NOT_BLOCK)
++					goto echild;
++				if (!lockref_get_not_dead(&d->d_lockref)) {
++					if (read_seqretry(&rename_lock, seq))
++						goto resched;
++					rcu_read_unlock();
++					return -ESTALE;
++				}
++				if (read_seqretry(&rename_lock, seq)) {
++					rcu_read_unlock();
++					dput(d);
++					cond_resched();
++					goto retry;
++				}
++				rcu_read_unlock();
++				if (!d_inode(d)) {
++					dput(d);
++					return -ESTALE;
++				}
++				ret = trim_inode_flags_load(d_inode(d), &tflags);
++				dput(d);
++				if (ret)
++					return ret;
++				goto retry;
++			case TRIM_INODE_FLAGS_CORRUPT:
++				ret = -EUCLEAN;
++				goto done;
++			case TRIM_INODE_FLAGS_UNSUPPORTED:
++				ret = -EOPNOTSUPP;
++				goto done;
++			}
++			tflags = atomic64_read(&inode->i_trim_flags);
++			if (tflags & TRIM_INODE_F_POSIX_ACL) {
++				*policy = TRIMACL_POLICY_POSIX;
++				break;
++			}
++		}
++		if (IS_ROOT(d))
++			break;
++	}
++done:
++	if (read_seqretry(&rename_lock, seq)) {
++		if (flags & MAY_NOT_BLOCK)
++			goto echild;
++resched:
++		rcu_read_unlock();
++		cond_resched();
++		goto retry;
++	}
++	rcu_read_unlock();
++	return ret;
++
++echild:
++	rcu_read_unlock();
++	return -ECHILD;
++
++posix:
++	*policy = TRIMACL_POLICY_POSIX;
++	return 0;
++}
++EXPORT_SYMBOL(trimacl_resolve_policy);
++
++static int trim_inode_flags_xattr_set(const struct xattr_handler *handler, struct mnt_idmap *idmap,
++				      struct dentry *dentry, struct inode *inode, const char *name,
++				      const void *value, size_t size, int flags)
++{
++	struct trim_inode_flags_xattr_v1 xattr = {};
++	const struct trim_inode_flags_xattr_v1 *in = value;
++	u64 new_flags = 0;
++	int ret;
++
++	if (!inode->i_op->set_trim_flags)
++		return -EOPNOTSUPP;
++	if (!capable(CAP_SYS_ADMIN) && vol_is_admin_or_homeowner(idmap, dentry) <= 0)
++		return -EPERM;
++
++	if (value) {
++		if (size < sizeof(*in))
++			return -EUCLEAN;
++		if (le16_to_cpu(in->version) != TRIM_INODE_FLAGS_XATTR_VERSION)
++			return -EOPNOTSUPP;
++		if (le16_to_cpu(in->size) != sizeof(*in) || size != sizeof(*in) || in->reserved)
++			return -EUCLEAN;
++		new_flags = le64_to_cpu(in->flags);
++		xattr.version = cpu_to_le16(TRIM_INODE_FLAGS_XATTR_VERSION);
++		xattr.size = cpu_to_le16(sizeof(xattr));
++		xattr.flags = cpu_to_le64(new_flags);
++		value = &xattr;
++		size = sizeof(xattr);
++	} else {
++		size = 0;
++	}
++
++	ret = inode->i_op->set_trim_flags(inode, value, size, flags);
++	if (ret)
++		return ret;
++
++	spin_lock(&inode->i_lock);
++	inode->i_trim_flags_generation++;
++	atomic64_set(&inode->i_trim_flags, new_flags);
++	inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
++	spin_unlock(&inode->i_lock);
++	return ret;
++}
++
++const struct xattr_handler trim_inode_flags_xattr_handler = {
++	.name = TRIM_INODE_FLAGS_XATTR,
++	.get = trim_inode_flags_xattr_get,
++	.set = trim_inode_flags_xattr_set,
++};
++EXPORT_SYMBOL(trim_inode_flags_xattr_handler);
++
++static int __init trimacl_debug_init_function(void)
++{
++	debugfs_create_u32("trimacl_debug_print_level", 0644, NULL, &trimacl_debug_level);
++	return 0;
++}
++fs_initcall(trimacl_debug_init_function);
+diff --git a/fs/trim_stub.c b/fs/trim_stub.c
+new file mode 100755
+index 000000000..d3db0d660
+--- /dev/null
++++ b/fs/trim_stub.c
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * 临时桩: 并行还原第 6 步时让 vmlinux 能链接。全部是 __weak,
++ * 真实实现写进 trim_acl.c / trimvfs.c / namespace.c 后自动覆盖。
++ * 第 6 步合并完成后删除本文件。
++ */
++#include <linux/fs.h>
++#include <linux/xattr.h>
++#include <linux/trim_acl.h>
++#include <linux/trim_flags.h>
++#include <linux/trimvfs.h>
++
++/* trimvfs.h */
++unsigned int g_external_disk_access __weak;
++bool __weak is_str_num(const char *str) { return false; }
++int __weak aclv2_mode_to_posix_mode(int mask) { return mask; }
++int __weak is_vol(struct inode *inode) { return 0; }
++unsigned int __weak d_is_vol_path(struct dentry *d) { return 0; }
++int __weak is_vol_d(struct dentry *dentry) { return 0; }
++int __weak is_user_dir_d(struct dentry *dentry, unsigned int uid, int vol_type) { return 0; }
++int __weak trim_is_in_group(gid_t gid, unsigned int gidlist_count, gid_t *gidlist) { return 0; }
++int __weak posixacl_access_permission(struct mnt_idmap *idmap, struct inode *inode, const struct posix_acl *acl, int want, struct trim_access_t *ta) { return 0; }
++int __weak posixacl_access_permission_check_vol(struct mnt_idmap *idmap, struct inode *inode, int mask, int vol_type, struct trim_access_t *ta) { return 0; }
++int __weak posixacl_access_permission_check(struct mnt_idmap *idmap, struct inode *inode, int mask, struct trim_access_t *ta) { return 0; }
++int __weak vol_is_admin_or_homeowner(struct mnt_idmap *idmap, struct dentry *dentry) { return 0; }
++unsigned int __weak is_mount_on_vol(struct inode *inode, char *vol_id) { return 0; }
++unsigned int __weak is_mount_on_vol_d(struct dentry *d, char *vol_id) { return 0; }
++unsigned int __weak trim_mounts_query_by_sb(struct super_block *sb, char *vol_id) { return 0; }
++unsigned int __weak posixacl_get_permission(struct mnt_idmap *idmap, struct inode *inode, struct trim_access_t *ta) { return 0; }
++int __weak origin_may_delete(struct mnt_idmap *idmap, struct inode *dir, struct dentry *victim, bool isdir) { return 0; }
++int __weak trim_access(struct mnt_idmap *idmap, struct dentry *dentry, int mode, struct trim_access_t *ta) { return 0; }
++int __weak trim_access_delete(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
++int __weak get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
++int __weak is_trimacl(struct dentry *dentry) { return 0; }
++int __weak trim_do_trashbin(struct vfsmount *mnt, struct inode *dir, struct dentry *dentry, int is_dir, int trim_trashbin_flag, int *processed) { return 0; }
++bool __weak trim_is_on_trashbin_whitelist(void) { return false; }
++int __weak get_team_trashbin_access(struct dentry *dentry) { return 0; }
++int __weak is_team_trashbin_dir_and_check_acl_d(struct dentry *dentry, int mask, struct mnt_idmap *idmap, struct trim_access_t *ta, int *access) { return 0; }
++int __weak is_team_trashbin_dir_and_get_permission_d(struct dentry *dentry, struct mnt_idmap *idmap, struct trim_access_t *ta, unsigned int *perm) { return 0; }
++long __weak trim_syscall_set_ro_stat(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++long __weak trim_syscall_is_mountpoint(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++long __weak trim_syscall_is_trimacl(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++long __weak trim_syscall_realpath(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++long __weak trim_syscall_faccessat(int dfd, const char __user *filename, int mode, int flags) { return -ENOSYS; }
++long __weak trim_syscall_set_external_disk_access(int mode) { return -ENOSYS; }
++long __weak trim_syscall_get_external_disk_access(void) { return -ENOSYS; }
++long __weak trim_syscall_get_perm(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++long __weak trim_syscall_may_delete(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++long __weak trim_syscall_get_trimacl_xattr(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++long __weak trim_syscall_get_posix_mode(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
++
++/* trim_acl.h / trim_flags.h (trim_acl.c 还没写完的部分) */
++int __weak trim_permission(struct mnt_idmap *idmap, struct dentry *dentry, int perm) { return 0; }
++int __weak trim_may_delete(struct mnt_idmap *idmap, struct dentry *victim, struct inode *dir) { return 0; }
++int __weak trim_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *stat) { return 0; }
++int __weak trim_xattr_permission(struct mnt_idmap *idmap, const char *name, struct dentry *dentry, unsigned int perm) { return 0; }
++int __weak trim_acl_chmod(struct mnt_idmap *idmap, struct dentry *dentry, umode_t mode) { return 0; }
++int __weak trimacl_check_acl(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta) { return 0; }
++unsigned int __weak trimacl_calc_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
++int __weak trim_generic_permission_ta(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta) { return 0; }
++int __weak trim_generic_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask) { return 0; }
++int __weak trimacl_get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
++unsigned int __weak trimacl_to_mode(struct mnt_idmap *idmap, struct dentry *dentry) { return 0; }
++int __weak trimacl_get_trimacl_xattr_all(struct mnt_idmap *idmap, struct dentry *dentry, unsigned flags, void __user *buffer, size_t buffer_size) { return 0; }
++int __weak trim_inode_flags_load(struct inode *inode, u64 *flags) { return -EOPNOTSUPP; }
++void __weak trim_inode_flags_forget(struct inode *inode) { }
++void __weak trim_inode_flags_init_new(struct inode *inode) { }
++int __weak trimacl_resolve_policy(struct dentry *dentry, unsigned int flags, enum trimacl_policy *policy) { *policy = TRIMACL_POLICY_POSIX; return 0; }
++const struct xattr_handler trim_inode_flags_xattr_handler __weak = { .name = TRIM_INODE_FLAGS_XATTR };
+diff --git a/fs/trimvfs.c b/fs/trimvfs.c
+new file mode 100644
+index 000000000..4c3e2d535
+--- /dev/null
++++ b/fs/trimvfs.c
+@@ -0,0 +1,5 @@
++// SPDX-License-Identifier: GPL-2.0
++/* fnOS trimvfs: 卷判断、POSIX ACL 卷权限、trim 私有 syscall (还原中) */
++#include <linux/fs.h>
++#include <linux/trim_acl.h>
++#include <linux/trimvfs.h>
+diff --git a/include/linux/fanotify.h b/include/linux/fanotify.h
+index 879cff5ec..227c2f864 100644
+--- a/include/linux/fanotify.h
++++ b/include/linux/fanotify.h
+@@ -91,7 +91,7 @@
+ 
+ /* Content events can be used to inspect file content */
+ #define FANOTIFY_CONTENT_PERM_EVENTS (FAN_OPEN_PERM | FAN_OPEN_EXEC_PERM | \
+-				      FAN_ACCESS_PERM)
++				      FAN_ACCESS_PERM | FAN_DELETE_PERM) /* shasure  FAN_DELETE_PERM */
+ /* Pre-content events can be used to fill file content */
+ #define FANOTIFY_PRE_CONTENT_EVENTS  (FAN_PRE_ACCESS)
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 3a3164a2c..057aa0677 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -63,6 +63,7 @@ struct iovec;
+ struct kiocb;
+ struct kobject;
+ struct pipe_inode_info;
++struct socket;
+ struct poll_table_struct;
+ struct kstatfs;
+ struct vm_area_struct;
+@@ -97,15 +98,30 @@ typedef int (get_block_t)(struct inode *inode, sector_t iblock,
+ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
+ 			ssize_t bytes, void *private);
+ 
++// shasure - trimacl -->
++/*
++   Trim-ACL Permissions
++*/
+ #define MAY_EXEC		0x00000001
+ #define MAY_WRITE		0x00000002
+ #define MAY_READ		0x00000004
+ #define MAY_APPEND		0x00000008
+-#define MAY_ACCESS		0x00000010
+-#define MAY_OPEN		0x00000020
+-#define MAY_CHDIR		0x00000040
+-/* called from RCU mode, don't block */
+-#define MAY_NOT_BLOCK		0x00000080
++#define MAY_ACCESS 		0x00000010
++#define MAY_OPEN 		0x00000020
++
++#define MAY_READ_EXT_ATTR	0x00000040
++#define MAY_READ_PERMISSION	0x00000080	/* read acl-xattr */
++#define MAY_READ_ATTR		0x00000100
++#define MAY_WRITE_ATTR		0x00000200
++#define MAY_WRITE_EXT_ATTR	0x00000400
++#define MAY_WRITE_PERMISSION	0x00000800	/* write acl-xattr */
++#define MAY_DEL			0x00001000
++#define MAY_DEL_CHILD		0x00002000
++#define MAY_GET_OWNER_SHIP	0x00004000
++
++#define MAY_CHDIR		0x00010000
++#define MAY_NOT_BLOCK		0x00020000 /* called from RCU mode, don't block */
++// <--
+ 
+ /*
+  * flags in file.f_mode.  Note that FMODE_READ and FMODE_WRITE must correspond
+@@ -659,6 +675,18 @@ is_uncached_acl(struct posix_acl *acl)
+ 	return (long)acl & 1;
+ }
+ 
++// shasure - trimacl -->
++struct trim_access_t;
++struct trim_acl;
++
++static inline bool
++is_uncached_trim_acl(struct trim_acl *acl)
++{
++	return (long)acl & 1;
++}
++// <--
++
++
+ #define IOP_FASTPERM	0x0001
+ #define IOP_LOOKUP	0x0002
+ #define IOP_NOFOLLOW	0x0004
+@@ -902,6 +930,13 @@ struct inode {
+ #endif
+ 
+ 	void			*i_private; /* fs or device private pointer */
++	
++	// shasure - trimacl -->
++	struct trim_acl		*i_trim_acl;
++	atomic64_t		i_trim_flags;
++	unsigned int		i_trim_flags_state;
++	unsigned int		i_trim_flags_generation;
++	// <--
+ } __randomize_layout;
+ 
+ /*
+@@ -1660,6 +1695,12 @@ struct super_block {
+ 
+ 	spinlock_t		s_inode_wblist_lock;
+ 	struct list_head	s_inodes_wb;	/* writeback inodes */
++
++	// shasure -->
++	unsigned int vol_type;
++	char vol_path[32];
++	struct dentry *vol_mountpoint;
++	// <--
+ } __randomize_layout;
+ 
+ static inline struct user_namespace *i_user_ns(const struct inode *inode)
+@@ -2370,6 +2411,8 @@ struct file_operations {
+ 	int (*flock) (struct file *, int, struct file_lock *);
+ 	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
+ 	ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
++	ssize_t (*recvfile)(struct file *, struct socket *, loff_t *, size_t,
++			   struct recvfile_io_stats *);
+ 	void (*splice_eof)(struct file *file);
+ 	int (*setlease)(struct file *, int, struct file_lease **, void **);
+ 	long (*fallocate)(struct file *file, int mode, loff_t offset,
+@@ -2455,6 +2498,21 @@ struct inode_operations {
+ 			    struct dentry *dentry, struct file_kattr *fa);
+ 	int (*fileattr_get)(struct dentry *dentry, struct file_kattr *fa);
+ 	struct offset_ctx *(*get_offset_ctx)(struct inode *inode);
++
++// shasure - trimacl -->
++	int (*is_trimacl)(struct dentry *dentry);
++	struct trim_acl * (*get_trim_acl)(struct mnt_idmap *, struct inode *);
++	int (*set_trim_acl)(struct mnt_idmap *, struct inode *, struct trim_acl *);
++	int (*trim_permission)(struct mnt_idmap *, struct dentry *, int);
++	int (*trim_may_delete)(struct mnt_idmap *, struct dentry *, struct inode *);
++	int (*trim_acl_to_mode)(struct mnt_idmap *, struct dentry *, struct kstat *);
++	int (*get_trimacl_xattr_all)(struct mnt_idmap *idmap, struct dentry *dentry, unsigned flags, void __user *buffer, size_t buffer_size);
++	int (*trim_access)(struct mnt_idmap *idmap, struct dentry *dentry, int mode, struct trim_access_t *ta);
++	int (*trim_access_delete)(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta);
++	int (*get_permission)(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta);
++	ssize_t (*get_trim_flags)(struct inode *inode, void *buffer, size_t size);
++	int (*set_trim_flags)(struct inode *inode, const void *value, size_t size, int flags);
++// <--
+ } ____cacheline_aligned;
+ 
+ /* Did the driver provide valid mmap hook configuration? */
+@@ -2660,6 +2718,15 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags
+ 				 (inode)->i_rdev == WHITEOUT_DEV)
+ #define IS_ANON_FILE(inode)	((inode)->i_flags & S_ANON_INODE)
+ 
++/*
++ * Usually, we hack trim function to send unused hints.
++ * This flag is used to tell if we want to send hint or trim
++ */
++enum trim_act {
++	TRIM_SEND_TRIM,
++	TRIM_SEND_HINT
++};
++
+ static inline bool HAS_UNMAPPED_ID(struct mnt_idmap *idmap,
+ 				   struct inode *inode)
+ {
+@@ -3541,6 +3608,8 @@ extern ssize_t generic_file_read_iter(struct kiocb *, struct iov_iter *);
+ extern ssize_t __generic_file_write_iter(struct kiocb *, struct iov_iter *);
+ extern ssize_t generic_file_write_iter(struct kiocb *, struct iov_iter *);
+ extern ssize_t generic_file_direct_write(struct kiocb *, struct iov_iter *);
++ssize_t generic_recvfile(struct file *, struct socket *, loff_t *, size_t,
++			 struct recvfile_io_stats *);
+ ssize_t generic_perform_write(struct kiocb *, struct iov_iter *);
+ ssize_t direct_write_fallback(struct kiocb *iocb, struct iov_iter *iter,
+ 		ssize_t direct_written, ssize_t buffered_written);
+@@ -3879,7 +3948,7 @@ static inline bool sb_same_encoding(const struct super_block *sb1,
+ #endif
+ }
+ 
+-int may_setattr(struct mnt_idmap *idmap, struct inode *inode,
++int may_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		unsigned int ia_valid);
+ int setattr_prepare(struct mnt_idmap *, struct dentry *, struct iattr *);
+ extern int inode_newsize_ok(const struct inode *, loff_t offset);
+diff --git a/include/linux/fsnotify.h b/include/linux/fsnotify.h
+index 28a9cb13f..e1fa49c0d 100644
+--- a/include/linux/fsnotify.h
++++ b/include/linux/fsnotify.h
+@@ -206,6 +206,19 @@ static inline int fsnotify_file_perm(struct file *file, int perm_mask)
+ 	return fsnotify_file_area_perm(file, perm_mask, NULL, 0);
+ }
+ 
++/* shasure  FAN_DELETE_PERM */
++/*
++ * fsnotify_delete_perm - permission hook before unlink/rmdir.
++ */
++static inline int fsnotify_delete_perm(const struct path *path)
++{
++	/* shasure  FAN_DELETE_PERM */
++	if (d_is_negative(path->dentry))
++		return 0;
++
++	return fsnotify_path(path, FS_DELETE_PERM);
++}
++
+ #else
+ static inline int fsnotify_open_perm_and_set_mode(struct file *file)
+ {
+@@ -233,6 +246,12 @@ static inline int fsnotify_file_perm(struct file *file, int perm_mask)
+ {
+ 	return 0;
+ }
++
++static inline int fsnotify_delete_perm(const struct path *path)
++{
++	/* shasure  FAN_DELETE_PERM */
++	return 0;
++}
+ #endif
+ 
+ /*
+diff --git a/include/linux/fsnotify_backend.h b/include/linux/fsnotify_backend.h
+index d67a893d7..453d93e57 100644
+--- a/include/linux/fsnotify_backend.h
++++ b/include/linux/fsnotify_backend.h
+@@ -58,6 +58,7 @@
+ /* #define FS_DIR_MODIFY	0x00080000 */	/* Deprecated (reserved) */
+ 
+ #define FS_PRE_ACCESS		0x00100000	/* Pre-content access hook */
++#define FS_DELETE_PERM		0x00200000	/* delete event in a permission hook */ /* shasure  FAN_DELETE_PERM */
+ 
+ #define FS_MNT_ATTACH		0x01000000	/* Mount was attached */
+ #define FS_MNT_DETACH		0x02000000	/* Mount was detached */
+@@ -89,7 +90,7 @@
+ 
+ /* Content events can be used to inspect file content */
+ #define FSNOTIFY_CONTENT_PERM_EVENTS (FS_OPEN_PERM | FS_OPEN_EXEC_PERM | \
+-				      FS_ACCESS_PERM)
++				      FS_ACCESS_PERM | FS_DELETE_PERM) /* shasure  FAN_DELETE_PERM */
+ /* Pre-content events can be used to fill file content */
+ #define FSNOTIFY_PRE_CONTENT_EVENTS  (FS_PRE_ACCESS)
+ 
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index a3e3c8f3d..86748ad45 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -63,6 +63,7 @@ struct getcpu_cache;
+ struct old_linux_dirent;
+ struct perf_event_attr;
+ struct file_handle;
++struct recvfile_io_stats;
+ struct sigaltstack;
+ struct rseq;
+ union bpf_attr;
+@@ -502,6 +503,9 @@ asmlinkage long sys_pwritev(unsigned long fd, const struct iovec __user *vec,
+ 			    unsigned long vlen, unsigned long pos_l, unsigned long pos_h);
+ asmlinkage long sys_sendfile64(int out_fd, int in_fd,
+ 			       loff_t __user *offset, size_t count);
++asmlinkage long sys_recvfile(int fd, int sockfd, loff_t __user *offset,
++			     size_t count,
++			     struct recvfile_io_stats __user *stats);
+ asmlinkage long sys_pselect6(int, fd_set __user *, fd_set __user *,
+ 			     fd_set __user *, struct __kernel_timespec __user *,
+ 			     void __user *);
+diff --git a/include/linux/trim_acl.h b/include/linux/trim_acl.h
+new file mode 100644
+index 000000000..7f728fbdf
+--- /dev/null
++++ b/include/linux/trim_acl.h
+@@ -0,0 +1,126 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) T.R.I.M Inc.
++ */
++#ifndef _LINUX_TRIM_ACL_H
++#define _LINUX_TRIM_ACL_H
++
++#include <linux/fs.h>
++#include <linux/slab.h>
++#include <linux/rcupdate.h>
++#include <linux/refcount.h>
++#include <linux/spinlock.h>
++#include <uapi/linux/trim_acl.h>
++#include <linux/trimvfs.h>
++#include <linux/trim_flags.h>
++
++#define TRIM_ACL_CHECK_PARENT 1
++
++/* */
++#define SB_TRIMACL (1 << 20) /* Trim-ACL */
++
++#define IS_SB_TRIMACL(inode) __IS_FLG(inode, SB_TRIMACL)
++#define IS_TRIMACL_INODE(inode) (IS_SB_TRIMACL(inode))
++#define IS_TRIMACL(dentry) (IS_SB_TRIMACL(dentry->d_inode))
++/* 这里加入is_vol和is_vol_d的判断，是为了外接存储，能进到trimacl的特殊权限判定代码里（这里是管理员对外接存储可读写的特权，否则管理员无法写入U盘） */
++//#define IS_TRIMACL_INODE(inode) (IS_SB_TRIMACL(inode) || is_vol(inode))
++//#define IS_TRIMACL(dentry) (IS_SB_TRIMACL(dentry->d_inode) || is_vol_d(dentry))
++
++#define IS_TRIMACL_OWNER_IS_GROUP(dentry) 0
++#define IS_TRIMACL_OWNER(dentry)                                                  \
++	(IS_TRIMACL_OWNER_IS_GROUP(dentry) ? in_group_p(dentry->d_inode->i_gid) : \
++					     (uid_eq(dentry->d_inode->i_uid, current_fsuid())))
++#define IS_TRIMACL_OWNER_OR_CAPABLE(dentry) (IS_TRIMACL_OWNER(dentry) || capable(CAP_FOWNER))
++
++/* e_tag entry in struct trim_acl_entry */
++#define TRIM_ACL_USER 0x01
++#define TRIM_ACL_GROUP 0x02
++#define TRIM_ACL_EVERYONE 0x04
++#define TRIM_ACL_OWNER 0x08
++#define TRIM_ACL_AUTHENTICATEDUSER 0x09
++#define TRIM_ACL_SYSTEM 0x0A
++#define TRIM_ACL_TAG_ALL (TRIM_ACL_USER | TRIM_ACL_GROUP | TRIM_ACL_OWNER | TRIM_ACL_EVERYONE)
++
++/* e_allow */
++#define TRIM_ACL_ALLOW 0x01
++#define TRIM_ACL_DENY 0x02
++
++struct trim_acl_entry {
++	unsigned short e_tag;
++	unsigned int e_id;
++	unsigned int e_perm;
++	unsigned short e_inherit;
++	unsigned short e_allow;
++	unsigned int e_level;
++};
++
++struct trim_acl {
++	refcount_t a_refcount;
++	struct rcu_head a_rcu;
++	unsigned int a_count;
++	struct trim_acl_entry a_entries[0];
++};
++
++#define FOREACH_TRIMACL_ENTRY(pa, acl, pe) for (pa = (acl)->a_entries, pe = pa + (acl)->a_count; pa < pe; pa++)
++
++/*
++ * Duplicate an ACL handle.
++ */
++static inline struct trim_acl *trim_acl_dup(struct trim_acl *acl)
++{
++	if (acl)
++		refcount_inc(&acl->a_refcount);
++	return acl;
++}
++
++#define non_gpl_kvfree_rcu(ptr, rhf)                                         \
++	do {                                                                 \
++		typeof(ptr) ___p = (ptr);                                    \
++                                                                             \
++		if (___p) {                                                  \
++			BUILD_BUG_ON(offsetof(typeof(*(ptr)), rhf) >= 4096); \
++			__kvfree_call_rcu(&((___p)->rhf), (void *)(___p));   \
++		}                                                            \
++	} while (0)
++
++/*
++ * Free an ACL handle.
++ */
++static inline void trim_acl_release(struct trim_acl *acl)
++{
++	if (acl && refcount_dec_and_test(&acl->a_refcount))
++		non_gpl_kvfree_rcu(acl, a_rcu);
++}
++
++extern struct trim_acl *trim_acl_alloc(int count, gfp_t flags);
++extern int trim_acl_valid(const struct trim_acl *);
++extern struct trim_acl *trim_acl_realloc(struct trim_acl *acl, unsigned int counts, gfp_t flags);
++extern struct trim_acl *trim_acl_clone(const struct trim_acl *acl, gfp_t flags);
++
++extern int trim_acl_to_xattr(const struct trim_acl *acl, void *buffer, size_t size);
++extern struct trim_acl *trim_acl_from_xattr(const void *value, size_t size);
++
++struct trim_acl *get_cached_trim_acl(struct inode *inode);
++void set_cached_trim_acl(struct inode *inode, struct trim_acl *acl);
++
++extern void forget_cached_trim_acl(struct inode *inode);
++
++extern int trim_permission(struct mnt_idmap *idmap, struct dentry *dentry, int perm);
++extern int trim_may_delete(struct mnt_idmap *idmap, struct dentry *victim, struct inode *dir);
++extern int trim_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *stat);
++extern int trim_xattr_permission(struct mnt_idmap *idmap, const char *name, struct dentry *dentry, unsigned int perm);
++extern int trim_acl_chmod(struct mnt_idmap *idmap, struct dentry *dentry, umode_t mode);
++
++extern struct trim_acl *trim_acl_from_disk(const void *value, size_t size);
++extern void *trim_acl_to_disk(const struct trim_acl *acl, size_t *size);
++
++int trimacl_check_acl(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta);
++unsigned int trimacl_calc_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta);
++int trim_generic_permission_ta(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta);
++int trim_generic_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask);
++int trimacl_get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta);
++unsigned int trimacl_to_mode(struct mnt_idmap *idmap, struct dentry *dentry);
++int trimacl_get_trimacl_xattr_all(struct mnt_idmap *idmap, struct dentry *dentry, unsigned flags, void __user *buffer,
++				  size_t buffer_size);
++
++#endif /* _LINUX_TRIM_ACL_H */
+diff --git a/include/linux/trim_acl_xattr.h b/include/linux/trim_acl_xattr.h
+new file mode 100644
+index 000000000..e25f6d8ae
+--- /dev/null
++++ b/include/linux/trim_acl_xattr.h
+@@ -0,0 +1,21 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) T.R.I.M Inc.
++ */
++#ifndef _LINUX_TRIM_ACL_XATTR_H
++#define _LINUX_TRIM_ACL_XATTR_H
++
++#define TRIM_ACL_VERSION  0x0001
++
++typedef struct {
++	__le16          e_tag;
++	__le16          e_inherit;
++	__le32          e_perm;
++	__le32          e_id;
++} __attribute__ ((__packed__)) trim_acl_entry_t;
++
++typedef struct {
++	__le16          a_version;
++} __attribute__ ((__packed__)) trim_acl_header_t;
++
++#endif	/* _LINUX_TRIM_ACL_XATTR_H */
+diff --git a/include/linux/trim_flags.h b/include/linux/trim_flags.h
+new file mode 100644
+index 000000000..1c5c60ac7
+--- /dev/null
++++ b/include/linux/trim_flags.h
+@@ -0,0 +1,34 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_TRIM_FLAGS_H
++#define _LINUX_TRIM_FLAGS_H
++
++#include <linux/types.h>
++#include <uapi/linux/trim_flags.h>
++
++struct dentry;
++struct inode;
++struct xattr_handler;
++
++enum trim_inode_flags_cache_state {
++	TRIM_INODE_FLAGS_UNKNOWN,
++	TRIM_INODE_FLAGS_VALID,
++	TRIM_INODE_FLAGS_CORRUPT,
++	TRIM_INODE_FLAGS_UNSUPPORTED,
++};
++
++enum trimacl_policy {
++	TRIMACL_POLICY_TRIM,
++	TRIMACL_POLICY_POSIX,
++};
++
++int trim_inode_flags_load(struct inode *inode, u64 *flags);
++void trim_inode_flags_forget(struct inode *inode);
++void trim_inode_flags_init_new(struct inode *inode);
++
++int trimacl_resolve_policy(struct dentry *dentry, unsigned int flags, enum trimacl_policy *policy);
++//int trimacl_resolve_policy_at(struct inode *inode, struct dentry *parent, unsigned int flags,
++//			      enum trimacl_policy *policy);
++
++extern const struct xattr_handler trim_inode_flags_xattr_handler;
++
++#endif /* _LINUX_TRIM_FLAGS_H */
+diff --git a/include/linux/trimvfs.h b/include/linux/trimvfs.h
+new file mode 100644
+index 000000000..fb38a7ebd
+--- /dev/null
++++ b/include/linux/trimvfs.h
+@@ -0,0 +1,132 @@
++#ifndef __LINUX_TRIM_FS_H_
++#define __LINUX_TRIM_FS_H_ 1
++
++/*
++ *
++ */
++extern unsigned int g_external_disk_access;
++
++/*
++ * common
++ */
++bool is_str_num(const char *str);
++
++int aclv2_mode_to_posix_mode(int mask);
++
++int is_vol(struct inode *inode);
++
++unsigned int d_is_vol_path(struct dentry *d);
++
++int is_vol_d(struct dentry *dentry);
++
++int is_user_dir_d(struct dentry *dentry, unsigned int uid, int vol_type);
++
++int trim_is_in_group(gid_t gid, unsigned int gidlist_count, gid_t *gidlist);
++
++/*
++ * VFS
++ */
++#define AT_SET_SB_TRIM_RO BIT(18)
++#define SB_TRIM_RO BIT(13)
++#define ST_TRIM_RO BIT(13)
++
++#define TRIM_ACCESS_FLAG_IGNORE_ADMINS (1 << 0)
++#define TRIM_ACCESS_FLAG_CURRENT_USER (1 << 7)
++
++#define TA_NOT_CURRENT(ta) (ta && !(ta->flags & TRIM_ACCESS_FLAG_CURRENT_USER))
++
++struct trim_access_t {
++	const char __user *filename;
++	unsigned int flags;
++	uid_t uid;
++	unsigned int gid_count;
++	gid_t *gids;
++};
++
++struct trim_realpath_t {
++	const char __user *filename;
++	char __user *resolved;
++};
++
++#define TRIM_GET_TRIMACL_XATTR_FLAG_FORCE_INHERIT (1 << 0)
++#define TRIM_GET_TRIMACL_XATTR_FLAG_FD (1 << 30)
++
++struct trim_get_trimacl_xattr_t {
++	const char __user *filename;
++	void __user *buffer;
++	size_t buffer_size;
++	int fd;
++	unsigned flags;
++};
++
++int posixacl_access_permission(struct mnt_idmap *idmap, struct inode *inode, const struct posix_acl *acl, int want,
++			       struct trim_access_t *ta);
++
++// int posixacl_permission_check(struct mnt_idmap *idmap, struct inode *inode, int mask, int vol_type);
++int posixacl_access_permission_check_vol(struct mnt_idmap *idmap, struct inode *inode, int mask, int vol_type,
++					 struct trim_access_t *ta);
++
++int posixacl_access_permission_check(struct mnt_idmap *idmap, struct inode *inode, int mask, struct trim_access_t *ta);
++
++int vol_is_admin_or_homeowner(struct mnt_idmap *idmap, struct dentry *dentry);
++
++unsigned int is_mount_on_vol(struct inode *inode, char *vol_id);
++
++unsigned int is_mount_on_vol_d(struct dentry *d /*挂载点的dentry*/, char *vol_id);
++
++unsigned int trim_mounts_query_by_sb(struct super_block *sb, char *vol_id);
++
++unsigned int posixacl_get_permission(struct mnt_idmap *idmap, struct inode *inode, struct trim_access_t *ta);
++
++int origin_may_delete(struct mnt_idmap *idmap, struct inode *dir, struct dentry *victim, bool isdir);
++
++int trim_access(struct mnt_idmap *idmap, struct dentry *dentry, int mode, struct trim_access_t *ta);
++
++int trim_access_delete(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta);
++
++int get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta);
++
++int is_trimacl(struct dentry *dentry);
++
++/*
++ * trashbin
++ */
++int trim_do_trashbin(struct vfsmount *mnt, struct inode *dir, struct dentry *dentry, int is_dir, int trim_trashbin_flag,
++		     int *processed);
++
++bool trim_is_on_trashbin_whitelist(void);
++
++int get_team_trashbin_access(struct dentry *dentry);
++
++int is_team_trashbin_dir_and_check_acl_d(struct dentry *dentry, int mask, struct mnt_idmap *idmap,
++					 struct trim_access_t *ta, int *access);
++
++int is_team_trashbin_dir_and_get_permission_d(struct dentry *dentry, struct mnt_idmap *idmap, struct trim_access_t *ta,
++					      unsigned int *perm);
++
++/*
++ * Trim Syscall
++ */
++long trim_syscall_set_ro_stat(int dfd, const char __user *filename, int flags);
++
++long trim_syscall_is_mountpoint(int dfd, const char __user *filename, int flags);
++
++long trim_syscall_is_trimacl(int dfd, const char __user *filename, int flags);
++
++long trim_syscall_realpath(int dfd, const char __user *filename, int flags);
++
++long trim_syscall_faccessat(int dfd, const char __user *filename, int mode, int flags);
++
++long trim_syscall_set_external_disk_access(int mode);
++
++long trim_syscall_get_external_disk_access(void);
++
++long trim_syscall_get_perm(int dfd, const char __user *filename, int flags);
++
++long trim_syscall_may_delete(int dfd, const char __user *filename, int flags);
++
++long trim_syscall_get_trimacl_xattr(int dfd, const char __user *filename, int flags);
++
++long trim_syscall_get_posix_mode(int dfd, const char __user *filename, int flags);
++
++#endif
+diff --git a/include/uapi/linux/fanotify.h b/include/uapi/linux/fanotify.h
+index e710967c7..3c0397ffa 100644
+--- a/include/uapi/linux/fanotify.h
++++ b/include/uapi/linux/fanotify.h
+@@ -28,6 +28,7 @@
+ /* #define FAN_DIR_MODIFY	0x00080000 */	/* Deprecated (reserved) */
+ 
+ #define FAN_PRE_ACCESS		0x00100000	/* Pre-content access hook */
++#define FAN_DELETE_PERM		0x00200000	/* File delete in perm check */ /* shasure  FAN_DELETE_PERM */
+ #define FAN_MNT_ATTACH		0x01000000	/* Mount was attached */
+ #define FAN_MNT_DETACH		0x02000000	/* Mount was detached */
+ 
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index beb4c2d1e..ddbbc3ca7 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -84,6 +84,11 @@ struct fstrim_range {
+ 	__u64 minlen;
+ };
+ 
++struct recvfile_io_stats {
++	__u64 received;
++	__u64 written;
++};
++
+ /*
+  * We include a length field because some filesystems (vfat) have an identifier
+  * that we do want to expose as a UUID, but doesn't have the standard length.
+@@ -310,6 +315,7 @@ struct file_attr {
+ #define FICLONE		_IOW(0x94, 9, int)
+ #define FICLONERANGE	_IOW(0x94, 13, struct file_clone_range)
+ #define FIDEDUPERANGE	_IOWR(0x94, 54, struct file_dedupe_range)
++#define FIHINTUNUSED    _IOWR('x', 129, unsigned int)   /* search unused space as hints */
+ 
+ #define FSLABEL_MAX 256	/* Max chars for the interface; each fs may differ */
+ 
+diff --git a/include/uapi/linux/trim_acl.h b/include/uapi/linux/trim_acl.h
+new file mode 100644
+index 000000000..9ab06e80e
+--- /dev/null
++++ b/include/uapi/linux/trim_acl.h
+@@ -0,0 +1,95 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) T.R.I.M Inc.
++ */
++#ifndef _UAPI_LINUX_TRIM_ACL_H
++#define _UAPI_LINUX_TRIM_ACL_H
++
++#include <linux/types.h>
++
++#define TRIM_ACL_MNT_OPT "trimacl"
++#define TRIM_ACL_NOT_MNT_OPT "no" TRIM_ACL_MNT_OPT
++
++/* trim-acl xattr name */
++#define TRIM_ACL_XATTR_ACCESS "system.trim_acl"
++
++/* Supported ACL a_version fields */
++#define TRIM_ACL_XATTR_VERSION 0x0001
++
++/* undefined e_id value */
++#define TRIM_ACL_UNDEFINED_ID -1
++
++/* Classify permission type */
++#define TRIM_PERM_READABLE (MAY_READ | MAY_READ_ATTR | MAY_READ_PERMISSION | MAY_READ_EXT_ATTR)
++#define TRIM_PERM_WRITE_DATA (MAY_WRITE | MAY_APPEND | MAY_DEL_CHILD)
++#define TRIM_PERM_WRITABLE (TRIM_PERM_WRITE_DATA | MAY_WRITE_ATTR | MAY_WRITE_EXT_ATTR)
++#define TRIM_PERM_FULL_WRITABLE (TRIM_PERM_WRITABLE | MAY_WRITE_PERMISSION | MAY_GET_OWNER_SHIP | MAY_DEL)
++#define TRIM_PERM_OWNER (MAY_READ_PERMISSION | MAY_WRITE_PERMISSION | MAY_GET_OWNER_SHIP)
++#define TRIM_PERM_FULL_CONTROL \
++	(MAY_EXEC | TRIM_PERM_READABLE | TRIM_PERM_WRITABLE | MAY_WRITE_PERMISSION | MAY_GET_OWNER_SHIP | MAY_DEL)
++
++/* inherit mode in the e_inherit field */
++#define TRIM_ACL_INHERIT_SELF 0x0001
++#define TRIM_ACL_INHERIT_FILE 0x0002
++#define TRIM_ACL_INHERIT_DIR 0x0004
++#define TRIM_ACL_INHERIT_NO_PROPAGATE 0x1000
++#define TRIM_ACL_INHERIT_EXCLUDE 0x4000
++
++#define TRIM_ACL_INHERIT_TYPE (TRIM_ACL_INHERIT_SELF | TRIM_ACL_INHERIT_FILE | TRIM_ACL_INHERIT_DIR)
++
++#define TRIM_ACL_INHERIT_ALL                                                                                    \
++	(TRIM_ACL_INHERIT_SELF | TRIM_ACL_INHERIT_FILE | TRIM_ACL_INHERIT_DIR | TRIM_ACL_INHERIT_NO_PROPAGATE | \
++	 TRIM_ACL_INHERIT_EXCLUDE)
++
++#define TRIM_ACL_XATTR_TAG_IS_ALLOW 0x0001
++#define TRIM_ACL_XATTR_TAG_IS_DENY 0x0002
++#define TRIM_ACL_XATTR_TAG_ALLOW_ALL (TRIM_ACL_XATTR_TAG_IS_ALLOW | TRIM_ACL_XATTR_TAG_IS_DENY)
++
++#define TRIM_ACL_XATTR_TAG_ID_USER 0x0004
++#define TRIM_ACL_XATTR_TAG_ID_GROUP 0x0008
++#define TRIM_ACL_XATTR_TAG_ID_EVERYONE 0x0010
++#define TRIM_ACL_XATTR_TAG_ID_OWNER 0x0020
++#define TRIM_ACL_XATTR_TAG_ID_AUTHENTICATEDUSER 0x0040
++#define TRIM_ACL_XATTR_TAG_ID_SYSTEM 0x0080
++#define TRIM_ACL_XATTR_TAG_ID_ALL                                                                    \
++	(TRIM_ACL_XATTR_TAG_ID_USER | TRIM_ACL_XATTR_TAG_ID_GROUP | TRIM_ACL_XATTR_TAG_ID_EVERYONE | \
++	 TRIM_ACL_XATTR_TAG_ID_OWNER | TRIM_ACL_XATTR_TAG_ID_AUTHENTICATEDUSER | TRIM_ACL_XATTR_TAG_ID_SYSTEM)
++
++/*
++ * these two structs should be packed because btrfs-send will transfer raw xattr
++ * data including `trim_acl_xattr_{entry,header}` via trim_acl_to_xattr().
++ */
++typedef struct {
++	__le16 e_tag;
++	__le16 e_unused1;
++	__le32 e_perm;
++	__le16 e_inherit;
++	__le16 e_unused2;
++	__le32 e_id;
++	__le32 e_level;
++} __attribute__((__packed__)) trim_acl_xattr_entry;
++
++typedef struct {
++	__le16 a_version;
++	__le16 a_unused;
++	trim_acl_xattr_entry a_entries[0];
++} __attribute__((__packed__)) trim_acl_xattr_header;
++
++static inline size_t trim_acl_xattr_size(int count)
++{
++	return (sizeof(trim_acl_xattr_header) + (count * sizeof(trim_acl_xattr_entry)));
++}
++
++static inline int trim_acl_xattr_count(size_t size)
++{
++	if (size < sizeof(trim_acl_xattr_header))
++		return -1;
++
++	size -= sizeof(trim_acl_xattr_header);
++	if (size % sizeof(trim_acl_xattr_entry))
++		return -1;
++
++	return size / sizeof(trim_acl_xattr_entry);
++}
++
++#endif /* _UAPI_LINUX_TRIM_ACL_H */
+diff --git a/include/uapi/linux/trim_acl_xattr_ds.h b/include/uapi/linux/trim_acl_xattr_ds.h
+new file mode 100644
+index 000000000..7bfedc722
+--- /dev/null
++++ b/include/uapi/linux/trim_acl_xattr_ds.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * Copyright (C) T.R.I.M Inc.
++ */
++#ifndef _UAPI_LINUX_TRIM_ACL_XATTR_DS_H
++#define _UAPI_LINUX_TRIM_ACL_XATTR_DS_H
++
++/* Provided for userspace backward compatiblity. */
++
++#include <linux/trim_acl.h>
++
++#endif /* _UAPI_LINUX_TRIM_ACL_XATTR_DS_H */
+diff --git a/include/uapi/linux/trim_flags.h b/include/uapi/linux/trim_flags.h
+new file mode 100644
+index 000000000..03f32d4be
+--- /dev/null
++++ b/include/uapi/linux/trim_flags.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_TRIM_FLAGS_H
++#define _UAPI_LINUX_TRIM_FLAGS_H
++
++#include <linux/types.h>
++
++#define TRIM_INODE_FLAGS_XATTR "system.trim_flags"
++#define TRIM_INODE_FLAGS_XATTR_VERSION 1
++
++#define TRIM_INODE_F_POSIX_ACL (1ULL << 0)
++
++struct trim_inode_flags_xattr_v1 {
++	__le16 version;
++	__le16 size;
++	__le32 reserved;
++	__le64 flags;
++} __attribute__((__packed__));
++
++#endif /* _UAPI_LINUX_TRIM_FLAGS_H */

@@ -1,0 +1,70 @@
+From cb912dfc786803785fbeb2e19017b0ea952809d8 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:25:00 +0000
+Subject: [PATCH 082/110] =?UTF-8?q?md/raid0,1,10,linear:=20set=5Flimits=20?=
+ =?UTF-8?q?=E4=BD=BF=E7=94=A8=20mddev->logical=5Fblock=5Fsize(=E4=B8=8A?=
+ =?UTF-8?q?=E6=B8=B8=20014=20=E6=A8=A1=E5=9D=97=E9=83=A8=E5=88=86)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 62ed1b582246 "md: allow configuring logical block size" 里 md-linear.c/raid0.c/
+raid1.c/raid10.c 的四处 `lim.logical_block_size = mddev->logical_block_size;` 原样移植
+(飞牛四个 set_limits 都读 mddev+0x13c)。md.c/md.h 部分属 md.c 子任务(字段 hdr 已加)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md-linear.c | 1 +
+ drivers/md/raid0.c     | 1 +
+ drivers/md/raid1.c     | 1 +
+ drivers/md/raid10.c    | 1 +
+ 4 files changed, 4 insertions(+)
+
+diff --git a/drivers/md/md-linear.c b/drivers/md/md-linear.c
+index a07620bb6..9cb1d7e85 100644
+--- a/drivers/md/md-linear.c
++++ b/drivers/md/md-linear.c
+@@ -73,6 +73,7 @@ static int linear_set_limits(struct mddev *mddev)
+ 	md_init_stacking_limits(&lim);
+ 	lim.features |= BLK_FEAT_NOWAIT;
+ 	lim.max_hw_sectors = mddev->chunk_sectors;
++	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.max_write_zeroes_sectors = mddev->chunk_sectors;
+ 	lim.max_hw_wzeroes_unmap_sectors = mddev->chunk_sectors;
+ 	lim.io_min = mddev->chunk_sectors << 9;
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index dc4be4c9d..f629350a0 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -386,6 +386,7 @@ static int raid0_set_limits(struct mddev *mddev)
+ 	lim.max_hw_sectors = mddev->chunk_sectors;
+ 	lim.max_write_zeroes_sectors = mddev->chunk_sectors;
+ 	lim.max_hw_wzeroes_unmap_sectors = mddev->chunk_sectors;
++	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.io_min = mddev->chunk_sectors << 9;
+ 	lim.io_opt = lim.io_min * mddev->raid_disks;
+ 	lim.chunk_sectors = mddev->chunk_sectors;
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index fa0f140c8..f8d2347c7 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -3185,6 +3185,7 @@ static int raid1_set_limits(struct mddev *mddev)
+ 	md_init_stacking_limits(&lim);
+ 	lim.max_write_zeroes_sectors = 0;
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
++	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+ 	if (err)
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index b55c93b0d..5d7882490 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -3981,6 +3981,7 @@ static int raid10_set_queue_limits(struct mddev *mddev)
+ 	md_init_stacking_limits(&lim);
+ 	lim.max_write_zeroes_sectors = 0;
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
++	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.io_min = mddev->chunk_sectors << 9;
+ 	lim.chunk_sectors = mddev->chunk_sectors;
+ 	lim.io_opt = lim.io_min * raid10_nr_stripes(conf);

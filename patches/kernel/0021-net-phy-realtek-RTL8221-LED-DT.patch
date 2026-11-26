@@ -1,0 +1,98 @@
+From 427e9c54e99454eb0ff12ce6cfc1878054a0478c Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:22:40 +0700
+Subject: [PATCH 021/110] =?UTF-8?q?net:=20phy:=20realtek:=20=E8=BF=98?=
+ =?UTF-8?q?=E5=8E=9F=E9=A3=9E=E7=89=9B=E5=B8=A6=E7=9A=84=20RTL8221=20LED?=
+ =?UTF-8?q?=20=E9=80=89=E6=8B=A9=20DT=20=E5=B1=9E=E6=80=A7?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+rtl822x_read_status() 末尾改为 return rtl8221b_config_led(phydev): 从
+设备属性 realtek,led-link-select (3 个)、realtek,led-act-select、
+realtek,led-polarity-select 读值写到 VEND2 0xd032/0xd034/0xd036、0xd040、0xd044。
+
+来源: 非上游, OpenWrt/ImmortalWrt 的 hack 补丁
+"net: phy: realtek: add led-link-select for RTL8221" (Yangyu Chen, 2023),
+原样取自 ImmortalWrt target/linux/mediatek/patches-6.18/
+733-net-phy-realtek-add-led-link-select-for-RTL8221.patch。
+
+比对: realtek.ko 里 rtl822x_read_status 一致, 至此 realtek.ko 全部一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/phy/realtek/realtek_main.c | 47 +++++++++++++++++++++++++-
+ 1 file changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/phy/realtek/realtek_main.c b/drivers/net/phy/realtek/realtek_main.c
+index f1b4ca867..32992fe3b 100644
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -136,6 +136,12 @@
+  */
+ #define RTL822X_VND2_C22_REG(reg)		(0xa400 + 2 * (reg))
+ 
++#define RTL8221B_NR_LEDS				3
++#define RTL8221B_LED_LINK_SELECT		0xd032
++#define RTL8221B_LED_LINK_SELECT_OFFSET	0x2
++#define RTL8221B_LED_ACT_SELECT		0xd040
++#define RTL8221B_LED_POLARITY_SELECT		0xd044
++
+ #define RTL8366RB_POWER_SAVE			0x15
+ #define RTL8366RB_POWER_SAVE_ON			BIT(12)
+ 
+@@ -1277,6 +1283,45 @@ static int rtl822x_config_init(struct phy_device *phydev)
+ 	return rtl822x_set_serdes_option_mode(phydev, true);
+ }
+ 
++static int rtl8221b_config_led(struct phy_device *phydev) {
++	struct device *node = &phydev->mdio.dev;
++	u32 link_select[RTL8221B_NR_LEDS];
++	u32 act_select, polarity_select;
++	int i, val;
++
++	val = device_property_read_u32_array(node, "realtek,led-link-select",
++			link_select, RTL8221B_NR_LEDS);
++	if (!val) {
++		for (i = 0; i < RTL8221B_NR_LEDS; i++) {
++			val = phy_write_mmd(phydev, MDIO_MMD_VEND2,
++				RTL8221B_LED_LINK_SELECT + i * RTL8221B_LED_LINK_SELECT_OFFSET,
++				link_select[i]);
++			if (val < 0)
++				return val;
++		}
++	}
++
++	val = device_property_read_u32(node,
++			"realtek,led-act-select", &act_select);
++	if (!val) {
++		val = phy_write_mmd(phydev, MDIO_MMD_VEND2,
++				RTL8221B_LED_ACT_SELECT, act_select);
++		if (val < 0)
++			return val;
++	}
++
++	val = device_property_read_u32(node,
++			"realtek,led-polarity-select", &polarity_select);
++	if (!val) {
++		val = phy_write_mmd(phydev, MDIO_MMD_VEND2,
++				RTL8221B_LED_POLARITY_SELECT, polarity_select);
++		if (val < 0)
++			return val;
++	}
++
++	return 0;
++}
++
+ static int rtl822xb_config_init(struct phy_device *phydev)
+ {
+ 	return rtl822x_set_serdes_option_mode(phydev, false);
+@@ -1382,7 +1427,7 @@ static int rtl822x_read_status(struct phy_device *phydev)
+ 
+ 	mii_10gbt_stat_mod_linkmode_lpa_t(phydev->lp_advertising, lpadv);
+ 
+-	return 0;
++	return rtl8221b_config_led(phydev);
+ }
+ 
+ static int rtl822xb_read_status(struct phy_device *phydev)

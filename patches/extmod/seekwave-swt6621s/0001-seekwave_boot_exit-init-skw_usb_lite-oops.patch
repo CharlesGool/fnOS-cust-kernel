@@ -1,0 +1,51 @@
+From d66b48a04d39c5013bc8925d8c02398dc8af0b86 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 02:46:04 +0000
+Subject: [PATCH] =?UTF-8?q?seekwave=5Fboot=5Fexit:=20=E6=B2=A1=20init=20?=
+ =?UTF-8?q?=E8=BF=87=E5=B0=B1=E7=9B=B4=E6=8E=A5=E8=BF=94=E5=9B=9E(?=
+ =?UTF-8?q?=E6=97=A0=E7=A1=AC=E4=BB=B6=E6=97=B6=E5=8D=B8=E8=BD=BD=20skw=5F?=
+ =?UTF-8?q?usb=5Flite=20=E4=BC=9A=20oops)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/seekwaveplatform_lite/skwutil/skw_boot.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/seekwaveplatform_lite/skwutil/skw_boot.c b/drivers/seekwaveplatform_lite/skwutil/skw_boot.c
+index a82562f..cc24533 100644
+--- a/drivers/seekwaveplatform_lite/skwutil/skw_boot.c
++++ b/drivers/seekwaveplatform_lite/skwutil/skw_boot.c
+@@ -1454,10 +1454,15 @@ static int skw_first_boot(struct seekwave_device *boot_data)
+ #endif
+ 	return ret;
+ }
++/* 只有探测到设备才会 init; 没有硬件时卸载模块不能去注销没注册过的东西 */
++static bool seekwave_boot_inited;
+ int seekwave_boot_init(char *chip_id)
+ {
+ 	int ret;
+ 
++	if (seekwave_boot_inited)
++		return 0;
++
+ 	skwboot_log("%s: enter chip_id=%s\n",__func__,chip_id);
+ 	if(chip_id != NULL && strlen(chip_id)!=0){
+ 		local_chip_id = chip_id;
+@@ -1467,10 +1472,14 @@ int seekwave_boot_init(char *chip_id)
+ 	ret = platform_driver_register(&seekwave_driver);
+ 	if (seekwave_device.name)
+ 		platform_device_register(&seekwave_device);
++	seekwave_boot_inited = true;
+ 	return ret;
+ }
+ void seekwave_boot_exit(void)
+ {
++	if (!seekwave_boot_inited)
++		return;
++	seekwave_boot_inited = false;
+ 	skw_ucom_exit();
+ 
+ 	if (seekwave_device.name)

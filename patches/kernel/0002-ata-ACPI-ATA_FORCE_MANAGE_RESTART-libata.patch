@@ -1,0 +1,455 @@
+From 1e3af65ac47873ad530e4201996d79f77ce7c61c Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 09:26:46 +0700
+Subject: [PATCH 002/110] =?UTF-8?q?ata:=20=E7=A7=BB=E6=A4=8D=E4=B8=8A?=
+ =?UTF-8?q?=E6=B8=B8=20ACPI=20=E7=AB=AF=E5=8F=A3=E7=94=B5=E6=BA=90?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=81=20+=20=E9=A3=9E=E7=89=9B=20ATA=5FFORCE=5FMAN?=
+ =?UTF-8?q?AGE=5FRESTART=20+=20libata=20=E4=BA=8B=E4=BB=B6=E4=B8=8A?=
+ =?UTF-8?q?=E6=8A=A5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 上游 6.19 (Markus Probst): sd 新增 manage_restart 属性、重启前停盘;
+  ata_acpi_dev_manage_restart() / ata_acpi_port_power_on()
+- 飞牛 CONFIG_ATA_FORCE_MANAGE_RESTART: 所有 ATA 盘重启前一律停盘
+- 飞牛 libata 事件上报: ata_dev_*/ata_link_* 打印宏顺带调用
+  ata_{dev,link}_<level>_report(), err/warn 级别带序列号经 er_emit(0x50) 上报
+  (新文件 drivers/ata/libata-er.c)
+
+比对: drivers/ata + drivers/scsi 全部飞牛私有改动一致;
+er_report_ata_dev 只差寄存器/循环变量选择。剩余不一致均为飞牛挑进来的 stable 修复。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/ata/Kconfig        |   9 +++
+ drivers/ata/Makefile       |   1 +
+ drivers/ata/libata-acpi.c  |  67 ++++++++++++++++++++
+ drivers/ata/libata-core.c  |   2 +
+ drivers/ata/libata-er.c    | 121 +++++++++++++++++++++++++++++++++++++
+ drivers/ata/libata-scsi.c  |   5 ++
+ drivers/ata/libata.h       |   4 ++
+ drivers/scsi/sd.c          |  34 ++++++++++-
+ include/linux/libata.h     |  29 ++++++++-
+ include/scsi/scsi_device.h |   6 ++
+ 10 files changed, 276 insertions(+), 2 deletions(-)
+ create mode 100755 drivers/ata/libata-er.c
+
+diff --git a/drivers/ata/Kconfig b/drivers/ata/Kconfig
+index ff81f707d..f5d94b61a 100644
+--- a/drivers/ata/Kconfig
++++ b/drivers/ata/Kconfig
+@@ -81,6 +81,15 @@ config ATA_ACPI
+ 	  You can disable this at kernel boot time by using the
+ 	  option libata.noacpi=1
+ 
++config ATA_FORCE_MANAGE_RESTART
++	bool "Always spin down ATA disks on system restart"
++	depends on ATA
++	help
++	  Let sd stop (spin down) every ATA disk before a reboot, not only
++	  disks whose port power is controlled by ACPI.
++
++	  This is the fnOS default for NAS boxes.
++
+ config SATA_ZPODD
+ 	bool "SATA Zero Power Optical Disc Drive (ZPODD) support"
+ 	depends on ATA_ACPI && PM
+diff --git a/drivers/ata/Makefile b/drivers/ata/Makefile
+index 81e04e96b..c5b9e4950 100644
+--- a/drivers/ata/Makefile
++++ b/drivers/ata/Makefile
+@@ -128,3 +128,4 @@ libata-$(CONFIG_SATA_PMP)	+= libata-pmp.o
+ libata-$(CONFIG_ATA_ACPI)	+= libata-acpi.o
+ libata-$(CONFIG_SATA_ZPODD)	+= libata-zpodd.o
+ libata-$(CONFIG_PATA_TIMINGS)	+= libata-pata-timings.o
++libata-$(CONFIG_EVENT_REPORT)	+= libata-er.o
+diff --git a/drivers/ata/libata-acpi.c b/drivers/ata/libata-acpi.c
+index f2140fc06..15e18d50d 100644
+--- a/drivers/ata/libata-acpi.c
++++ b/drivers/ata/libata-acpi.c
+@@ -245,6 +245,73 @@ void ata_acpi_bind_dev(struct ata_device *dev)
+ 				   ata_acpi_dev_uevent);
+ }
+ 
++/**
++ * ata_acpi_dev_manage_restart - if the disk should be stopped (spun down) on
++ *                               system restart.
++ * @dev: target ATA device
++ *
++ * RETURNS:
++ * true if the disk should be stopped, otherwise false.
++ */
++bool ata_acpi_dev_manage_restart(struct ata_device *dev)
++{
++	struct device *tdev;
++
++	/*
++	 * If ATA_FLAG_ACPI_SATA is set, the acpi fwnode is attached to the
++	 * ata_device instead of the ata_port.
++	 */
++	if (dev->link->ap->flags & ATA_FLAG_ACPI_SATA)
++		tdev = &dev->tdev;
++	else
++		tdev = &dev->link->ap->tdev;
++
++	if (!is_acpi_device_node(tdev->fwnode))
++		return false;
++	return acpi_bus_power_manageable(ACPI_HANDLE(tdev));
++}
++
++/**
++ * ata_acpi_port_power_on - set the power state of the ata port to D0
++ * @ap: target ATA port
++ *
++ * This function is called at the beginning of ata_port_probe().
++ */
++void ata_acpi_port_power_on(struct ata_port *ap)
++{
++	acpi_handle handle;
++	int i;
++
++	/*
++	 * If ATA_FLAG_ACPI_SATA is set, the acpi fwnode is attached to the
++	 * ata_device instead of the ata_port.
++	 */
++	if (ap->flags & ATA_FLAG_ACPI_SATA) {
++		for (i = 0; i < ATA_MAX_DEVICES; i++) {
++			struct ata_device *dev = &ap->link.device[i];
++
++			if (!is_acpi_device_node(dev->tdev.fwnode))
++				continue;
++			handle = ACPI_HANDLE(&dev->tdev);
++			if (!acpi_bus_power_manageable(handle))
++				continue;
++			if (acpi_bus_set_power(handle, ACPI_STATE_D0))
++				ata_dev_err(dev,
++					    "acpi: failed to set power state to D0\n");
++		}
++		return;
++	}
++
++	if (!is_acpi_device_node(ap->tdev.fwnode))
++		return;
++	handle = ACPI_HANDLE(&ap->tdev);
++	if (!acpi_bus_power_manageable(handle))
++		return;
++
++	if (acpi_bus_set_power(handle, ACPI_STATE_D0))
++		ata_port_err(ap, "acpi: failed to set power state to D0\n");
++}
++
+ /**
+  * ata_acpi_dissociate - dissociate ATA host from ACPI objects
+  * @host: target ATA host
+diff --git a/drivers/ata/libata-core.c b/drivers/ata/libata-core.c
+index 29394d18e..30cc0b93d 100644
+--- a/drivers/ata/libata-core.c
++++ b/drivers/ata/libata-core.c
+@@ -6119,6 +6119,8 @@ void ata_port_probe(struct ata_port *ap)
+ 	struct ata_eh_info *ehi = &ap->link.eh_info;
+ 	unsigned long flags;
+ 
++	ata_acpi_port_power_on(ap);
++
+ 	/* kick EH for boot probing */
+ 	spin_lock_irqsave(ap->lock, flags);
+ 
+diff --git a/drivers/ata/libata-er.c b/drivers/ata/libata-er.c
+new file mode 100755
+index 000000000..7a5c80eea
+--- /dev/null
++++ b/drivers/ata/libata-er.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * libata 事件上报: ata_dev_err()/ata_link_warn() 等打印的同时, 把 err/warn 级别的
++ * 消息连同硬盘序列号经 er_emit() 上报给 event_report(飞牛 sysdiag 订阅)。
++ * 按飞牛 6.18.18.c1186-trim 二进制还原。
++ */
++#include <linux/kernel.h>
++#include <linux/export.h>
++#include <linux/string.h>
++#include <linux/libata.h>
++#include <linux/event_report.h>
++
++#define ER_EVENT_SATA	0x50
++
++static void er_report_ata_dev(const struct ata_device *dev, const char *level,
++			      const char *fmt, va_list args)
++{
++	struct ata_error_info info;
++	unsigned int i;
++	u32 print_id;
++	u16 subevent;
++	char *p;
++	int len;
++
++	if (!dev)
++		return;
++
++	if (!strcmp(level, "err"))
++		subevent = SATA_SUBEVENT_ERROR;
++	else if (!strcmp(level, "warn"))
++		subevent = SATA_SUBEVENT_WARNING;
++	else
++		return;
++
++	memset(&info, 0, sizeof(info));
++
++	/* IDENTIFY 里的序列号(同 ata_id_string): 每个字高字节在前 */
++	for (i = 0; i < ATA_ID_SERNO_LEN / 2; i++) {
++		u16 w = dev->id[ATA_ID_SERNO + i];
++
++		info.serial_number[i * 2] = w >> 8;
++		info.serial_number[i * 2 + 1] = w & 0xff;
++	}
++	info.serial_number[ATA_ID_SERNO_LEN] = '\0';
++
++	/* 去掉开头的空白 */
++	for (i = 0; i < ATA_ID_SERNO_LEN; i++)
++		if (info.serial_number[i] != ' ' && info.serial_number[i] != '\t')
++			break;
++	if (i > 0)
++		memmove(info.serial_number, info.serial_number + i,
++			sizeof(info.serial_number) - i);
++
++	/* 去掉结尾的空格; 序列号为空就不报 */
++	len = strlen(info.serial_number);
++	p = &info.serial_number[len - 1];
++	while (len > 0 && *p-- == ' ')
++		len--;
++	if (!len)
++		return;
++	info.serial_number[len] = '\0';
++
++	vsnprintf(info.error_desc, sizeof(info.error_desc), fmt, args);
++
++	print_id = -1;
++	if (dev->link && dev->link->ap)
++		print_id = dev->link->ap->print_id;
++	info.print_id = print_id;
++
++	er_emit(ER_EVENT_SATA, subevent, &info, sizeof(info));
++}
++
++#define DEFINE_ATA_DEV_REPORT(lvl)						\
++void ata_dev_##lvl##_report(const struct ata_device *dev, const char *fmt, ...)	\
++{										\
++	va_list args;								\
++										\
++	va_start(args, fmt);							\
++	er_report_ata_dev(dev, #lvl, fmt, args);				\
++	va_end(args);								\
++}										\
++EXPORT_SYMBOL_GPL(ata_dev_##lvl##_report)
++
++DEFINE_ATA_DEV_REPORT(err);
++DEFINE_ATA_DEV_REPORT(warn);
++DEFINE_ATA_DEV_REPORT(notice);
++DEFINE_ATA_DEV_REPORT(info);
++DEFINE_ATA_DEV_REPORT(debug);
++
++/* 注意: 飞牛原版对 link 上每个设备复用同一个 va_list(没有 va_copy), 这里照原样还原 */
++static void er_report_ata_link(const struct ata_link *link, const char *level,
++			       const char *fmt, va_list args)
++{
++	struct ata_device *dev;
++
++	if (!link)
++		return;
++
++	ata_for_each_dev(dev, (struct ata_link *)link, ALL) {
++		if (dev->class == ATA_DEV_NONE)
++			continue;
++		er_report_ata_dev(dev, level, fmt, args);
++	}
++}
++
++#define DEFINE_ATA_LINK_REPORT(lvl)						\
++void ata_link_##lvl##_report(const struct ata_link *link, const char *fmt, ...)	\
++{										\
++	va_list args;								\
++										\
++	va_start(args, fmt);							\
++	er_report_ata_link(link, #lvl, fmt, args);				\
++	va_end(args);								\
++}										\
++EXPORT_SYMBOL_GPL(ata_link_##lvl##_report)
++
++DEFINE_ATA_LINK_REPORT(err);
++DEFINE_ATA_LINK_REPORT(warn);
++DEFINE_ATA_LINK_REPORT(notice);
++DEFINE_ATA_LINK_REPORT(info);
++DEFINE_ATA_LINK_REPORT(debug);
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index ce206f90d..e0381c837 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -1106,6 +1106,11 @@ int ata_scsi_dev_config(struct scsi_device *sdev, struct queue_limits *lim,
+ 		 */
+ 		sdev->manage_runtime_start_stop = 1;
+ 		sdev->manage_shutdown = 1;
++#ifdef CONFIG_ATA_FORCE_MANAGE_RESTART
++		sdev->manage_restart = 1;
++#else
++		sdev->manage_restart = ata_acpi_dev_manage_restart(dev);
++#endif
+ 		sdev->force_runtime_start_on_system_start = 1;
+ 	}
+ 
+diff --git a/drivers/ata/libata.h b/drivers/ata/libata.h
+index 506a649b7..813681083 100644
+--- a/drivers/ata/libata.h
++++ b/drivers/ata/libata.h
+@@ -131,6 +131,8 @@ extern void ata_acpi_on_disable(struct ata_device *dev);
+ extern void ata_acpi_set_state(struct ata_port *ap, pm_message_t state);
+ extern void ata_acpi_bind_port(struct ata_port *ap);
+ extern void ata_acpi_bind_dev(struct ata_device *dev);
++extern void ata_acpi_port_power_on(struct ata_port *ap);
++extern bool ata_acpi_dev_manage_restart(struct ata_device *dev);
+ extern acpi_handle ata_dev_acpi_handle(struct ata_device *dev);
+ #else
+ static inline void ata_acpi_dissociate(struct ata_host *host) { }
+@@ -141,6 +143,8 @@ static inline void ata_acpi_set_state(struct ata_port *ap,
+ 				      pm_message_t state) { }
+ static inline void ata_acpi_bind_port(struct ata_port *ap) {}
+ static inline void ata_acpi_bind_dev(struct ata_device *dev) {}
++static inline void ata_acpi_port_power_on(struct ata_port *ap) {}
++static inline bool ata_acpi_dev_manage_restart(struct ata_device *dev) { return 0; }
+ #endif
+ 
+ /* libata-scsi.c */
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index cd98b5df1..443b20008 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -372,6 +372,35 @@ static ssize_t manage_shutdown_store(struct device *dev,
+ }
+ static DEVICE_ATTR_RW(manage_shutdown);
+ 
++static ssize_t manage_restart_show(struct device *dev,
++				   struct device_attribute *attr, char *buf)
++{
++	struct scsi_disk *sdkp = to_scsi_disk(dev);
++	struct scsi_device *sdp = sdkp->device;
++
++	return sysfs_emit(buf, "%u\n", sdp->manage_restart);
++}
++
++static ssize_t manage_restart_store(struct device *dev,
++				    struct device_attribute *attr,
++				    const char *buf, size_t count)
++{
++	struct scsi_disk *sdkp = to_scsi_disk(dev);
++	struct scsi_device *sdp = sdkp->device;
++	bool v;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EACCES;
++
++	if (kstrtobool(buf, &v))
++		return -EINVAL;
++
++	sdp->manage_restart = v;
++
++	return count;
++}
++static DEVICE_ATTR_RW(manage_restart);
++
+ static ssize_t
+ allow_restart_show(struct device *dev, struct device_attribute *attr, char *buf)
+ {
+@@ -708,6 +737,7 @@ static struct attribute *sd_disk_attrs[] = {
+ 	&dev_attr_manage_system_start_stop.attr,
+ 	&dev_attr_manage_runtime_start_stop.attr,
+ 	&dev_attr_manage_shutdown.attr,
++	&dev_attr_manage_restart.attr,
+ 	&dev_attr_protection_type.attr,
+ 	&dev_attr_protection_mode.attr,
+ 	&dev_attr_app_tag_own.attr,
+@@ -4190,7 +4220,9 @@ static void sd_shutdown(struct device *dev)
+ 	    (system_state == SYSTEM_POWER_OFF &&
+ 	     sdkp->device->manage_shutdown) ||
+ 	    (system_state == SYSTEM_RUNNING &&
+-	     sdkp->device->manage_runtime_start_stop)) {
++	     sdkp->device->manage_runtime_start_stop) ||
++	    (system_state == SYSTEM_RESTART &&
++	     sdkp->device->manage_restart)) {
+ 		sd_printk(KERN_NOTICE, sdkp, "Stopping disk\n");
+ 		sd_start_stop_device(sdkp, 0);
+ 	}
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index 77155535b..c033931ca 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -1549,6 +1549,29 @@ static inline int sata_srst_pmp(struct ata_link *link)
+ 	return link->pmp;
+ }
+ 
++/*
++ * 事件上报(CONFIG_EVENT_REPORT): ata_link_*() / ata_dev_*() 打印时顺带上报,
++ * err/warn 级别会带上硬盘序列号经 er_emit() 发给 event_report。
++ */
++#ifdef CONFIG_EVENT_REPORT
++#define ATA_REPORT_DECL(obj, type, lvl)					\
++	__printf(2, 3) void ata_ ## obj ## _ ## lvl ## _report(const type *obj, const char *fmt, ...);
++#else
++#define ATA_REPORT_DECL(obj, type, lvl)					\
++	static inline __printf(2, 3)					\
++	void ata_ ## obj ## _ ## lvl ## _report(const type *obj, const char *fmt, ...) { }
++#endif
++ATA_REPORT_DECL(link, struct ata_link, err)
++ATA_REPORT_DECL(link, struct ata_link, warn)
++ATA_REPORT_DECL(link, struct ata_link, notice)
++ATA_REPORT_DECL(link, struct ata_link, info)
++ATA_REPORT_DECL(link, struct ata_link, debug)
++ATA_REPORT_DECL(dev, struct ata_device, err)
++ATA_REPORT_DECL(dev, struct ata_device, warn)
++ATA_REPORT_DECL(dev, struct ata_device, notice)
++ATA_REPORT_DECL(dev, struct ata_device, info)
++ATA_REPORT_DECL(dev, struct ata_device, debug)
++
+ #define ata_port_printk(level, ap, fmt, ...)			\
+ 	pr_ ## level ("ata%u: " fmt, (ap)->print_id, ##__VA_ARGS__)
+ 
+@@ -1575,6 +1598,7 @@ do {								\
+ 		pr_ ## level ("ata%u: " fmt,			\
+ 			      (link)->ap->print_id,		\
+ 			      ##__VA_ARGS__);			\
++	ata_link_ ## level ## _report(link, fmt, ##__VA_ARGS__);	\
+ } while (0)
+ 
+ #define ata_link_err(link, fmt, ...)				\
+@@ -1589,10 +1613,13 @@ do {								\
+ 	ata_link_printk(debug, link, fmt, ##__VA_ARGS__)
+ 
+ #define ata_dev_printk(level, dev, fmt, ...)			\
++do {								\
+         pr_ ## level("ata%u.%02u: " fmt,			\
+                (dev)->link->ap->print_id,			\
+ 	       (dev)->link->pmp + (dev)->devno,			\
+-	       ##__VA_ARGS__)
++	       ##__VA_ARGS__);					\
++	ata_dev_ ## level ## _report(dev, fmt, ##__VA_ARGS__);	\
++} while (0)
+ 
+ #define ata_dev_err(dev, fmt, ...)				\
+ 	ata_dev_printk(err, dev, fmt, ##__VA_ARGS__)
+diff --git a/include/scsi/scsi_device.h b/include/scsi/scsi_device.h
+index 850aceb35..89f5865f1 100644
+--- a/include/scsi/scsi_device.h
++++ b/include/scsi/scsi_device.h
+@@ -178,6 +178,12 @@ struct scsi_device {
+ 	 */
+ 	unsigned manage_shutdown:1;
+ 
++	/*
++	 * If true, let the high-level device driver (sd) manage the device
++	 * power state for system restart (reboot) operations.
++	 */
++	unsigned manage_restart:1;
++
+ 	/*
+ 	 * If set and if the device is runtime suspended, ask the high-level
+ 	 * device driver (sd) to force a runtime resume of the device.

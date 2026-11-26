@@ -1,0 +1,119 @@
+From da67544152fec754093e8e4389a5674e07abba48 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 08:04:48 +0000
+Subject: [PATCH 100/110] =?UTF-8?q?md:=20=E8=A1=A5=E9=BD=90=20DFR/llbitmap?=
+ =?UTF-8?q?=20=E7=9A=84=20EXPORT=5FSYMBOL=5FGPL,=20raid5=20break=5Fstripe?=
+ =?UTF-8?q?=5Fbatch=5Flist=20=E4=BF=9D=E7=95=99=20STRIPE=5FDFR?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md-dfr.c      | 8 ++++++++
+ drivers/md/md-llbitmap.c | 2 ++
+ drivers/md/raid5.c       | 3 ++-
+ 3 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/md-dfr.c b/drivers/md/md-dfr.c
+index f26aeed12..daf7ed46f 100644
+--- a/drivers/md/md-dfr.c
++++ b/drivers/md/md-dfr.c
+@@ -42,6 +42,7 @@ bool md_dfr_started(struct mddev *mddev)
+ 
+ 	return dfr && test_bit(DFR_F_PLUG, &dfr->flags);
+ }
++EXPORT_SYMBOL_GPL(md_dfr_started);
+ 
+ void md_dfr_set_sync_takeover(struct mddev *mddev)
+ {
+@@ -50,6 +51,7 @@ void md_dfr_set_sync_takeover(struct mddev *mddev)
+ 	if (dfr)
+ 		set_bit(DFR_F_SYNC_TAKEOVER, &dfr->flags);
+ }
++EXPORT_SYMBOL_GPL(md_dfr_set_sync_takeover);
+ 
+ bool md_dfr_test_sync_takeover(struct mddev *mddev)
+ {
+@@ -73,6 +75,7 @@ bool md_rdev_in_dfr(struct mddev *mddev, struct md_rdev *rdev)
+ 	return dfr && test_bit(DFR_F_PLUG, &dfr->flags) &&
+ 	       test_bit(Offline, &rdev->flags);
+ }
++EXPORT_SYMBOL_GPL(md_rdev_in_dfr);
+ 
+ /* The bio holds a reference on dfr->pending until it is plugged or ended. */
+ void stripe_end_dfr(struct stripe_head *sh)
+@@ -82,6 +85,7 @@ void stripe_end_dfr(struct stripe_head *sh)
+ 	if (atomic_dec_and_test(&dfr->pending))
+ 		wake_up(&dfr->unplug_wait);
+ }
++EXPORT_SYMBOL_GPL(stripe_end_dfr);
+ 
+ void stripe_end_bio(struct stripe_head *sh, struct bio *bio)
+ {
+@@ -95,6 +99,7 @@ void stripe_end_bio(struct stripe_head *sh, struct bio *bio)
+ 	}
+ 	bio_endio(bio);
+ }
++EXPORT_SYMBOL_GPL(stripe_end_bio);
+ 
+ /* Called with dfr->lock held. */
+ static bool __md_start_dfr_locked(struct md_rdev *rdev)
+@@ -384,6 +389,7 @@ bool md_start_dfr(struct md_rdev *rdev, struct bio *bio)
+ {
+ 	return md_start_dfr_rdev(rdev, bio) == 0;
+ }
++EXPORT_SYMBOL_GPL(md_start_dfr);
+ 
+ static bool md_rdev_start_dfr(struct md_rdev *rdev)
+ {
+@@ -432,6 +438,7 @@ bool stripe_start_dfr(struct md_rdev *rdev, struct stripe_head *sh)
+ 		atomic_inc(&dfr->pending);
+ 	return can_dfr;
+ }
++EXPORT_SYMBOL_GPL(stripe_start_dfr);
+ 
+ static ssize_t start_dfr_by_slot_store(struct mddev *mddev, const char *buf,
+ 				       size_t len)
+@@ -514,6 +521,7 @@ void md_stop_dfr(struct md_rdev *rdev)
+ unlock:
+ 	spin_unlock_irqrestore(&dfr->lock, flags);
+ }
++EXPORT_SYMBOL_GPL(md_stop_dfr);
+ 
+ /* The clone @bio of an io on an offline disk is done. Return true if the orig bio is held. */
+ bool md_dfr_end_clone_io(struct md_io_clone *md_io_clone, struct bio *bio)
+diff --git a/drivers/md/md-llbitmap.c b/drivers/md/md-llbitmap.c
+index 366eccdbf..7ec498d61 100644
+--- a/drivers/md/md-llbitmap.c
++++ b/drivers/md/md-llbitmap.c
+@@ -2767,6 +2767,7 @@ sector_t md_llbitmap_sync_remaining(struct mddev *mddev, sector_t resync,
+ 
+ 	return bits << llbitmap->chunkshift;
+ }
++EXPORT_SYMBOL_GPL(md_llbitmap_sync_remaining);
+ 
+ /*
+  * For raid456 in LLBITMAP_RESYNC_MODE_RECOVERY, return the disk to rebuild
+@@ -2794,6 +2795,7 @@ int md_llbitmap_sync_target(struct mddev *mddev, sector_t offset)
+ 
+ 	return target;
+ }
++EXPORT_SYMBOL_GPL(md_llbitmap_sync_target);
+ 
+ int md_llbitmap_init(void)
+ {
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 65bd7f269..0b3a794ec 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5128,7 +5128,8 @@ static void break_stripe_batch_list(struct stripe_head *head_sh,
+ 
+ 		set_mask_bits(&sh->state, ~(STRIPE_EXPAND_SYNC_FLAGS |
+ 					    (1 << STRIPE_PREREAD_ACTIVE) |
+-					    (1 << STRIPE_ON_UNPLUG_LIST)),
++					    (1 << STRIPE_ON_UNPLUG_LIST) |
++					    (1 << STRIPE_DFR)),
+ 			      state & (1 << STRIPE_INSYNC));
+ 
+ 		sh->check_state = head_sh->check_state;

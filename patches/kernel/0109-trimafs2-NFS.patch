@@ -1,0 +1,56 @@
+From 21c5dc811d995862f079c7b87360f79a8b137d89 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 21:44:30 +0000
+Subject: [PATCH 109/110] =?UTF-8?q?trimafs2:=20NFS=20=E4=B8=8B=E5=B1=82?=
+ =?UTF-8?q?=E5=8F=A5=E6=9F=84=E9=9D=9E=E7=9B=AE=E5=BD=95=E4=B9=9F=E8=A6=81?=
+ =?UTF-8?q?=E5=9C=A8=E6=A1=A5=E6=A0=B9=E4=B9=8B=E4=B8=8B(=E5=AE=89?=
+ =?UTF-8?q?=E5=85=A8=E4=BF=AE=E5=A4=8D)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题: trimafs2_lower_acceptable 对非目录直接返回 1, 伪造的下层句柄可以
+打开桥目录之外的文件。
+
+修法: 非目录和目录同样处理: DISCONNECTED 拒绝、要求
+path_is_under 桥根(已删除的目录仍拒绝; 非目录保留"打开后删除"按句柄访问, 和上游一致)。下层句柄本来就按 EXPORT_FH_CONNECTABLE 编码,
+exportfs_decode_fh 遇到非目录被拒时会走 fh_to_parent + reconnect_path +
+get_name 找回连通的 dentry 再检查, 合法句柄在冷缓存下仍能解开。
+另在 trimafs2_map_lower_to_upper 非目录分支开头补一道 path_is_under
+检查, 不在桥根之下返回 -ESTALE(纵深防御)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/trimafs2/export.c | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/fs/trimafs2/export.c b/fs/trimafs2/export.c
+index 2d1d7410c..f658d46de 100644
+--- a/fs/trimafs2/export.c
++++ b/fs/trimafs2/export.c
+@@ -21,11 +21,11 @@ static int trimafs2_lower_acceptable(void *data, struct dentry *dentry)
+ 	struct trimafs2_decode_ctx *ctx = data;
+ 	struct path path, root;
+ 
+-	if (!d_is_dir(dentry))
+-		return 1;
++	/* 非目录也要连通并在桥根之下(exportfs 会经 fh_to_parent 找回连通的 dentry) */
+ 	if (dentry->d_flags & DCACHE_DISCONNECTED)
+ 		return 0;
+-	if (d_unlinked(dentry))
++	/* 已删除的目录不再接受; 非目录保留"打开后删除"仍可按句柄访问(和上游一致) */
++	if (d_is_dir(dentry) && d_unlinked(dentry))
+ 		return 0;
+ 
+ 	path.mnt = ctx->branch->lower_mnt;
+@@ -197,6 +197,10 @@ static struct dentry *trimafs2_map_lower_to_upper(struct trimafs2_branch *branch
+ 		struct inode *inode;
+ 		int err;
+ 
++		/* 纵深防御: 下层对象必须在桥根之下 */
++		if (!path_is_under(&path, &root))
++			return ERR_PTR(-ESTALE);
++
+ 		inode = trimafs2_get_lower_inode(upper_root->d_sb, &lower_path, branch->branch_id);
+ 		if (IS_ERR(inode))
+ 			return ERR_CAST(inode);

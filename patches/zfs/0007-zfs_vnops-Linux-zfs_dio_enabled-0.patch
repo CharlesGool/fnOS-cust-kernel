@@ -1,0 +1,51 @@
+From 03cec0c73f24fc05e664b362968526f9f2d91370 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:08:00 +0700
+Subject: [PATCH 7/8] =?UTF-8?q?zfs=5Fvnops:=20Linux=20=E4=B8=8A=20zfs=5Fdi?=
+ =?UTF-8?q?o=5Fenabled=20=E9=BB=98=E8=AE=A4=E6=94=B9=E6=88=90=200(?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 2.4.1 在 Linux 上默认开启 Direct I/O(zfs_dio_enabled=1),
+飞牛 zfs.ko 里这个参数在 .bss(初值 0), 和 FreeBSD 一样默认关,
+O_DIRECT 请求都走 ARC。模块参数里这是唯一的默认值改动。
+man/man4/zfs.4 同步。
+
+来源: 飞牛私有改动。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ man/man4/zfs.4         | 3 ++-
+ module/zfs/zfs_vnops.c | 2 +-
+ 2 files changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/man/man4/zfs.4 b/man/man4/zfs.4
+index a2faec4..591e817 100644
+--- a/man/man4/zfs.4
++++ b/man/man4/zfs.4
+@@ -299,8 +299,9 @@ Default dnode block size as a power of 2.
+ .It Sy zfs_default_ibs Ns = Ns Sy 17 Po 128 KiB Pc Pq int
+ Default dnode indirect block size as a power of 2.
+ .
+-.It Sy zfs_dio_enabled Ns = Ns Sy 1 Ns | Ns 0 Pq int
++.It Sy zfs_dio_enabled Ns = Ns Sy 0 Ns | Ns 1 Pq int
+ Enable Direct I/O.
++Disabled by default on fnOS.
+ If this setting is 0, then all I/O requests will be directed through the ARC
+ acting as though the dataset property
+ .Sy direct
+diff --git a/module/zfs/zfs_vnops.c b/module/zfs/zfs_vnops.c
+index 7bb9ba5..ff12693 100644
+--- a/module/zfs/zfs_vnops.c
++++ b/module/zfs/zfs_vnops.c
+@@ -89,7 +89,7 @@ int zfs_bclone_wait_dirty = 1;
+ #ifdef __FreeBSD__
+ static int zfs_dio_enabled = 0;
+ #else
+-static int zfs_dio_enabled = 1;
++static int zfs_dio_enabled = 0;	/* fnOS: Linux default off too */
+ #endif
+ 
+ /*

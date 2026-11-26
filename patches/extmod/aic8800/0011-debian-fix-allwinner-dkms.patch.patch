@@ -1,0 +1,49 @@
+From ad6da5614351affaa668aaaf32d684a455c21a41 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:11:50 +0000
+Subject: [PATCH 11/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-allwin?=
+ =?UTF-8?q?ner-dkms.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/Makefile  | 5 +++++
+ src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/Makefile | 5 +++++
+ 2 files changed, 10 insertions(+)
+
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/Makefile b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/Makefile
+index ccc4efe..af5397a 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/Makefile
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/Makefile
+@@ -140,6 +140,11 @@ KVER ?= $(shell uname -r)
+ MODDESTDIR ?= /lib/modules/$(KVER)/kernel/drivers/net/wireless/
+ ARCH ?= x86_64
+ CROSS_COMPILE ?=
++
++ifeq ($(CONFIG_AW_BSP), y)
++ccflags-y += -DCONFIG_PLATFORM_ALLWINNER
++endif
++
+ endif
+ ###########################################
+ 
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/Makefile b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/Makefile
+index 033b8b4..96e0d58 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/Makefile
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/Makefile
+@@ -411,6 +411,11 @@ KVER ?= $(shell uname -r)
+ MODDESTDIR ?= /lib/modules/$(KVER)/kernel/drivers/net/wireless/
+ ARCH ?= x86_64
+ CROSS_COMPILE ?=
++
++ifeq ($(CONFIG_AW_BSP), y)
++ccflags-y += -DCONFIG_PLATFORM_ALLWINNER
++endif
++
+ endif
+ ###########################################
+ 

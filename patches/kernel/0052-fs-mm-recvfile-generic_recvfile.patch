@@ -1,0 +1,365 @@
+From 23c4ac06fbbb395cd87ed1a5b85634cc41944565 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:38:23 +0700
+Subject: [PATCH 052/110] =?UTF-8?q?fs,=20mm:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E7=A7=81=E6=9C=89=20recvfile=20=E7=B3=BB=E7=BB=9F?=
+ =?UTF-8?q?=E8=B0=83=E7=94=A8=E5=92=8C=20generic=5Frecvfile?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛私有接口 (给 Samba 用, 网络 socket 直接收进文件页缓存, sendfile 的反方向):
+
+  long recvfile(int fd, int sockfd, loff_t __user *offset, size_t count,
+                struct recvfile_io_stats __user *stats);   /* x86_64/i386 802 号 */
+
+fs/read_write.c: SYSCALL_DEFINE5(recvfile) + do_recvfile()
+  - count==0 直接返回 0; offset 非空用 fdget + 拷入偏移, 否则 fdget_pos 用 f_pos;
+  - sockfd_lookup, sock->sk 为空 -EINVAL;
+  - 只接受 FMODE_WRITE(-EBADF) + FMODE_CAN_WRITE + 普通文件(-EINVAL);
+  - rw_verify_area(WRITE) -> file_start_write -> inode_lock ->
+    generic_write_checks_count (O_APPEND/RLIMIT_FSIZE/s_maxbytes 截断) ->
+    file_remove_privs -> f_op->recvfile 或 generic_recvfile -> fsnotify_modify
+    -> 解锁 -> generic_write_sync(按实际写入字节) -> 记 rchar/wchar/syscr/syscw;
+  - 回写偏移 (offset 或 f_pos), stats 非空时拷出 {received, written}。
+
+mm/filemap.c: generic_recvfile() (EXPORT_SYMBOL) + generic_recvfile_one_batch()
+  - 要求 a_ops 有 write_begin/write_end, 否则 -EOPNOTSUPP;
+  - 每批最多 128K / 32 个 folio: 逐个 write_begin, 拼 bio_vec,
+    一次 sock_recvmsg(MSG_WAITALL), 临时把 sk_rcvtimeo 设成 64 秒;
+  - 收到多少就按 folio 顺序 write_end 多少, 剩下的 folio 以 copied=0 释放;
+  - 收到的字节数小于本批长度 (对端没数据/超时) 即停止, 返回已写入字节。
+
+与飞牛逐函数比对: __x64/__ia32_sys_recvfile、x64_sys_call、ia32_sys_call、
+sys_call_table 一致; __do_sys_recvfile、generic_recvfile、generic_recvfile_one_batch
+只差栈帧大小/寄存器分配 (tokdiff 调用、常量、结构体偏移集合相同)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/read_write.c | 122 +++++++++++++++++++++++++++++++++++
+ mm/filemap.c    | 165 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 287 insertions(+)
+
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 011fe55c9..3ace25060 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -20,6 +20,7 @@
+ #include <linux/compat.h>
+ #include <linux/mount.h>
+ #include <linux/fs.h>
++#include <linux/net.h>
+ #include "internal.h"
+ 
+ #include <linux/uaccess.h>
+@@ -1414,6 +1415,127 @@ SYSCALL_DEFINE4(sendfile, int, out_fd, int, in_fd, off_t __user *, offset, size_
+ 	return do_sendfile(out_fd, in_fd, NULL, count, 0);
+ }
+ 
++static ssize_t do_recvfile(struct file *file, struct socket *sock, loff_t *ppos,
++			   size_t count, struct recvfile_io_stats *stats)
++{
++	struct inode *inode = file_inode(file);
++	struct kiocb kiocb = {};
++	loff_t len = count;
++	ssize_t ret;
++
++	stats->received = 0;
++	stats->written = 0;
++
++	if (!(file->f_mode & FMODE_WRITE))
++		return -EBADF;
++	if (!(file->f_mode & FMODE_CAN_WRITE) || !S_ISREG(inode->i_mode))
++		return -EINVAL;
++
++	ret = rw_verify_area(WRITE, file, ppos, count);
++	if (ret < 0)
++		return ret;
++
++	file_start_write(file);
++	inode_lock(inode);
++	init_sync_kiocb(&kiocb, file);
++	kiocb.ki_pos = *ppos;
++	ret = generic_write_checks_count(&kiocb, &len);
++	if (!ret && len) {
++		ret = file_remove_privs(file);
++		if (!ret) {
++			*ppos = kiocb.ki_pos;
++			if (file->f_op->recvfile)
++				ret = file->f_op->recvfile(file, sock, ppos, len,
++							   stats);
++			else
++				ret = generic_recvfile(file, sock, ppos, len,
++						       stats);
++			if (ret > 0)
++				fsnotify_modify(file);
++		}
++	}
++	kiocb.ki_pos = *ppos;
++	inode_unlock(inode);
++	file_end_write(file);
++
++	if (ret > 0) {
++		ssize_t sret = generic_write_sync(&kiocb, stats->written);
++
++		if (sret < 0)
++			ret = sret;
++	}
++	add_rchar(current, stats->received);
++	add_wchar(current, stats->written);
++	inc_syscr(current);
++	inc_syscw(current);
++	return ret;
++}
++
++/*
++ * recvfile(fd, sockfd, offset, count, stats): receive up to @count bytes
++ * from socket @sockfd and write them to regular file @fd at *@offset (or
++ * at the file position if @offset is NULL).  fnOS private, syscall 802.
++ */
++SYSCALL_DEFINE5(recvfile, int, fd, int, sockfd, loff_t __user *, offset,
++		size_t, count, struct recvfile_io_stats __user *, stats)
++{
++	struct recvfile_io_stats kstats = {};
++	struct socket *sock;
++	struct file *file;
++	struct fd f;
++	loff_t pos = 0;
++	ssize_t ret;
++	int err = 0;
++
++	if (!count)
++		return 0;
++
++	if (offset) {
++		f = fdget(fd);
++		if (fd_empty(f))
++			return -EBADF;
++		if (copy_from_user(&pos, offset, sizeof(loff_t))) {
++			ret = -EFAULT;
++			goto out_fdput;
++		}
++	} else {
++		f = fdget_pos(fd);
++		if (fd_empty(f))
++			return -EBADF;
++		pos = fd_file(f)->f_pos;
++	}
++	file = fd_file(f);
++
++	sock = sockfd_lookup(sockfd, &err);
++	if (!sock) {
++		ret = err;
++		goto out_fdput;
++	}
++	if (!sock->sk) {
++		ret = -EINVAL;
++		goto out_sockput;
++	}
++
++	ret = do_recvfile(file, sock, &pos, count, &kstats);
++
++	if (offset) {
++		if (copy_to_user(offset, &pos, sizeof(loff_t)))
++			ret = -EFAULT;
++	} else {
++		file->f_pos = pos;
++	}
++	if (stats && copy_to_user(stats, &kstats, sizeof(kstats)))
++		ret = -EFAULT;
++out_sockput:
++	sockfd_put(sock);
++out_fdput:
++	if (offset)
++		fdput(f);
++	else
++		fdput_pos(f);
++	return ret;
++}
++
+ SYSCALL_DEFINE4(sendfile64, int, out_fd, int, in_fd, loff_t __user *, offset, size_t, count)
+ {
+ 	loff_t pos;
+diff --git a/mm/filemap.c b/mm/filemap.c
+index ee6594e69..260b24571 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -48,6 +48,9 @@
+ #include <linux/rcupdate_wait.h>
+ #include <linux/sched/mm.h>
+ #include <linux/sysctl.h>
++#include <linux/net.h>
++#include <linux/bvec.h>
++#include <net/sock.h>
+ #include <asm/pgalloc.h>
+ #include <asm/tlbflush.h>
+ #include "internal.h"
+@@ -4335,6 +4338,168 @@ ssize_t generic_perform_write(struct kiocb *iocb, struct iov_iter *i)
+ }
+ EXPORT_SYMBOL(generic_perform_write);
+ 
++/*
++ * recvfile: receive data from a socket straight into the page cache of a
++ * regular file (the reverse of sendfile), used by Samba for SMB writes.
++ */
++#define RECVFILE_BATCH_BYTES	SZ_128K
++#define RECVFILE_BATCH_FOLIOS	32
++#define RECVFILE_RCVTIMEO	(64 * HZ)
++
++struct generic_recvfile_ctx {
++	struct folio *folio;
++	void *fsdata;
++	loff_t pos;
++	size_t len;
++};
++
++static ssize_t generic_recvfile_one_batch(struct kiocb *iocb,
++					  struct socket *sock, size_t len,
++					  struct recvfile_io_stats *stats)
++{
++	struct address_space *mapping = iocb->ki_filp->f_mapping;
++	const struct address_space_operations *a_ops = mapping->a_ops;
++	struct generic_recvfile_ctx ctx[RECVFILE_BATCH_FOLIOS] = {};
++	struct bio_vec bvec[RECVFILE_BATCH_FOLIOS] = {};
++	struct msghdr msg = {};
++	const bool writably_mapped = mapping_writably_mapped(mapping);
++	size_t chunk = mapping_max_folio_size(mapping);
++	size_t done = 0, written = 0, copied;
++	ssize_t received;
++	long rcvtimeo;
++	int nr = 0, i, status;
++	ssize_t ret = 0;
++
++	while (done < len && nr < RECVFILE_BATCH_FOLIOS) {
++		size_t offset = (iocb->ki_pos + done) & (chunk - 1);
++		size_t bytes = min(chunk - offset, len - done);
++		struct folio *folio = NULL;
++		void *fsdata = NULL;
++
++		if (fatal_signal_pending(current)) {
++			ret = -EINTR;
++			goto release;
++		}
++
++		ret = a_ops->write_begin(iocb, mapping, iocb->ki_pos + done,
++					 bytes, &folio, &fsdata);
++		if (ret < 0)
++			goto release;
++
++		offset = offset_in_folio(folio, iocb->ki_pos + done);
++		bytes = min(folio_size(folio) - offset, bytes);
++
++		ctx[nr].folio = folio;
++		ctx[nr].fsdata = fsdata;
++		ctx[nr].pos = iocb->ki_pos + done;
++		ctx[nr].len = bytes;
++		bvec_set_folio(&bvec[nr], folio, bytes, offset);
++		done += bytes;
++		nr++;
++	}
++
++	iov_iter_bvec(&msg.msg_iter, ITER_DEST, bvec, nr, done);
++	rcvtimeo = sock->sk->sk_rcvtimeo;
++	sock->sk->sk_rcvtimeo = RECVFILE_RCVTIMEO;
++	received = sock_recvmsg(sock, &msg, MSG_WAITALL);
++	sock->sk->sk_rcvtimeo = rcvtimeo;
++	if (received < 0) {
++		ret = received;
++		goto release;
++	}
++	stats->received += received;
++
++	for (i = 0; i < nr; i++) {
++		copied = min(ctx[i].len, (size_t)received);
++		if (writably_mapped)
++			flush_dcache_folio(ctx[i].folio);
++		status = a_ops->write_end(iocb, mapping, ctx[i].pos, ctx[i].len,
++					  copied, ctx[i].folio, ctx[i].fsdata);
++		if (status > 0)
++			written += status;
++		if (status < 0 || status != copied) {
++			if (status < 0)
++				ret = status;
++			/* release the folios that did not get any data */
++			for (i++; i < nr; i++) {
++				status = a_ops->write_end(iocb, mapping,
++						ctx[i].pos, ctx[i].len, 0,
++						ctx[i].folio, ctx[i].fsdata);
++				if (status < 0 && !ret)
++					ret = status;
++			}
++			break;
++		}
++		received -= copied;
++	}
++
++	stats->written += written;
++	iocb->ki_pos += written;
++	if (written) {
++		balance_dirty_pages_ratelimited(mapping);
++		return written;
++	}
++	return ret;
++
++release:
++	for (i = 0; i < nr; i++)
++		a_ops->write_end(iocb, mapping, ctx[i].pos, ctx[i].len, 0,
++				 ctx[i].folio, ctx[i].fsdata);
++	return ret;
++}
++
++/**
++ * generic_recvfile - receive data from a socket into a file
++ * @file:	file to write to
++ * @sock:	socket to read from
++ * @ppos:	file position, updated by the number of bytes written
++ * @count:	number of bytes to receive
++ * @stats:	optional, returns bytes received from the socket and written
++ *
++ * Caller holds the inode lock and has done the write checks.
++ */
++ssize_t generic_recvfile(struct file *file, struct socket *sock, loff_t *ppos,
++			 size_t count, struct recvfile_io_stats *stats)
++{
++	struct address_space *mapping = file->f_mapping;
++	struct recvfile_io_stats local_stats = {};
++	struct kiocb kiocb;
++	ssize_t ret;
++
++	if (!stats)
++		stats = &local_stats;
++	stats->received = 0;
++	stats->written = 0;
++
++	if (!mapping->a_ops->write_begin || !mapping->a_ops->write_end)
++		return -EOPNOTSUPP;
++
++	init_sync_kiocb(&kiocb, file);
++	kiocb.ki_pos = *ppos;
++
++	ret = file_update_time(file);
++	if (ret)
++		goto out;
++
++	do {
++		size_t chunk = min_t(size_t, count, RECVFILE_BATCH_BYTES);
++
++		ret = generic_recvfile_one_batch(&kiocb, sock, chunk, stats);
++		if (ret <= 0)
++			break;
++		count -= ret;
++		if (ret < chunk)
++			break;
++		cond_resched();
++	} while ((ssize_t)count > 0);
++
++	if (stats->written)
++		*ppos = kiocb.ki_pos;
++out:
++	return stats->written ? stats->written : ret;
++}
++EXPORT_SYMBOL(generic_recvfile);
++
+ /**
+  * __generic_file_write_iter - write data to a file
+  * @iocb:	IO state structure (file, offset, etc.)

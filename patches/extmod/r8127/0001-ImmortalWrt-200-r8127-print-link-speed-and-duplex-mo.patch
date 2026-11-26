@@ -1,0 +1,112 @@
+From 61c95b6d141c0bf630b92604324ad1fce6557ab9 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:21:35 +0000
+Subject: [PATCH 1/3] =?UTF-8?q?=E5=BA=94=E7=94=A8=20ImmortalWrt=20?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=81=20200-r8127-print-link-speed-and-duplex-mode?=
+ =?UTF-8?q?.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来源: immortalwrt/immortalwrt package/kernel/r8127/patches/200-r8127-print-link-speed-and-duplex-mode.patch
+(飞牛的 r8127.ko 带有该补丁的行为, 见笔记 step14-extmod-net.md)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/r8127.h   |  5 +++++
+ src/r8127_n.c | 50 +++++++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 52 insertions(+), 3 deletions(-)
+
+diff --git a/src/r8127.h b/src/r8127.h
+index f7a3848..3295fb5 100755
+--- a/src/r8127.h
++++ b/src/r8127.h
+@@ -1770,6 +1770,11 @@ enum RTL8127_register_content {
+         LinkStatus = 0x02,
+         FullDup = 0x01,
+ 
++#define RTL8127_FULL_DUPLEX_MASK (_10000bpsF | _5000bpsF | _2500bpsF | _1000bpsF | FullDup)
++#define RTL8127_SPEED_1000_MASK (_1000bpsF | _1000bpsL | _2500bpsL)
++#define RTL8127_SPEED_2500_MASK (_2500bpsF | _5000bpsL)
++#define RTL8127_SPEED_5000_MASK (_5000bpsF | _10000bpsL)
++
+         /* DBG_reg */
+         Fix_Nak_1 = (1 << 4),
+         Fix_Nak_2 = (1 << 3),
+diff --git a/src/r8127_n.c b/src/r8127_n.c
+index 86573b6..a15b8aa 100755
+--- a/src/r8127_n.c
++++ b/src/r8127_n.c
+@@ -39,6 +39,7 @@
+ #include <linux/module.h>
+ #include <linux/version.h>
+ #include <linux/pci.h>
++#include <linux/phy.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/delay.h>
+@@ -4734,6 +4735,42 @@ rtl8127_link_down_patch(struct net_device *dev)
+ #endif
+ }
+ 
++static unsigned int rtl8127_phy_duplex(u32 status)
++{
++        unsigned int duplex = DUPLEX_UNKNOWN;
++
++        if (status & LinkStatus) {
++                if (status & RTL8127_FULL_DUPLEX_MASK)
++                        duplex = DUPLEX_FULL;
++                else
++                        duplex = DUPLEX_HALF;
++        }
++
++        return duplex;
++}
++
++static int rtl8127_phy_speed(u32 status)
++{
++        int speed = SPEED_UNKNOWN;
++
++        if (status & LinkStatus) {
++                if (status & _10000bpsF)
++                        speed = SPEED_10000;
++                else if (status & RTL8127_SPEED_5000_MASK)
++                        speed = SPEED_5000;
++                else if (status & RTL8127_SPEED_2500_MASK)
++                        speed = SPEED_2500;
++                else if (status & RTL8127_SPEED_1000_MASK)
++                        speed = SPEED_1000;
++                else if (status & _100bps)
++                        speed = SPEED_100;
++                else if (status & _10bps)
++                        speed = SPEED_10;
++        }
++
++        return speed;
++}
++
+ static void
+ _rtl8127_check_link_status(struct net_device *dev, unsigned int link_state)
+ {
+@@ -4746,11 +4783,18 @@ _rtl8127_check_link_status(struct net_device *dev, unsigned int link_state)
+         if (link_state == R8127_LINK_STATE_ON) {
+                 rtl8127_link_on_patch(dev);
+ 
+-                if (netif_msg_ifup(tp))
+-                        printk(KERN_INFO PFX "%s: link up\n", dev->name);
++                if (netif_msg_ifup(tp)) {
++                        const u32 phy_status = RTL_R32(tp, PHYstatus);
++                        const unsigned int phy_duplex = rtl8127_phy_duplex(phy_status);
++                        const int phy_speed = rtl8127_phy_speed(phy_status);
++                        printk(KERN_INFO PFX "%s: Link is Up - %s/%s\n",
++                                dev->name,
++                                phy_speed_to_str(phy_speed),
++                                phy_duplex_to_str(phy_duplex));
++                }
+         } else {
+                 if (netif_msg_ifdown(tp))
+-                        printk(KERN_INFO PFX "%s: link down\n", dev->name);
++                        printk(KERN_INFO PFX "%s: Link is Down\n", dev->name);
+ 
+                 rtl8127_link_down_patch(dev);
+         }

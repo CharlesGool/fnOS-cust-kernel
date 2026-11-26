@@ -1,0 +1,264 @@
+From 81432c173463b62effd662a4d7e04ea6c509d5ab Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:42:09 +0700
+Subject: [PATCH 061/110] =?UTF-8?q?md/raid5:=20stripe=5Frequest=5Fctx=20?=
+ =?UTF-8?q?=E6=94=B9=E7=94=A8=20mempool=20=E5=88=86=E9=85=8D,=20sectors=5F?=
+ =?UTF-8?q?to=5Fdo=20=E5=8F=98=E6=9F=94=E6=80=A7=E6=95=B0=E7=BB=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+移植上游两个补丁(Yu Kuai, fnnas), 原样打上:
+  9340a95d489a md/raid5: use mempool to allocate stripe_request_ctx
+  4ffe28ed0d7c md/raid5: make sure max_sectors is not less than io_opt
+飞牛 raid456 BTF: r5conf 末尾有 ctx_pool/ctx_size, stripe_request_ctx 的
+do_flush 在前、sectors_to_do[] 为柔性数组, 与这两个补丁一致。
+NR_RAID_BIOS 随 029 移到 md.h。函数级是否与飞牛一致留给 raid5 子任务比对
+(pmark 显示 raid5_create_ctx_pool 名字在飞牛里不存在, 可能被内联)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.h       |  4 ++
+ drivers/md/raid1-10.c |  5 ---
+ drivers/md/raid5.c    | 86 ++++++++++++++++++++++++++++++-------------
+ drivers/md/raid5.h    |  3 ++
+ 4 files changed, 67 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index cab3d7360..09ed3290d 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -22,6 +22,10 @@
+ #include <trace/events/block.h>
+ 
+ #define MaxSector (~(sector_t)0)
++/*
++ * Number of guaranteed raid bios in case of extreme VM load:
++ */
++#define	NR_RAID_BIOS 256
+ 
+ enum md_submodule_type {
+ 	MD_PERSONALITY = 0,
+diff --git a/drivers/md/raid1-10.c b/drivers/md/raid1-10.c
+index df47bce81..3b0e23069 100644
+--- a/drivers/md/raid1-10.c
++++ b/drivers/md/raid1-10.c
+@@ -3,11 +3,6 @@
+ #define RESYNC_BLOCK_SIZE (64*1024)
+ #define RESYNC_PAGES ((RESYNC_BLOCK_SIZE + PAGE_SIZE-1) / PAGE_SIZE)
+ 
+-/*
+- * Number of guaranteed raid bios in case of extreme VM load:
+- */
+-#define	NR_RAID_BIOS 256
+-
+ /* when we get a read error on a read-only array, we redirect to another
+  * device without failing the first device, or trying to over-write to
+  * correct the read error.  To keep track of bad blocks on a per-bio
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 06ae7a3ec..dc3fea0f5 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -777,14 +777,14 @@ struct stripe_request_ctx {
+ 	/* last sector in the request */
+ 	sector_t last_sector;
+ 
++	/* the request had REQ_PREFLUSH, cleared after the first stripe_head */
++	bool do_flush;
++
+ 	/*
+ 	 * bitmap to track stripe sectors that have been added to stripes
+ 	 * add one to account for unaligned requests
+ 	 */
+-	DECLARE_BITMAP(sectors_to_do, RAID5_MAX_REQ_STRIPES + 1);
+-
+-	/* the request had REQ_PREFLUSH, cleared after the first stripe_head */
+-	bool do_flush;
++	unsigned long sectors_to_do[];
+ };
+ 
+ /*
+@@ -6147,13 +6147,13 @@ static sector_t raid5_bio_lowest_chunk_sector(struct r5conf *conf,
+ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ {
+ 	DEFINE_WAIT_FUNC(wait, woken_wake_function);
+-	bool on_wq;
+ 	struct r5conf *conf = mddev->private;
+-	sector_t logical_sector;
+-	struct stripe_request_ctx ctx = {};
+ 	const int rw = bio_data_dir(bi);
++	struct stripe_request_ctx *ctx;
++	sector_t logical_sector;
+ 	enum stripe_result res;
+ 	int s, stripe_cnt;
++	bool on_wq;
+ 
+ 	if (unlikely(bi->bi_opf & REQ_PREFLUSH)) {
+ 		int ret = log_handle_flush_request(conf, bi);
+@@ -6165,11 +6165,6 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 				return true;
+ 		}
+ 		/* ret == -EAGAIN, fallback */
+-		/*
+-		 * if r5l_handle_flush_request() didn't clear REQ_PREFLUSH,
+-		 * we need to flush journal device
+-		 */
+-		ctx.do_flush = bi->bi_opf & REQ_PREFLUSH;
+ 	}
+ 
+ 	md_write_start(mddev, bi);
+@@ -6192,16 +6187,25 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 	}
+ 
+ 	logical_sector = bi->bi_iter.bi_sector & ~((sector_t)RAID5_STRIPE_SECTORS(conf)-1);
+-	ctx.first_sector = logical_sector;
+-	ctx.last_sector = bio_end_sector(bi);
+ 	bi->bi_next = NULL;
+ 
+-	stripe_cnt = DIV_ROUND_UP_SECTOR_T(ctx.last_sector - logical_sector,
++	ctx = mempool_alloc(conf->ctx_pool, GFP_NOIO);
++	memset(ctx, 0, conf->ctx_size);
++	ctx->first_sector = logical_sector;
++	ctx->last_sector = bio_end_sector(bi);
++	/*
++	 * if r5l_handle_flush_request() didn't clear REQ_PREFLUSH,
++	 * we need to flush journal device
++	 */
++	if (unlikely(bi->bi_opf & REQ_PREFLUSH))
++		ctx->do_flush = true;
++
++	stripe_cnt = DIV_ROUND_UP_SECTOR_T(ctx->last_sector - logical_sector,
+ 					   RAID5_STRIPE_SECTORS(conf));
+-	bitmap_set(ctx.sectors_to_do, 0, stripe_cnt);
++	bitmap_set(ctx->sectors_to_do, 0, stripe_cnt);
+ 
+ 	pr_debug("raid456: %s, logical %llu to %llu\n", __func__,
+-		 bi->bi_iter.bi_sector, ctx.last_sector);
++		 bi->bi_iter.bi_sector, ctx->last_sector);
+ 
+ 	md_account_bio(mddev, &bi);
+ 
+@@ -6219,10 +6223,10 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 		add_wait_queue(&conf->wait_for_reshape, &wait);
+ 		on_wq = true;
+ 	}
+-	s = (logical_sector - ctx.first_sector) >> RAID5_STRIPE_SHIFT(conf);
++	s = (logical_sector - ctx->first_sector) >> RAID5_STRIPE_SHIFT(conf);
+ 
+ 	while (1) {
+-		res = make_stripe_request(mddev, conf, &ctx, logical_sector,
++		res = make_stripe_request(mddev, conf, ctx, logical_sector,
+ 					  bi);
+ 		if (res == STRIPE_FAIL || res == STRIPE_WAIT_RESHAPE)
+ 			break;
+@@ -6239,9 +6243,9 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 			 * raid5_activate_delayed() from making progress
+ 			 * and thus deadlocking.
+ 			 */
+-			if (ctx.batch_last) {
+-				raid5_release_stripe(ctx.batch_last);
+-				ctx.batch_last = NULL;
++			if (ctx->batch_last) {
++				raid5_release_stripe(ctx->batch_last);
++				ctx->batch_last = NULL;
+ 			}
+ 
+ 			wait_woken(&wait, TASK_UNINTERRUPTIBLE,
+@@ -6249,21 +6253,23 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 			continue;
+ 		}
+ 
+-		s = find_next_bit_wrap(ctx.sectors_to_do, stripe_cnt, s);
++		s = find_next_bit_wrap(ctx->sectors_to_do, stripe_cnt, s);
+ 		if (s == stripe_cnt)
+ 			break;
+ 
+-		logical_sector = ctx.first_sector +
++		logical_sector = ctx->first_sector +
+ 			(s << RAID5_STRIPE_SHIFT(conf));
+ 	}
+ 	if (unlikely(on_wq))
+ 		remove_wait_queue(&conf->wait_for_reshape, &wait);
+ 
+-	if (ctx.batch_last)
+-		raid5_release_stripe(ctx.batch_last);
++	if (ctx->batch_last)
++		raid5_release_stripe(ctx->batch_last);
+ 
+ 	if (rw == WRITE)
+ 		md_write_end(mddev);
++
++	mempool_free(ctx, conf->ctx_pool);
+ 	if (res == STRIPE_WAIT_RESHAPE) {
+ 		md_free_cloned_bio(bi);
+ 		return false;
+@@ -7445,6 +7451,9 @@ static void free_conf(struct r5conf *conf)
+ 	bioset_exit(&conf->bio_split);
+ 	kfree(conf->stripe_hashtbl);
+ 	kfree(conf->pending_data);
++
++	mempool_destroy(conf->ctx_pool);
++
+ 	kfree(conf);
+ }
+ 
+@@ -7802,6 +7811,25 @@ static int only_parity(int raid_disk, int algo, int raid_disks, int max_degraded
+ 	return 0;
+ }
+ 
++static int raid5_create_ctx_pool(struct r5conf *conf)
++{
++	struct stripe_request_ctx *ctx;
++	int size;
++
++	if (mddev_is_dm(conf->mddev))
++		size = BITS_TO_LONGS(RAID5_MAX_REQ_STRIPES);
++	else
++		size = BITS_TO_LONGS(
++			queue_max_hw_sectors(conf->mddev->gendisk->queue) >>
++			RAID5_STRIPE_SHIFT(conf));
++
++	conf->ctx_size = struct_size(ctx, sectors_to_do, size);
++	conf->ctx_pool = mempool_create_kmalloc_pool(NR_RAID_BIOS,
++						     conf->ctx_size);
++
++	return conf->ctx_pool ? 0 : -ENOMEM;
++}
++
+ static int raid5_set_limits(struct mddev *mddev)
+ {
+ 	struct r5conf *conf = mddev->private;
+@@ -7857,6 +7885,8 @@ static int raid5_set_limits(struct mddev *mddev)
+ 	 * Limit the max sectors based on this.
+ 	 */
+ 	lim.max_hw_sectors = RAID5_MAX_REQ_STRIPES << RAID5_STRIPE_SHIFT(conf);
++	if ((lim.max_hw_sectors << 9) < lim.io_opt)
++		lim.max_hw_sectors = lim.io_opt >> 9;
+ 
+ 	/* No restrictions on the number of segments in the request */
+ 	lim.max_segments = USHRT_MAX;
+@@ -8141,6 +8171,10 @@ static int raid5_run(struct mddev *mddev)
+ 			goto abort;
+ 	}
+ 
++	ret = raid5_create_ctx_pool(conf);
++	if (ret)
++		goto abort;
++
+ 	ret = log_init(conf, journal_dev, raid5_has_ppl(conf));
+ 	if (ret)
+ 		goto abort;
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index fa9647a86..fc158bd9c 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -691,6 +691,9 @@ struct r5conf {
+ 	struct list_head	pending_list;
+ 	int			pending_data_cnt;
+ 	struct r5pending_data	*next_pending_data;
++
++	mempool_t		*ctx_pool;
++	int			ctx_size;
+ };
+ 
+ #if PAGE_SIZE == DEFAULT_STRIPE_SIZE

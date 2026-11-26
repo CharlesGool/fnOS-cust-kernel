@@ -1,0 +1,31 @@
+From 678e422e4542022aeef4fa0a93d6a36a8fc41c55 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 00:59:19 +0000
+Subject: [PATCH] =?UTF-8?q?=E9=80=82=E9=85=8D=206.18.65:=20drm=5Ffb=5Fhelp?=
+ =?UTF-8?q?er=5Flastclose=20=E5=B7=B2=E7=A7=BB=E9=99=A4,=20lastclose=20?=
+ =?UTF-8?q?=E5=9B=9E=E8=B0=83=E7=95=99=E7=A9=BA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+6.18.65 的 drm_file.c 在 lastclose 时自己调 drm_client_dev_restore, 驱动不用再调
+drm_fb_helper_lastclose(该符号在新内核里没有导出, modpost 报未定义)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ linux/zx_pcie.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/linux/zx_pcie.c b/linux/zx_pcie.c
+index 2735989..e2c59fe 100644
+--- a/linux/zx_pcie.c
++++ b/linux/zx_pcie.c
+@@ -517,6 +517,8 @@ void  zx_drm_last_close(struct drm_device* dev)
+ #if DRM_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
+     zx_card_t *zx = dev->dev_private;
+     zx_fbdev_restore_mode(zx);
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 65)
++    /* 6.18.65 起 drm_fb_helper_lastclose 已移除, DRM 核心 (drm_file.c) 自己调用 drm_client_dev_restore */
+ #else
+     drm_fb_helper_lastclose(dev);
+ #endif

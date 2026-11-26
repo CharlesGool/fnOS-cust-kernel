@@ -1,0 +1,35 @@
+From 4960197715849da4a746ef6d11a24faa9065c69a Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:53:04 +0000
+Subject: [PATCH] =?UTF-8?q?=E9=80=82=E9=85=8D=206.18:=20nft=5Fexpr=5Fops::?=
+ =?UTF-8?q?validate=20=E5=8E=BB=E6=8E=89=E7=AC=AC=E4=B8=89=E4=B8=AA?=
+ =?UTF-8?q?=E5=8F=82=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 nft-fullcone 07d93b6(2023)按旧签名写, 6.18.18 内核编译报 incompatible-pointer-types。
+只在 6.18.18 及以上用两参数版本。
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/nft_ext_fullcone.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/nft_ext_fullcone.c b/src/nft_ext_fullcone.c
+index 96d1feb..de352bb 100644
+--- a/src/nft_ext_fullcone.c
++++ b/src/nft_ext_fullcone.c
+@@ -121,7 +121,12 @@ static int exp_event_cb(unsigned int events, const struct nf_exp_event *item)
+ }
+ #endif
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 18)
++/* 6.18 稳定版(含 6.18.18/6.18.65)的 nft_expr_ops::validate 已去掉第三个参数 */
++static int nft_fullcone_validate(const struct nft_ctx *ctx, const struct nft_expr *expr)
++#else
+ static int nft_fullcone_validate(const struct nft_ctx *ctx, const struct nft_expr *expr, const struct nft_data **data)
++#endif
+ {
+ 	int err;
+ 

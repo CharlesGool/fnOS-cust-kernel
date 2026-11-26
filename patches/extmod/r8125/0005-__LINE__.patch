@@ -1,0 +1,74 @@
+From 4c7bac4b81f412cc2dc12b97b6403605b3b9c6be Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:49:08 +0000
+Subject: [PATCH 5/5] =?UTF-8?q?=E8=A1=8C=E5=8F=B7=E5=AF=B9=E9=BD=90?=
+ =?UTF-8?q?=E5=8D=A0=E4=BD=8D:=20=E8=A1=A5=E8=B6=B3=E9=A3=9E=E7=89=9B?=
+ =?UTF-8?q?=E7=89=88=E5=A4=9A=E5=87=BA=E7=9A=84=E8=A1=8C=E6=95=B0,=20?=
+ =?UTF-8?q?=E4=BD=BF=20=5F=5FLINE=5F=5F=20=E4=B8=80=E8=87=B4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 r8125.ko 的 __bug_table 行号比官方(含 ImmortalWrt 补丁)多出若干行, 这些多出的行
+不产生任何代码(.text 字节对比一致), 原文无法从二进制还原, 只补注释占位,
+让 WARN_ON/ASSERT_RTNL 里的行号常量与飞牛一致。
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/r8125_n.c | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/src/r8125_n.c b/src/r8125_n.c
+index 9779254..dff3dcb 100644
+--- a/src/r8125_n.c
++++ b/src/r8125_n.c
+@@ -45,6 +45,7 @@
+ #include <linux/delay.h>
+ #include <linux/mii.h>
+ #include <linux/of.h>
++/* 行号对齐占位 */
+ #include <linux/if_vlan.h>
+ #include <linux/crc32.h>
+ #include <linux/interrupt.h>
+@@ -17730,6 +17731,41 @@ rtl8125_get_dash_message_id(struct rtl8125_private *tp)
+ }
+ #endif /* ENABLE_DASH_SUPPORT */
+ 
++/*
++ * 行号对齐占位: 飞牛版此处之前比官方多出若干行(不产生代码, 内容无法从 .ko 还原),
++ * 为了让 WARN_ON/ASSERT_RTNL 的 __LINE__ 与飞牛一致, 补足空行数。
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ *
++ */
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,11,0)
+ static void
+ rtl8125_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)

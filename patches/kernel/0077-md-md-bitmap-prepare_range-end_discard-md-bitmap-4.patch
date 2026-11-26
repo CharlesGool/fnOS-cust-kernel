@@ -1,0 +1,161 @@
+From 07988243ead88d1800ecd891795d41025556b4ae Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:46:10 +0000
+Subject: [PATCH 077/110] =?UTF-8?q?md/md-bitmap:=20prepare=5Frange?=
+ =?UTF-8?q?=E3=80=81end=5Fdiscard=20=E5=AE=9E=E7=8E=B0,=20md/bitmap/=20?=
+ =?UTF-8?q?=E6=96=B0=E5=A2=9E=204=20=E4=B8=AA=E5=8F=AA=E8=AF=BB=E5=B1=9E?=
+ =?UTF-8?q?=E6=80=A7?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- bitmap_prepare_range(): 上游 142 1ee6fef6e0db "md: add exact bitmap mapping and
+  reshape hooks" 的 md-bitmap 部分(调用 pers->bitmap_sector), 挂到 bitmap_ops.prepare_range。
+- bitmap_end_discard(): 旧 bitmap 不关心 discard 结果, 直接 bitmap_end_write()
+  (替换 hdr 子任务留下的前向声明写法, 行为相同)。
+- 飞牛私有 sysfs(md/bitmap/ 下, 模式 0644 但只有 show):
+  events_cleared(%llu)、chunks(counts.chunks, %lu)、bytes(storage.bytes, %lu)、
+  use_bitmap(有 bitmap 为 1 否则 0); 无 bitmap 时都输出 "0"。
+  都在 mddev->lock 下读, 追加在 md_bitmap_attrs 末尾(顺序与飞牛一致)。
+
+backlog_store 的差异是 stable 修复 126 2911cd0a0f43(6.18.65 已有), 按规则不还原。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md-bitmap.c | 94 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 87 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/md/md-bitmap.c b/drivers/md/md-bitmap.c
+index ba6036162..70790b203 100644
+--- a/drivers/md/md-bitmap.c
++++ b/drivers/md/md-bitmap.c
+@@ -1730,14 +1730,11 @@ static void bitmap_start_write(struct mddev *mddev, sector_t offset,
+ 	}
+ }
+ 
+-static void bitmap_end_write(struct mddev *mddev, sector_t offset,
+-			     unsigned long sectors);
+-
+-static void bitmap_end_discard(struct mddev *mddev, sector_t offset,
+-			       unsigned long sectors,
+-			       enum md_bitmap_discard_result result)
++static void bitmap_prepare_range(struct mddev *mddev, sector_t *offset,
++				 unsigned long *sectors, bool discard)
+ {
+-	bitmap_end_write(mddev, offset, sectors);
++	if (mddev->pers->bitmap_sector)
++		mddev->pers->bitmap_sector(mddev, offset, sectors);
+ }
+ 
+ static void bitmap_end_write(struct mddev *mddev, sector_t offset,
+@@ -1788,6 +1785,14 @@ static void bitmap_end_write(struct mddev *mddev, sector_t offset,
+ 	}
+ }
+ 
++/* the old bitmap doesn't care about the result of discard */
++static void bitmap_end_discard(struct mddev *mddev, sector_t offset,
++			       unsigned long sectors,
++			       enum md_bitmap_discard_result result)
++{
++	bitmap_end_write(mddev, offset, sectors);
++}
++
+ static bool __bitmap_start_sync(struct bitmap *bitmap, sector_t offset,
+ 				sector_t *blocks, bool degraded)
+ {
+@@ -3023,6 +3028,76 @@ static struct md_sysfs_entry max_backlog_used =
+ __ATTR(max_backlog_used, S_IRUGO | S_IWUSR,
+        behind_writes_used_show, behind_writes_used_reset);
+ 
++static ssize_t bitmap_events_cleared_show(struct mddev *mddev, char *page)
++{
++	struct bitmap *bitmap;
++	ssize_t ret;
++
++	spin_lock(&mddev->lock);
++	bitmap = mddev->bitmap;
++	if (bitmap)
++		ret = sprintf(page, "%llu\n", bitmap->events_cleared);
++	else
++		ret = sprintf(page, "0\n");
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static struct md_sysfs_entry bitmap_events_cleared =
++__ATTR(events_cleared, S_IRUGO | S_IWUSR, bitmap_events_cleared_show, NULL);
++
++static ssize_t bitmap_chunks_show(struct mddev *mddev, char *page)
++{
++	struct bitmap *bitmap;
++	ssize_t ret;
++
++	spin_lock(&mddev->lock);
++	bitmap = mddev->bitmap;
++	if (bitmap)
++		ret = sprintf(page, "%lu\n", bitmap->counts.chunks);
++	else
++		ret = sprintf(page, "0\n");
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static struct md_sysfs_entry bitmap_chunks =
++__ATTR(chunks, S_IRUGO | S_IWUSR, bitmap_chunks_show, NULL);
++
++static ssize_t bitmap_bytes_show(struct mddev *mddev, char *page)
++{
++	struct bitmap *bitmap;
++	ssize_t ret;
++
++	spin_lock(&mddev->lock);
++	bitmap = mddev->bitmap;
++	if (bitmap)
++		ret = sprintf(page, "%lu\n", bitmap->storage.bytes);
++	else
++		ret = sprintf(page, "0\n");
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static struct md_sysfs_entry bitmap_bytes =
++__ATTR(bytes, S_IRUGO | S_IWUSR, bitmap_bytes_show, NULL);
++
++static ssize_t bitmap_use_bitmap_show(struct mddev *mddev, char *page)
++{
++	ssize_t ret;
++
++	spin_lock(&mddev->lock);
++	if (mddev->bitmap)
++		ret = sprintf(page, "1\n");
++	else
++		ret = sprintf(page, "0\n");
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static struct md_sysfs_entry bitmap_use_bitmap =
++__ATTR(use_bitmap, S_IRUGO | S_IWUSR, bitmap_use_bitmap_show, NULL);
++
+ static struct attribute *md_bitmap_common_attrs[] = {
+ 	&bitmap_location.attr,
+ 	NULL
+@@ -3036,6 +3111,10 @@ static struct attribute *md_bitmap_internal_attrs[] = {
+ 	&bitmap_metadata.attr,
+ 	&bitmap_can_clear.attr,
+ 	&max_backlog_used.attr,
++	&bitmap_events_cleared.attr,
++	&bitmap_chunks.attr,
++	&bitmap_bytes.attr,
++	&bitmap_use_bitmap.attr,
+ 	NULL
+ };
+ 
+@@ -3091,6 +3170,7 @@ static struct bitmap_operations bitmap_ops = {
+ 	.flush			= bitmap_flush,
+ 	.write_all		= bitmap_write_all,
+ 	.dirty_bits		= bitmap_dirty_bits,
++	.prepare_range		= bitmap_prepare_range,
+ 	.unplug			= bitmap_unplug,
+ 	.daemon_work		= bitmap_daemon_work,
+ 

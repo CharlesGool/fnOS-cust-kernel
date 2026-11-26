@@ -1,0 +1,68 @@
+From 87d11f9550463fd837f26b2fdf91b6cb7f82b394 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:25:05 +0000
+Subject: [PATCH 084/110] =?UTF-8?q?md/raid0,linear:=20=E8=AE=B0=E5=BD=95?=
+ =?UTF-8?q?=E6=88=90=E5=91=98=E7=9B=98=E5=88=B0=20md=5Fio=5Fclone,=20?=
+ =?UTF-8?q?=E5=8E=BB=E6=8E=89=20is=5Frdev=5Fbroken=20=E6=A3=80=E6=9F=A5(?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按反汇编还原:
+- raid0_map_submit_bio / linear_make_request 不再调用 is_rdev_broken()(disk_live) 并
+  md_error + bio_io_error; 改为 md_account_bio 之后 md_clone_set_rdev(bio, rdev),
+  由 md.c 的 md_end_clone_io 根据记录的成员盘处理错误(DFR)。
+比对: raid0.ko 15/15、linear.ko 12/12 函数与飞牛一致(komp)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md-linear.c | 8 ++------
+ drivers/md/raid0.c     | 8 ++------
+ 2 files changed, 4 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/md/md-linear.c b/drivers/md/md-linear.c
+index 9cb1d7e85..8a9448787 100644
+--- a/drivers/md/md-linear.c
++++ b/drivers/md/md-linear.c
+@@ -251,12 +251,6 @@ static bool linear_make_request(struct mddev *mddev, struct bio *bio)
+ 		     bio_sector < start_sector))
+ 		goto out_of_bounds;
+ 
+-	if (unlikely(is_rdev_broken(tmp_dev->rdev))) {
+-		md_error(mddev, tmp_dev->rdev);
+-		bio_io_error(bio);
+-		return true;
+-	}
+-
+ 	if (unlikely(bio_end_sector(bio) > end_sector)) {
+ 		/* This bio crosses a device boundary, so we have to split it */
+ 		bio = bio_submit_split_bioset(bio, end_sector - bio_sector,
+@@ -266,6 +260,8 @@ static bool linear_make_request(struct mddev *mddev, struct bio *bio)
+ 	}
+ 
+ 	md_account_bio(mddev, &bio);
++	/* fnnas: record the member disk so the clone end_io can see it */
++	md_clone_set_rdev(bio, tmp_dev->rdev);
+ 	bio_set_dev(bio, tmp_dev->rdev->bdev);
+ 	bio->bi_iter.bi_sector = bio->bi_iter.bi_sector -
+ 		start_sector + data_offset;
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index 981313ef6..4651fec3d 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -572,12 +572,8 @@ static void raid0_map_submit_bio(struct mddev *mddev, struct bio *bio)
+ 		return;
+ 	}
+ 
+-	if (unlikely(is_rdev_broken(tmp_dev))) {
+-		bio_io_error(bio);
+-		md_error(mddev, tmp_dev);
+-		return;
+-	}
+-
++	/* fnnas: no is_rdev_broken() check, md_end_clone_io handles the error */
++	md_clone_set_rdev(bio, tmp_dev);
+ 	bio_set_dev(bio, tmp_dev->bdev);
+ 	bio->bi_iter.bi_sector = sector + zone->dev_start +
+ 		tmp_dev->data_offset;

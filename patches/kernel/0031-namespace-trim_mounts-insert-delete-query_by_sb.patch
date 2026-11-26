@@ -1,0 +1,180 @@
+From 41fc95c80da0eeadf800a034dd69b4f5d2cc229a Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:56:47 +0700
+Subject: [PATCH 031/110] =?UTF-8?q?namespace:=20=E5=8D=B7=E6=8C=82?=
+ =?UTF-8?q?=E8=BD=BD=E8=AE=B0=E5=BD=95=20trim=5Fmounts=20(insert/delete/qu?=
+ =?UTF-8?q?ery=5Fby=5Fsb)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 新增 trim_mounts_rwlock 和 trim_mounts_query_by_sb() (覆盖 trim_stub 弱定义)
+- do_new_mount 成功后 (overlay 除外) 找顶层挂载点, is_mount_on_vol_d 判断是否
+  在卷上, 把卷类型/卷 ID/挂载点记进 super_block; 嵌套在卷里的挂载类型 1 记成 0xffff
+- path_umount 成功后, 挂载点相同则清掉记录
+
+vmlinux fcmp:
+- trim_mounts_query_by_sb 一致
+- path_umount ≈ (清记录时飞牛复用比较用的 sb 寄存器, 我们从栈上重读)
+- path_mount 822/827: 飞牛把 nested 标志的两条路径尾部整体复制了一份,
+  我们的 gcc 部分复制; 另外飞牛 printk 的 sb 参数是重读 fc->root->d_sb。
+  试过把 fc 传进 helper 让 printk 也重读, 反而丢了尾部复制 (803 条), 留现版本, 语义等价
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/namespace.c | 98 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 98 insertions(+)
+
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 34e0d14c4..8e8deecb6 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -34,6 +34,7 @@
+ #include <linux/mnt_idmapping.h>
+ #include <linux/pidfs.h>
+ #include <linux/nstree.h>
++#include <linux/trimvfs.h>
+ 
+ #include "pnode.h"
+ #include "internal.h"
+@@ -90,6 +91,8 @@ static DECLARE_RWSEM(namespace_sem);
+ static HLIST_HEAD(unmounted);	/* protected by namespace_sem */
+ static LIST_HEAD(ex_mountpoints); /* protected by namespace_sem */
+ static struct mnt_namespace *emptied_ns; /* protected by namespace_sem */
++/* 保护 super_block 的 vol_type/vol_path/vol_mountpoint (fnOS 卷挂载记录) */
++static DEFINE_RWLOCK(trim_mounts_rwlock);
+ 
+ static inline void namespace_lock(void);
+ static void namespace_unlock(void);
+@@ -2062,15 +2065,34 @@ static int can_umount(const struct path *path, int flags)
+ 	return 0;
+ }
+ 
++/* fnOS: 卸载成功后清掉 sb 上的卷挂载记录(只清挂在这个挂载点上的那份) */
++static void trim_mounts_delete(struct super_block *sb, struct dentry *mountpoint)
++{
++	write_lock(&trim_mounts_rwlock);
++	if (sb->vol_mountpoint != mountpoint) {
++		write_unlock(&trim_mounts_rwlock);
++	} else {
++		sb->vol_type = 0;
++		sb->vol_path[0] = '\0';
++		sb->vol_mountpoint = NULL;
++		write_unlock(&trim_mounts_rwlock);
++		printk(KERN_INFO "[trim-mounts-hash]trim_mounts_delete: %p\n", sb);
++	}
++}
++
+ // caller is responsible for flags being sane
+ int path_umount(const struct path *path, int flags)
+ {
+ 	struct mount *mnt = real_mount(path->mnt);
++	struct dentry *mountpoint = mnt->mnt_mountpoint;
++	struct super_block *sb = mnt->mnt.mnt_sb;
+ 	int ret;
+ 
+ 	ret = can_umount(path, flags);
+ 	if (!ret)
+ 		ret = do_umount(mnt, flags);
++	if (!ret)
++		trim_mounts_delete(sb, mountpoint);
+ 
+ 	/* we mustn't call path_put() as that would clear mnt_expiry_mark */
+ 	dput(path->dentry);
+@@ -2440,6 +2462,26 @@ struct vfsmount *clone_private_mount(const struct path *path)
+ }
+ EXPORT_SYMBOL_GPL(clone_private_mount);
+ 
++/*
++ * 查 sb 挂载时记下的卷类型; 是卷本身(类型 1)时把卷 ID 拷进 vol_id,
++ * 否则 vol_id 置空串。vol_id 可以为 NULL。
++ */
++unsigned int trim_mounts_query_by_sb(struct super_block *sb, char *vol_id)
++{
++	unsigned int vol_type;
++
++	read_lock(&trim_mounts_rwlock);
++	vol_type = sb->vol_type;
++	if (vol_id) {
++		if (vol_type == 1)
++			strscpy(vol_id, sb->vol_path, sizeof(sb->vol_path));
++		else
++			vol_id[0] = '\0';
++	}
++	read_unlock(&trim_mounts_rwlock);
++	return vol_type;
++}
++
+ static void lock_mnt_tree(struct mount *mnt)
+ {
+ 	struct mount *p;
+@@ -3741,6 +3783,60 @@ static int do_new_mount_fc(struct fs_context *fc, const struct path *mountpoint,
+ 	return error;
+ }
+ 
++/*
++ * fnOS: 新挂载的文件系统如果挂在卷(/volN)上, 在它的 super_block 里记下
++ * 卷类型、卷 ID 和挂载点。先找"顶层挂载点": 挂载点所在的挂载本身就挂在
++ * 根上时就是挂载点本身, 否则沿 mnt_parent 往上找到挂在根上的那一层的
++ * 挂载点。这种嵌套在卷里的挂载, 卷本身(类型 1)记成 0xffff。
++ */
++static void trim_mounts_insert(struct super_block *sb, const struct path *path,
++			       const char *fstype)
++{
++	struct mount *m = real_mount(path->mnt);
++	struct dentry *top;
++	bool nested = false;
++
++	read_seqlock_excl(&mount_lock);
++	if (!strcmp(m->mnt_mountpoint->d_name.name, "/")) {
++		top = dget(path->dentry);
++	} else {
++		while (strcmp(m->mnt_parent->mnt_mountpoint->d_name.name, "/"))
++			m = m->mnt_parent;
++		top = dget(m->mnt_mountpoint);
++		nested = true;
++	}
++	read_sequnlock_excl(&mount_lock);
++
++	printk(KERN_INFO "[trim-mounts-hash]'%s'[%p]'s top mountpoint dentry: %s, fstype: %s\n",
++	       path->dentry->d_name.name, path->dentry, top->d_name.name, fstype);
++
++	write_lock(&trim_mounts_rwlock);
++	if (sb->vol_type) {
++		printk(KERN_ERR "[trim-mounts-hash]trim_mounts_insert error: %p - %s, already exists.\n",
++		       sb, top->d_name.name);
++	} else {
++		char vol_id[32] = {};
++		unsigned int type = is_mount_on_vol_d(top, vol_id);
++
++		if (nested && type == 1)
++			type = 0xffff;
++		printk(KERN_INFO "[trim-mounts-hash]dentry '%s' type: %x\n",
++		       top->d_name.name, type);
++		if (type) {
++			if (type == 1)
++				strscpy(sb->vol_path, vol_id);
++			else
++				sb->vol_path[0] = '\0';
++			sb->vol_type = type;
++			sb->vol_mountpoint = path->dentry;
++			printk(KERN_INFO "[trim-mounts-hash]trim_mounts_insert: %p - %s, type=%x\n",
++			       sb, path->dentry->d_name.name, type);
++		}
++	}
++	write_unlock(&trim_mounts_rwlock);
++	dput(top);
++}
++
+ /*
+  * create a new mount for userspace and request it to be added into the
+  * namespace's tree
+@@ -3793,6 +3889,8 @@ static int do_new_mount(const struct path *path, const char *fstype,
+ 		err = -EPERM;
+ 	if (!err)
+ 		err = do_new_mount_fc(fc, path, mnt_flags);
++	if (!err && strcmp(fstype, "overlay"))
++		trim_mounts_insert(fc->root->d_sb, path, fstype);
+ 
+ 	put_fs_context(fc);
+ 	return err;

@@ -1,0 +1,1482 @@
+From 700408ecc4df9671d0abc28e9eef0ed889f54937 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:47:23 +0700
+Subject: [PATCH 017/110] =?UTF-8?q?trimvfs:=20=E8=BF=98=E5=8E=9F=20fs/trim?=
+ =?UTF-8?q?vfs.c=20(=E5=8D=B7=E5=88=A4=E6=96=AD=E3=80=81=E5=8D=B7=E4=B8=8A?=
+ =?UTF-8?q?=20POSIX=20ACL=20=E6=9D=83=E9=99=90=E3=80=81=E5=9B=9E=E6=94=B6?=
+ =?UTF-8?q?=E7=AB=99=E5=85=A5=E5=8F=A3=E3=80=8111=20=E4=B8=AA=20trim=20sys?=
+ =?UTF-8?q?call)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+还原 __ia32_sys_file_setattr 之后的全部飞牛 trimvfs 函数和 bss 变量
+g_external_disk_access、trim_system_root_*。trim_trashbin() 属于
+trim_trashbin.c (另一组还原中), 先放 __weak 桩 fs/trimvfs_stub.c,
+那边落地后删掉桩和 Makefile 里的 trimvfs_stub.o。
+
+fcmp (vmlinux, 40 项): 一致 21, 近似 6, 不一致 13 (含缺 .part.0 1 项)
+一致: trim_is_on_trashbin_whitelist is_in_team_trashbin_dir_and_return_teamdir_dentry
+  is_trimacl may_user_dir_d __d_is_vol_path is_vol is_vol_path_d is_vol_d
+  is_str_num posixacl_access_check_acl is_mount_on_vol d_is_vol_path
+  trim_is_in_group get_permission vol_is_admin_or_homeowner
+  get_team_trashbin_access trim_syscall_is_mountpoint trim_syscall_is_trimacl
+  trim_syscall_set/get_external_disk_access trim_syscall_get_posix_mode
+近似(只差寄存器/排列): sb_is_system_root.part.0 posixacl_access_permission
+  is_user_dir_d is_team_trashbin_dir_and_check_acl_d
+  is_team_trashbin_dir_and_get_permission_d trim_syscall_realpath
+不一致(语义等价, 差在布局/寄存器/内联决定):
+  trim_do_trashbin 286/285, is_mount_on_vol_d 160/159,
+  trim_syscall_set_ro_stat 78/77, faccessat 185/185, get_perm 140/139,
+  may_delete 135/134, get_trimacl_xattr 112/113: 基本块顺序、寄存器分配
+  posixacl_access_permission_check_vol 256/237, posixacl_get_permission 472/423:
+    尾部复制和寄存器分配不同
+  posixacl_access_permission_check 33/123, trim_access 47/28,
+  trim_access_delete 111/73, 缺 posixacl_access_permission_check.part.0:
+    飞牛把 check 的头部(is_vol 分派)内联进 trim_access/trim_access_delete,
+    主体留在 .part.0; 我们的 gcc IPA 先把 .part.0 内联回头部, 头部
+    就超过 max-inline-insns-auto 不再内联进调用方。改写多种头部形状都
+    不变, 逻辑一致。
+导出与飞牛一致 (get_permission is_trimacl is_vol is_vol_d trim_access
+trim_access_delete trim_do_trashbin trim_is_on_trashbin_whitelist 为
+EXPORT_SYMBOL, 其余不导出)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/Makefile       |    2 +-
+ fs/trimvfs.c      | 1394 ++++++++++++++++++++++++++++++++++++++++++++-
+ fs/trimvfs_stub.c |    9 +
+ 3 files changed, 1403 insertions(+), 2 deletions(-)
+ create mode 100755 fs/trimvfs_stub.c
+
+diff --git a/fs/Makefile b/fs/Makefile
+index ef988a9b7..80631b1bd 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -17,7 +17,7 @@ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		fs_types.o fs_context.o fs_parser.o fsopen.o init.o \
+ 		kernel_read_file.o mnt_idmapping.o remap_range.o pidfs.o \
+ 		file_attr.o
+-obj-$(CONFIG_FS_TRIM_ACL)	+= trimvfs.o
++obj-$(CONFIG_FS_TRIM_ACL)	+= trimvfs.o trimvfs_stub.o	# trimvfs_stub: trim_trashbin 临时桩
+ obj-$(CONFIG_FS_TRIM_ACL)	+= trim_stub.o	# 临时桩, 第 6 步完成后删除
+ 
+ obj-$(CONFIG_BUFFER_HEAD)	+= buffer.o mpage.o
+diff --git a/fs/trimvfs.c b/fs/trimvfs.c
+index 4c3e2d535..83fbb6488 100644
+--- a/fs/trimvfs.c
++++ b/fs/trimvfs.c
+@@ -1,5 +1,1397 @@
+ // SPDX-License-Identifier: GPL-2.0
+-/* fnOS trimvfs: 卷判断、POSIX ACL 卷权限、trim 私有 syscall (还原中) */
++/*
++ * Copyright (C) T.R.I.M Inc.
++ *
++ * fnOS trimvfs: volume detection, POSIX ACL permission on volumes,
++ * trashbin entry and the private trim syscalls (multiplexed on faccessat2).
++ * Reconstructed from the fnOS 6.18.18.c1186-trim binary.
++ */
++#include <linux/kernel.h>
++#include <linux/init.h>
++#include <linux/slab.h>
+ #include <linux/fs.h>
++#include <linux/fs_struct.h>
++#include <linux/init_task.h>
++#include <linux/file.h>
++#include <linux/sched.h>
++#include <linux/cred.h>
++#include <linux/capability.h>
++#include <linux/namei.h>
++#include <linux/mount.h>
++#include <linux/dcache.h>
++#include <linux/lockref.h>
++#include <linux/seqlock.h>
++#include <linux/spinlock.h>
++#include <linux/mnt_idmapping.h>
++#include <linux/posix_acl.h>
++#include <linux/xattr.h>
++#include <linux/export.h>
++#include <linux/uaccess.h>
+ #include <linux/trim_acl.h>
++#include <linux/trim_flags.h>
+ #include <linux/trimvfs.h>
++#include "mount.h"
++
++/* fnOS Administrators group and system user (same values as trim_acl.c) */
++#define TRIM_ADMIN_GID		1000
++#define TRIM_SYSTEM_UID		712
++/* volume types */
++#define TRIM_VOL_TYPE_MOUNTED	0x1	/* /volN mounted volume */
++#define TRIM_VOL_TYPE_SYSTEM	0x2	/* /vol0X on the system disk */
++#define TRIM_VOL_TYPE_EXTERNAL	0x110	/* /vol00: external disks */
++#define TRIM_VOL_TYPE_PATH	0xffff	/* anywhere below /volN */
++/* is_user_dir_d() results */
++#define TRIM_USER_DIR_READONLY	0x01
++#define TRIM_USER_DIR_OTHER	0x02
++#define TRIM_USER_DIR_READ	0x11
++#define TRIM_USER_DIR_FULL	0x12
++
++#define TRIM_TEAM_DIR		"@team"
++#define TRIM_LOCAL_DIR		".@#local"
++#define TRIM_TRASH_DIR		"trash"
++#define TRIM_TRASHBIN_XATTR	"user.trim-trashbin"
++#define TRIM_TEAM_TRASHBIN_XATTR "user.trim-team-trashbin-access"
++
++int trim_trashbin(const char *path);
++
++unsigned int g_external_disk_access;
++
++static unsigned int trim_system_root_fs_seq;
++static struct super_block *trim_system_root_sb;
++static seqcount_t trim_system_root_cache_seq;
++static DEFINE_SPINLOCK(trim_system_root_cache_lock);
++
++#define TA_UID(ta)	(TA_NOT_CURRENT(ta) ? (ta)->uid : __kuid_val(current_fsuid()))
++
++static inline bool ta_vfsuid_eq(struct trim_access_t *ta, vfsuid_t vfsuid)
++{
++	return vfsuid_eq_kuid(vfsuid, KUIDT_INIT(TA_UID(ta)));
++}
++
++static inline bool ta_vfsgid_in_group(struct trim_access_t *ta, vfsgid_t vfsgid)
++{
++	if (TA_NOT_CURRENT(ta))
++		return trim_is_in_group(__vfsgid_val(vfsgid), ta->gid_count, ta->gids);
++	return vfsgid_in_group_p(vfsgid);
++}
++
++static inline bool ta_in_group(struct mnt_idmap *idmap, struct user_namespace *ns, struct trim_access_t *ta,
++			       gid_t gid)
++{
++	if (TA_NOT_CURRENT(ta))
++		return trim_is_in_group(gid, ta->gid_count, ta->gids);
++	return vfsgid_in_group_p(make_vfsgid(idmap, ns, make_kgid(ns, gid)));
++}
++
++static inline bool ta_is_root(struct mnt_idmap *idmap, struct inode *inode, struct trim_access_t *ta)
++{
++	return (!TA_NOT_CURRENT(ta) && capable_wrt_inode_uidgid(idmap, inode, CAP_DAC_OVERRIDE)) ||
++	       (TA_NOT_CURRENT(ta) && ta->uid == 0);
++}
++
++/*
++ * Deletions done by the file sharing daemons always go to the trashbin.
++ */
++bool trim_is_on_trashbin_whitelist(void)
++{
++	static char *while_list[] = { "smbd", "nfsd", "webdav", "smbftpd", NULL };
++	int i;
++
++	for (i = 0; while_list[i]; i++)
++		if (!strcmp(current->group_leader->comm, while_list[i]))
++			return true;
++	return false;
++}
++EXPORT_SYMBOL(trim_is_on_trashbin_whitelist);
++
++/*
++ * /@team/<team>/.@#local/trash/... -> returns a reference to /@team/<team>
++ */
++static struct dentry *is_in_team_trashbin_dir_and_return_teamdir_dentry(struct dentry *dentry)
++{
++	struct dentry *d[4];
++	struct dentry *p, *ret;
++	unsigned int seq;
++
++retry:
++	memset(d, 0, sizeof(d));
++	rcu_read_lock();
++	seq = read_seqbegin(&rename_lock);
++	for (p = dentry; !IS_ROOT(p); p = p->d_parent) {
++		d[3] = d[2];
++		d[2] = d[1];
++		d[1] = d[0];
++		d[0] = p;
++	}
++	ret = NULL;
++	if (!d[0] || strcmp(d[0]->d_name.name, TRIM_TEAM_DIR))
++		goto out;
++	if (!d[2] || strcmp(d[2]->d_name.name, TRIM_LOCAL_DIR))
++		goto out;
++	if (!d[3] || strcmp(d[3]->d_name.name, TRIM_TRASH_DIR))
++		goto out;
++	if (!d[1])
++		goto out;
++	if (!lockref_get_not_dead(&d[1]->d_lockref)) {
++		rcu_read_unlock();
++		goto retry;
++	}
++	ret = d[1];
++out:
++	if (read_seqretry(&rename_lock, seq)) {
++		if (ret)
++			dput(ret);
++		rcu_read_unlock();
++		goto retry;
++	}
++	rcu_read_unlock();
++	return ret;
++}
++
++int is_trimacl(struct dentry *dentry)
++{
++	enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++	int ret;
++
++	ret = trimacl_resolve_policy(dentry, 0, &policy);
++	if (ret)
++		return ret;
++	return policy == TRIMACL_POLICY_TRIM;
++}
++EXPORT_SYMBOL(is_trimacl);
++
++/*
++ * Is @sb the superblock of the system root (init's "/")?  The answer is
++ * cached against init_fs.seq once the system is running.
++ */
++static bool sb_is_system_root(struct super_block *sb)
++{
++	struct super_block *root_sb, *cached_sb;
++	struct vfsmount *mnt;
++	unsigned int seq, cseq, cached_seq;
++	bool ret = false, hit = false;
++
++	if (!sb)
++		goto out;
++
++	seq = read_seqbegin(&init_fs.seq);
++	if (system_state > SYSTEM_FREEING_INITMEM) {
++		do {
++			cseq = read_seqcount_begin(&trim_system_root_cache_seq);
++			cached_seq = trim_system_root_fs_seq;
++			cached_sb = trim_system_root_sb;
++		} while (read_seqcount_retry(&trim_system_root_cache_seq, cseq));
++		if (cached_seq == seq && cached_sb) {
++			ret = cached_sb == sb;
++			hit = true;
++		}
++	}
++	if (!read_seqretry(&init_fs.seq, seq) && hit)
++		return ret;
++
++	rcu_read_lock();
++	do {
++		seq = read_seqbegin(&init_fs.seq);
++		mnt = init_fs.root.mnt;
++		root_sb = mnt ? mnt->mnt_sb : NULL;
++	} while (read_seqretry(&init_fs.seq, seq));
++
++	if (!root_sb || root_sb->s_type == &rootfs_fs_type) {
++		ret = false;
++		goto out_unlock;
++	}
++	if (system_state > SYSTEM_FREEING_INITMEM && !read_seqretry(&init_fs.seq, seq)) {
++		spin_lock(&trim_system_root_cache_lock);
++		write_seqcount_begin(&trim_system_root_cache_seq);
++		trim_system_root_sb = root_sb;
++		trim_system_root_fs_seq = seq;
++		write_seqcount_end(&trim_system_root_cache_seq);
++		spin_unlock(&trim_system_root_cache_lock);
++	}
++	ret = sb == root_sb;
++out_unlock:
++	rcu_read_unlock();
++out:
++	return ret;
++}
++
++/*
++ * Top level directory of @dentry named @uid_str: the user's own home,
++ * other numeric top level directories: other users' homes.
++ */
++static int may_user_dir_d(struct dentry *dentry, const char *uid_str)
++{
++	struct dentry *top, *p;
++	struct inode *inode;
++	unsigned int seq;
++	int ret;
++
++retry:
++	rcu_read_lock();
++	seq = read_seqbegin(&rename_lock);
++	p = dentry;
++	do {
++		top = p;
++		p = READ_ONCE(p->d_parent);
++	} while (!IS_ROOT(p));
++	ret = 0;
++	inode = top->d_inode;
++	if (inode) {
++		if (!strcmp(top->d_name.name, uid_str))
++			ret = uid_eq(inode->i_uid, GLOBAL_ROOT_UID) ? TRIM_USER_DIR_READ : TRIM_USER_DIR_FULL;
++		else if (is_str_num(top->d_name.name))
++			ret = uid_eq(inode->i_uid, GLOBAL_ROOT_UID) ? TRIM_USER_DIR_READONLY : TRIM_USER_DIR_OTHER;
++	}
++	if (read_seqretry(&rename_lock, seq)) {
++		rcu_read_unlock();
++		goto retry;
++	}
++	rcu_read_unlock();
++	return ret;
++}
++
++/* Is @dentry below a top level "vol<N>" directory? */
++static unsigned int __d_is_vol_path(struct dentry *dentry)
++{
++	struct dentry *d[2];
++	struct dentry *p;
++	const char *name;
++	unsigned int seq, ret;
++
++retry:
++	memset(d, 0, sizeof(d));
++	rcu_read_lock();
++	seq = read_seqbegin(&rename_lock);
++	for (p = dentry; !IS_ROOT(p); p = READ_ONCE(p->d_parent)) {
++		d[1] = d[0];
++		d[0] = p;
++	}
++	ret = 0;
++	if (d[0]) {
++		name = d[0]->d_name.name;
++		if (!strncmp(name, "vol", 3) && is_str_num(name + 3))
++			ret = TRIM_VOL_TYPE_PATH;
++	}
++	if (read_seqretry(&rename_lock, seq)) {
++		rcu_read_unlock();
++		goto retry;
++	}
++	rcu_read_unlock();
++	return ret;
++}
++
++int is_vol(struct inode *inode)
++{
++	struct dentry *dentry;
++	int ret;
++
++	if (!inode)
++		return 0;
++
++	if (inode->i_sb) {
++		ret = trim_mounts_query_by_sb(inode->i_sb, NULL);
++		if (likely(ret))
++			return ret;
++	}
++
++	if (likely(!sb_is_system_root(inode->i_sb)))
++		return 0;
++
++	spin_lock(&inode->i_lock);
++	hlist_for_each_entry(dentry, &inode->i_dentry, d_u.d_alias) {
++		ret = __d_is_vol_path(dentry);
++		if (ret) {
++			spin_unlock(&inode->i_lock);
++			return ret;
++		}
++	}
++	spin_unlock(&inode->i_lock);
++	return 0;
++}
++EXPORT_SYMBOL(is_vol);
++
++static noinline unsigned int is_vol_path_d(struct dentry *dentry)
++{
++	unsigned int ret;
++
++	if (!dentry)
++		return 0;
++	ret = __d_is_vol_path(dentry);
++	if (ret && dentry->d_inode && sb_is_system_root(dentry->d_inode->i_sb))
++		return ret;
++	return 0;
++}
++
++int is_vol_d(struct dentry *dentry)
++{
++	int ret;
++
++	if (!dentry)
++		return 0;
++
++	if (dentry->d_inode && dentry->d_inode->i_sb) {
++		ret = trim_mounts_query_by_sb(dentry->d_inode->i_sb, NULL);
++		if (likely(ret))
++			return ret;
++	}
++	return is_vol_path_d(dentry);
++}
++EXPORT_SYMBOL(is_vol_d);
++
++/*
++ * Should the removal of @dentry go to the trashbin?  Only for user homes
++ * (/<uid>/...) and team folders (/@team/<team>/...) on a mounted volume.
++ * On success *processed is set and the path is handed to the trashbin
++ * daemon; the caller then skips the real unlink/rmdir.
++ */
++int trim_do_trashbin(struct vfsmount *mnt, struct inode *dir, struct dentry *dentry, int is_dir,
++		     int trim_trashbin_flag, int *processed)
++{
++	char vol_id[256] = { 0 };
++	struct dentry *d[3];
++	struct dentry *p, *target, *parent;
++	struct mnt_idmap *idmap;
++	char value[8];
++	unsigned int seq;
++	char *buf, *path;
++	int err = 0, len;
++
++	*processed = 0;
++	if (!d_inode(dentry) || d_is_negative(dentry) || !d_inode(dentry)->i_sb)
++		return 0;
++
++	if (trim_mounts_query_by_sb(d_inode(dentry)->i_sb, vol_id) == TRIM_VOL_TYPE_MOUNTED) {
++		idmap = mnt_idmap(mnt);
++retry:
++		memset(d, 0, sizeof(d));
++		rcu_read_lock();
++		seq = read_seqbegin(&rename_lock);
++		for (p = dentry; !IS_ROOT(p); p = READ_ONCE(p->d_parent)) {
++			d[2] = d[1];
++			d[1] = d[0];
++			d[0] = p;
++		}
++		target = NULL;
++		if (!d[0] || !d[1])
++			goto nomatch;
++		if (!is_str_num(d[0]->d_name.name) || !strcmp(d[1]->d_name.name, TRIM_LOCAL_DIR)) {
++			if (!d[2] || strcmp(d[0]->d_name.name, TRIM_TEAM_DIR) ||
++			    !strcmp(d[2]->d_name.name, TRIM_LOCAL_DIR))
++				goto nomatch;
++		}
++		if (trim_trashbin_flag != 2) {
++			target = strcmp(d[0]->d_name.name, TRIM_TEAM_DIR) ? d[0] : d[1];
++			if (!lockref_get_not_dead(&target->d_lockref)) {
++				rcu_read_unlock();
++				goto retry;
++			}
++		}
++		if (read_seqretry(&rename_lock, seq)) {
++			rcu_read_unlock();
++			if (target)
++				dput(target);
++			goto retry;
++		}
++		rcu_read_unlock();
++
++		if (target) {
++			memset(value, 0, sizeof(value));
++			if (d_inode(target) &&
++			    __vfs_getxattr(target, d_inode(target), TRIM_TRASHBIN_XATTR, value, sizeof(value)) > 0 &&
++			    value[0] == '0') {
++				/* trashbin disabled for this home / team folder */
++				dput(target);
++				goto check;
++			}
++			dput(target);
++		}
++
++		inode_lock(dir);
++		parent = dget_parent(dentry);
++		if (!d_inode(dentry) || d_is_negative(dentry) || d_inode(parent) != dir) {
++			dput(parent);
++			inode_unlock(dir);
++			return 0;
++		}
++		*processed = 1;
++		err = origin_may_delete(mnt_idmap(mnt), dir, dentry, is_dir);
++		dput(parent);
++		inode_unlock(dir);
++		goto check;
++nomatch:
++		if (read_seqretry(&rename_lock, seq)) {
++			rcu_read_unlock();
++			goto retry;
++		}
++		rcu_read_unlock();
++	}
++check:
++	if (!*processed)
++		return 0;
++	if (err)
++		return err;
++
++	buf = kmalloc(PATH_MAX, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	path = dentry_path_raw(dentry, buf, PATH_MAX);
++	if (IS_ERR(path)) {
++		err = PTR_ERR(path);
++		goto out;
++	}
++	/* prepend "/<vol_id>" */
++	len = strlen(vol_id);
++	err = -ENAMETOOLONG;
++	if (path - (len + 1) < buf)
++		goto out;
++	path -= len;
++	memcpy(path, vol_id, len);
++	*--path = '/';
++	err = trim_trashbin(path);
++out:
++	kfree(buf);
++	return err;
++}
++EXPORT_SYMBOL(trim_do_trashbin);
++
++bool is_str_num(const char *str)
++{
++	if (!*str)
++		return false;
++	for (; *str; str++)
++		if (*str < '0' || *str > '9')
++			return false;
++	return true;
++}
++
++/*
++ * posix_acl_permission() checking the user of @ta instead of current.
++ */
++int posixacl_access_permission(struct mnt_idmap *idmap, struct inode *inode, const struct posix_acl *acl, int want,
++			       struct trim_access_t *ta)
++{
++	const struct posix_acl_entry *pa, *pe, *mask_obj;
++	struct user_namespace *fs_userns = i_user_ns(inode);
++	int found = 0;
++	vfsuid_t vfsuid;
++	vfsgid_t vfsgid;
++
++	want &= MAY_READ | MAY_WRITE | MAY_EXEC;
++
++	FOREACH_ACL_ENTRY(pa, acl, pe) {
++		switch (pa->e_tag) {
++		case ACL_USER_OBJ:
++			/* (May have been checked already) */
++			vfsuid = i_uid_into_vfsuid(idmap, inode);
++			if (ta_vfsuid_eq(ta, vfsuid))
++				goto check_perm;
++			break;
++		case ACL_USER:
++			vfsuid = make_vfsuid(idmap, fs_userns, pa->e_uid);
++			if (ta_vfsuid_eq(ta, vfsuid))
++				goto mask;
++			break;
++		case ACL_GROUP_OBJ:
++			vfsgid = i_gid_into_vfsgid(idmap, inode);
++			if (ta_vfsgid_in_group(ta, vfsgid)) {
++				found = 1;
++				if ((pa->e_perm & want) == want)
++					goto mask;
++			}
++			break;
++		case ACL_GROUP:
++			vfsgid = make_vfsgid(idmap, fs_userns, pa->e_gid);
++			if (ta_vfsgid_in_group(ta, vfsgid)) {
++				found = 1;
++				if ((pa->e_perm & want) == want)
++					goto mask;
++			}
++			break;
++		case ACL_MASK:
++			break;
++		case ACL_OTHER:
++			if (found)
++				return -EACCES;
++			else
++				goto check_perm;
++		default:
++			return -EIO;
++		}
++	}
++	return -EIO;
++
++mask:
++	for (mask_obj = pa + 1; mask_obj != pe; mask_obj++) {
++		if (mask_obj->e_tag == ACL_MASK) {
++			if ((pa->e_perm & mask_obj->e_perm & want) == want)
++				return 0;
++			return -EACCES;
++		}
++	}
++
++check_perm:
++	if ((pa->e_perm & want) == want)
++		return 0;
++	return -EACCES;
++}
++
++/* check_acl() for @ta */
++static int posixacl_access_check_acl(struct mnt_idmap *idmap, struct inode *inode, int mask, struct trim_access_t *ta)
++{
++	struct posix_acl *acl;
++
++	if (mask & MAY_NOT_BLOCK) {
++		acl = get_cached_acl_rcu(inode, ACL_TYPE_ACCESS);
++		if (!acl)
++			return -EAGAIN;
++		/* no ->get_inode_acl() calls in RCU mode... */
++		if (is_uncached_acl(acl))
++			return -ECHILD;
++		return posixacl_access_permission(idmap, inode, acl, mask, ta);
++	}
++
++	acl = get_inode_acl(inode, ACL_TYPE_ACCESS);
++	if (IS_ERR(acl))
++		return PTR_ERR(acl);
++	if (acl) {
++		int error = posixacl_access_permission(idmap, inode, acl, mask, ta);
++
++		posix_acl_release(acl);
++		return error;
++	}
++	return -EAGAIN;
++}
++
++/* acl_permission_check() for @ta, without the "no ACL, everybody allowed" shortcut */
++static __always_inline int posixacl_mode_check(struct mnt_idmap *idmap, struct inode *inode, unsigned int mode,
++					       int mask, struct trim_access_t *ta)
++{
++	vfsuid_t vfsuid;
++
++	/* Are we the owner? If so, ACL's don't matter */
++	vfsuid = i_uid_into_vfsuid(idmap, inode);
++	if (ta_vfsuid_eq(ta, vfsuid)) {
++		mask &= 7;
++		mode >>= 6;
++		return (mask & ~mode) ? -EACCES : 0;
++	}
++
++	/* Do we have ACL's? */
++	if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
++		int error = posixacl_access_check_acl(idmap, inode, mask, ta);
++
++		if (error != -EAGAIN)
++			return error;
++	}
++
++	/* Only RWX matters for group/other mode bits */
++	mask &= 7;
++
++	/*
++	 * Are the group permissions different from
++	 * the other permissions in the bits we care
++	 * about? Need to check group ownership if so.
++	 */
++	if (mask & (mode ^ (mode >> 3))) {
++		vfsgid_t vfsgid = i_gid_into_vfsgid(idmap, inode);
++
++		if (ta_vfsgid_in_group(ta, vfsgid))
++			mode >>= 3;
++	}
++
++	/* Bits in 'mode' clear that we require? */
++	return (mask & ~mode) ? -EACCES : 0;
++}
++
++int is_user_dir_d(struct dentry *dentry, unsigned int uid, int vol_type)
++{
++	char uid_str[16] = { 0 };
++
++	if (vol_type != TRIM_VOL_TYPE_MOUNTED)
++		return 0;
++	sprintf(uid_str, "%u", uid);
++	return may_user_dir_d(dentry, uid_str);
++}
++
++int is_team_trashbin_dir_and_check_acl_d(struct dentry *dentry, int mask, struct mnt_idmap *idmap,
++					 struct trim_access_t *ta, int *access)
++{
++	struct dentry *teamdir;
++	char value[8] = { 0 };
++
++	teamdir = is_in_team_trashbin_dir_and_return_teamdir_dentry(dentry);
++	if (!teamdir)
++		return 0;
++
++	if (access) {
++		*access = -EACCES;
++		if (__vfs_getxattr(teamdir, d_inode(teamdir), TRIM_TEAM_TRASHBIN_XATTR, value, sizeof(value)) > 0 &&
++		    value[0] == '1')
++			*access = trimacl_check_acl(idmap, teamdir, mask, ta);
++	}
++	dput(teamdir);
++	return 1;
++}
++
++int is_team_trashbin_dir_and_get_permission_d(struct dentry *dentry, struct mnt_idmap *idmap, struct trim_access_t *ta,
++					      unsigned int *perm)
++{
++	struct dentry *teamdir;
++	char value[8] = { 0 };
++
++	teamdir = is_in_team_trashbin_dir_and_return_teamdir_dentry(dentry);
++	if (!teamdir)
++		return 0;
++
++	if (perm) {
++		*perm = 0;
++		if (__vfs_getxattr(teamdir, d_inode(teamdir), TRIM_TEAM_TRASHBIN_XATTR, value, sizeof(value)) > 0 &&
++		    value[0] == '1')
++			*perm = trimacl_calc_permission(idmap, teamdir, ta);
++	}
++	dput(teamdir);
++	return 1;
++}
++
++/*
++ * @d is a mount point candidate in the system root: "/vol<N>" returns
++ * TRIM_VOL_TYPE_MOUNTED and copies "vol<N>" to @vol_id, "/vol00" is the
++ * external disk directory, other "/vol0*" are system disk volumes.
++ */
++unsigned int is_mount_on_vol_d(struct dentry *dentry, char *vol_id)
++{
++	struct dentry *d[2];
++	struct dentry *p;
++	const char *name;
++	unsigned int seq, ret;
++
++	if (!dentry || !sb_is_system_root(dentry->d_sb))
++		return 0;
++
++retry:
++	memset(d, 0, sizeof(d));
++	rcu_read_lock();
++	seq = read_seqbegin(&rename_lock);
++	for (p = dentry; !IS_ROOT(p); p = READ_ONCE(p->d_parent)) {
++		d[1] = d[0];
++		d[0] = p;
++	}
++	ret = 0;
++	if (d[0]) {
++		name = d[0]->d_name.name;
++		if (!strncmp(name, "vol", 3) && is_str_num(name + 3)) {
++			if (name[3] == '0') {
++				ret = strcmp(name + 3, "00") ? TRIM_VOL_TYPE_SYSTEM : TRIM_VOL_TYPE_EXTERNAL;
++			} else {
++				ret = TRIM_VOL_TYPE_PATH;
++				if (!d[1] && strlen(name) < sizeof(((struct super_block *)0)->vol_path)) {
++					if (vol_id)
++						strcpy(vol_id, name);
++					ret = TRIM_VOL_TYPE_MOUNTED;
++				}
++			}
++		}
++	}
++	if (read_seqretry(&rename_lock, seq)) {
++		rcu_read_unlock();
++		goto retry;
++	}
++	rcu_read_unlock();
++	return ret;
++}
++
++unsigned int is_mount_on_vol(struct inode *inode, char *vol_id)
++{
++	if (!inode || !inode->i_sb)
++		return 0;
++	return trim_mounts_query_by_sb(inode->i_sb, vol_id);
++}
++
++unsigned int d_is_vol_path(struct dentry *d)
++{
++	unsigned int ret;
++
++	if (!d)
++		return 0;
++	ret = __d_is_vol_path(d);
++	if (ret && sb_is_system_root(d->d_sb))
++		return ret;
++	return 0;
++}
++
++int trim_is_in_group(gid_t gid, unsigned int gidlist_count, gid_t *gidlist)
++{
++	unsigned int i;
++
++	for (i = 0; i < gidlist_count; i++)
++		if (gidlist[i] == gid)
++			return 1;
++	return 0;
++}
++
++/*
++ * Permission check on a volume: administrators get full access, the
++ * system user and users in their own (read-only) home get read access,
++ * external disks are for administrators only unless enabled.
++ */
++int posixacl_access_permission_check_vol(struct mnt_idmap *idmap, struct inode *inode, int mask, int vol_type,
++					 struct trim_access_t *ta)
++{
++	unsigned int mode = inode->i_mode;
++
++	/* Traversing directories on a volume is always allowed */
++	if (S_ISDIR(mode))
++		mask &= ~MAY_EXEC;
++	if (!(mask & 7))
++		return 0;
++
++	if (TA_UID(ta) == TRIM_SYSTEM_UID)
++		goto read_access;
++
++	/* External disks are for administrators unless enabled for everyone */
++	if (vol_type == TRIM_VOL_TYPE_EXTERNAL && !g_external_disk_access &&
++	    !ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID))
++		return -EACCES;
++
++	if (!(ta && (ta->flags & TRIM_ACCESS_FLAG_IGNORE_ADMINS)) &&
++	    ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID))
++		goto full_access;
++	goto check;
++
++full_access:
++	if (S_ISDIR(inode->i_mode))
++		return 0;
++	mask &= ~(MAY_READ | MAY_WRITE);
++	goto check;
++
++read_access:
++	mask &= ~(MAY_READ | (S_ISDIR(mode) ? MAY_EXEC : 0));
++
++check:
++	if (!(mask & 7))
++		return 0;
++	return posixacl_mode_check(idmap, inode, mode, mask, ta);
++}
++
++int trim_access(struct mnt_idmap *idmap, struct dentry *dentry, int mode, struct trim_access_t *ta)
++{
++	if (IS_TRIMACL(dentry)) {
++		return trim_generic_permission_ta(idmap, dentry, mode | MAY_ACCESS, ta);
++	} else {
++		int mask = aclv2_mode_to_posix_mode(mode) | MAY_ACCESS;
++
++		return posixacl_access_permission_check(idmap, d_inode(dentry), mask, ta);
++	}
++}
++EXPORT_SYMBOL(trim_access);
++
++int trim_access_delete(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta)
++{
++	enum trimacl_policy policy = TRIMACL_POLICY_TRIM, parent_policy = TRIMACL_POLICY_TRIM;
++	struct dentry *parent = dentry->d_parent;
++	int ret;
++
++	if (!IS_TRIMACL(dentry))
++		return posixacl_access_permission_check(idmap, d_inode(parent), MAY_WRITE | MAY_EXEC, ta);
++
++	ret = trimacl_resolve_policy(dentry, 0, &policy);
++	if (ret)
++		return ret;
++	if (policy == TRIMACL_POLICY_POSIX) {
++		if (!ta)
++			return inode_permission(idmap, d_inode(dentry->d_parent), MAY_WRITE | MAY_EXEC);
++		return posixacl_access_permission_check(idmap, d_inode(dentry->d_parent), MAY_WRITE | MAY_EXEC, ta);
++	}
++
++	ret = trimacl_resolve_policy(dentry->d_parent, 0, &parent_policy);
++	if (ret)
++		return ret;
++	if (parent_policy != TRIMACL_POLICY_POSIX) {
++		ret = trim_generic_permission_ta(idmap, dentry, MAY_DEL, ta);
++		if (!ret)
++			return 0;
++	}
++	return trim_generic_permission_ta(idmap, dentry->d_parent, MAY_DEL_CHILD, ta);
++}
++EXPORT_SYMBOL(trim_access_delete);
++
++int posixacl_access_permission_check(struct mnt_idmap *idmap, struct inode *inode, int mask, struct trim_access_t *ta)
++{
++	int vol_type = is_vol(inode);
++	int ret;
++
++	if (vol_type)
++		ret = posixacl_access_permission_check_vol(idmap, inode, mask, vol_type, ta);
++	else
++		ret = posixacl_mode_check(idmap, inode, inode->i_mode, mask, ta);
++	return ret;
++}
++
++/*
++ * The rwx bits @ta gets on @inode by mode bits / POSIX ACL and volume rules.
++ */
++unsigned int posixacl_get_permission(struct mnt_idmap *idmap, struct inode *inode, struct trim_access_t *ta)
++{
++	const struct posix_acl_entry *pa, *pe, *mask_obj;
++	unsigned int mode = inode->i_mode;
++	unsigned int perm = 0;
++	struct user_namespace *fs_userns;
++	struct posix_acl *acl;
++	vfsuid_t vfsuid;
++	vfsgid_t vfsgid;
++	bool is_dir;
++	int vol_type;
++
++	if (ta_is_root(idmap, inode, ta)) {
++		if (S_ISDIR(mode) || (mode & S_IXUGO))
++			return MAY_READ | MAY_WRITE | MAY_EXEC;
++		perm = MAY_READ | MAY_WRITE;
++		goto calc;
++	}
++
++	vol_type = is_vol(inode);
++	if (!vol_type)
++		goto calc;
++
++	/* Traversing directories on a volume is always allowed */
++	is_dir = S_ISDIR(inode->i_mode);
++	perm = is_dir ? MAY_EXEC : 0;
++
++	if (TA_UID(ta) == TRIM_SYSTEM_UID) {
++		perm |= MAY_READ;
++		goto calc;
++	}
++
++	if (vol_type == TRIM_VOL_TYPE_EXTERNAL && !g_external_disk_access &&
++	    !ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID))
++		return 0;
++
++	if (!(ta && (ta->flags & TRIM_ACCESS_FLAG_IGNORE_ADMINS)) &&
++	    ta_in_group(idmap, i_user_ns(inode), ta, TRIM_ADMIN_GID)) {
++		if (S_ISDIR(inode->i_mode) || is_dir)
++			return MAY_READ | MAY_WRITE | MAY_EXEC;
++		perm = MAY_READ | MAY_WRITE;
++	}
++
++calc:
++	vfsuid = i_uid_into_vfsuid(idmap, inode);
++	if (ta_vfsuid_eq(ta, vfsuid))
++		return perm | ((mode >> 6) & 7);
++
++	if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
++		acl = get_inode_acl(inode, ACL_TYPE_ACCESS);
++		if (IS_ERR(acl))
++			return perm;
++		if (acl) {
++			fs_userns = i_user_ns(inode);
++			FOREACH_ACL_ENTRY(pa, acl, pe) {
++				switch (pa->e_tag) {
++				case ACL_USER_OBJ:
++					vfsuid = i_uid_into_vfsuid(idmap, inode);
++					if (ta_vfsuid_eq(ta, vfsuid))
++						goto entry_perm;
++					break;
++				case ACL_USER:
++					vfsuid = make_vfsuid(idmap, fs_userns, pa->e_uid);
++					if (ta_vfsuid_eq(ta, vfsuid))
++						goto mask;
++					break;
++				case ACL_GROUP_OBJ:
++					vfsgid = i_gid_into_vfsgid(idmap, inode);
++					if (ta_vfsgid_in_group(ta, vfsgid))
++						goto mask;
++					break;
++				case ACL_GROUP:
++					vfsgid = make_vfsgid(idmap, fs_userns, pa->e_gid);
++					if (ta_vfsgid_in_group(ta, vfsgid))
++						goto mask;
++					break;
++				case ACL_MASK:
++					break;
++				case ACL_OTHER:
++					goto entry_perm;
++				default:
++					goto release;
++				}
++			}
++			goto release;
++mask:
++			for (mask_obj = pa + 1; mask_obj != pe; mask_obj++) {
++				if (mask_obj->e_tag == ACL_MASK) {
++					perm |= (unsigned short)(pa->e_perm & mask_obj->e_perm);
++					goto release;
++				}
++			}
++entry_perm:
++			perm |= pa->e_perm;
++release:
++			posix_acl_release(acl);
++			return perm;
++		}
++	}
++
++	if (mode ^ (mode >> 3)) {
++		vfsgid = i_gid_into_vfsgid(idmap, inode);
++		if (ta_vfsgid_in_group(ta, vfsgid))
++			return perm | ((mode >> 3) & 7);
++	}
++	return perm | (mode & 7);
++}
++
++int get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta)
++{
++	if (!IS_TRIMACL(dentry))
++		return posixacl_get_permission(idmap, d_inode(dentry), ta);
++	return trimacl_get_permission(idmap, dentry, ta);
++}
++EXPORT_SYMBOL(get_permission);
++
++/*
++ * May the caller change owner/ACL on a volume?  1: administrator,
++ * 2: owner of the home directory on a mounted volume, 0: no.
++ */
++int vol_is_admin_or_homeowner(struct mnt_idmap *idmap, struct dentry *dentry)
++{
++	struct user_namespace *ns;
++	unsigned int uid;
++	int vol_type;
++
++	if (!dentry)
++		return 0;
++
++	vol_type = is_vol_d(dentry);
++	if (!vol_type)
++		return 0;
++
++	ns = i_user_ns(d_inode(dentry));
++	if (vfsgid_in_group_p(make_vfsgid(idmap, ns, make_kgid(ns, TRIM_ADMIN_GID))))
++		return 1;
++
++	uid = __kuid_val(current_fsuid());
++	if (vol_type == TRIM_VOL_TYPE_MOUNTED) {
++		char uid_str[16] = { 0 };
++
++		sprintf(uid_str, "%u", uid);
++		return may_user_dir_d(dentry, uid_str) == TRIM_USER_DIR_FULL ? 2 : 0;
++	}
++	return 0;
++}
++
++int get_team_trashbin_access(struct dentry *dentry)
++{
++	char value[8] = { 0 };
++
++	if (__vfs_getxattr(dentry, d_inode(dentry), TRIM_TEAM_TRASHBIN_XATTR, value, sizeof(value)) > 0)
++		return value[0] == '1';
++	return 0;
++}
++
++/*
++ * Trim syscalls.  fnOS user space reaches them through faccessat2() with a
++ * magic dfd, see sys_faccessat2().
++ */
++#define TRIM_SYSCALL_AT_FLAGS	(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)
++
++static inline unsigned int trim_syscall_lookup_flags(int flags)
++{
++	unsigned int lookup_flags = (flags & AT_SYMLINK_NOFOLLOW) ? 0 : LOOKUP_FOLLOW;
++
++	if (flags & AT_EMPTY_PATH)
++		lookup_flags |= LOOKUP_EMPTY;
++	return lookup_flags;
++}
++
++/* Set (AT_SET_SB_TRIM_RO) or clear the trim read-only flag of a mounted fs */
++long trim_syscall_set_ro_stat(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	struct mount *mnt;
++	unsigned int lookup_flags;
++	struct super_block *sb;
++
++	if (flags & ~(TRIM_SYSCALL_AT_FLAGS | AT_SET_SB_TRIM_RO))
++		return -EINVAL;
++
++	lookup_flags = trim_syscall_lookup_flags(flags);
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	if (user_path_at(dfd, filename, lookup_flags, &path))
++		return 0;
++
++	mnt = real_mount(path.mnt);
++	if (mnt && mnt->mnt_mountpoint && path.mnt && strcmp(mnt->mnt_mountpoint->d_name.name, "/") &&
++	    (sb = path.mnt->mnt_sb)) {
++		if (flags & AT_SET_SB_TRIM_RO)
++			sb->s_flags |= SB_TRIM_RO;
++		else
++			sb->s_flags &= ~SB_TRIM_RO;
++	}
++	path_put(&path);
++	return 0;
++}
++
++long trim_syscall_is_mountpoint(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	int error;
++	bool ret;
++
++	if (flags & ~TRIM_SYSCALL_AT_FLAGS)
++		return -EINVAL;
++
++	error = user_path_at(dfd, filename, trim_syscall_lookup_flags(flags), &path);
++	if (unlikely(error))
++		return 0;
++	ret = IS_ROOT(path.dentry);
++	path_put(&path);
++	return ret;
++}
++
++long trim_syscall_is_trimacl(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	unsigned int lookup_flags;
++	struct inode *inode;
++	int error;
++
++	if (flags & ~TRIM_SYSCALL_AT_FLAGS)
++		return -EINVAL;
++
++	lookup_flags = trim_syscall_lookup_flags(flags);
++retry:
++	error = user_path_at(dfd, filename, lookup_flags, &path);
++	if (error)
++		return error;
++	inode = d_inode(path.dentry);
++	if (unlikely(inode->i_op->is_trimacl))
++		error = inode->i_op->is_trimacl(path.dentry);
++	else
++		error = is_trimacl(path.dentry);
++	path_put(&path);
++	if (retry_estale(error, lookup_flags)) {
++		lookup_flags |= LOOKUP_REVAL;
++		goto retry;
++	}
++	return error;
++}
++
++long trim_syscall_realpath(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	struct trim_realpath_t rp;
++	unsigned int lookup_flags;
++	char *buf, *p;
++	int ret;
++
++	if (flags & ~TRIM_SYSCALL_AT_FLAGS)
++		return -EINVAL;
++
++	memset(&rp, 0, sizeof(rp));
++	lookup_flags = trim_syscall_lookup_flags(flags);
++	if (copy_from_user(&rp, filename, sizeof(rp)))
++		return -EFAULT;
++
++	ret = user_path_at(dfd, rp.filename, lookup_flags, &path);
++	if (unlikely(ret))
++		goto out;
++
++	buf = kmalloc(PATH_MAX, GFP_KERNEL);
++	if (!buf) {
++		ret = -ENOMEM;
++		goto out_path;
++	}
++	p = d_path(&path, buf, PATH_MAX);
++	if (IS_ERR(p)) {
++		ret = -ENOENT;
++		goto out_free;
++	}
++	ret = 0;
++	if (copy_to_user(rp.resolved, p, buf + PATH_MAX - p))
++		ret = -EFAULT;
++out_free:
++	kfree(buf);
++out_path:
++	path_put(&path);
++out:
++	return ret;
++}
++
++#define TRIM_SYSCALL_GIDS	128
++
++long trim_syscall_faccessat(int dfd, const char __user *filename, int mode, int flags)
++{
++	struct path path = {};
++	struct trim_access_t ta = {};
++	gid_t gids[TRIM_SYSCALL_GIDS] = {};
++	gid_t *kgids = NULL, *buf;
++	unsigned int lookup_flags, size;
++	struct inode *inode;
++	int res;
++
++	if ((mode & ~TRIM_PERM_FULL_CONTROL) || (flags & ~TRIM_SYSCALL_AT_FLAGS))
++		return -EINVAL;
++
++	lookup_flags = trim_syscall_lookup_flags(flags);
++	if (copy_from_user(&ta, filename, sizeof(ta)))
++		return -EFAULT;
++
++	if (!(ta.flags & TRIM_ACCESS_FLAG_CURRENT_USER)) {
++		/* checking another user's access */
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (ta.gid_count < 1 || ta.gid_count > NGROUPS_MAX)
++			return -EINVAL;
++		size = ta.gid_count * sizeof(gid_t);
++		if (likely(size <= sizeof(gids))) {
++			buf = gids;
++		} else {
++			kgids = kmalloc(size, GFP_KERNEL);
++			if (!kgids)
++				return -ENOMEM;
++			buf = kgids;
++		}
++		if (copy_from_user(buf, (const void __user *)ta.gids, size)) {
++			if (kgids)
++				kfree(kgids);
++			return -EFAULT;
++		}
++		ta.gids = buf;
++	}
++
++retry:
++	res = user_path_at(dfd, ta.filename, lookup_flags, &path);
++	if (res)
++		goto out;
++
++	inode = d_inode(path.dentry);
++
++	if ((mode & MAY_EXEC) && S_ISREG(inode->i_mode)) {
++		res = -EACCES;
++		if (path_noexec(&path))
++			goto out_path_release;
++	}
++
++	if (unlikely(inode->i_op->trim_access))
++		res = inode->i_op->trim_access(mnt_idmap(path.mnt), path.dentry, mode | MAY_ACCESS, &ta);
++	else
++		res = trim_access(mnt_idmap(path.mnt), path.dentry, mode | MAY_ACCESS, &ta);
++	/* SuS v2 requires we report a read only fs too */
++	if (res || !(mode & TRIM_PERM_FULL_WRITABLE) || special_file(inode->i_mode))
++		goto out_path_release;
++	if (__mnt_is_readonly(path.mnt))
++		res = -EROFS;
++
++out_path_release:
++	path_put(&path);
++	if (retry_estale(res, lookup_flags)) {
++		lookup_flags |= LOOKUP_REVAL;
++		goto retry;
++	}
++out:
++	if (kgids)
++		kfree(kgids);
++	return res;
++}
++
++long trim_syscall_get_perm(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	struct trim_access_t ta = {};
++	gid_t gids[TRIM_SYSCALL_GIDS] = {};
++	gid_t *kgids = NULL, *buf;
++	unsigned int lookup_flags, size;
++	struct inode *inode;
++	int perm;
++
++	if (flags & ~TRIM_SYSCALL_AT_FLAGS)
++		return 0;
++
++	lookup_flags = trim_syscall_lookup_flags(flags);
++	if (copy_from_user(&ta, filename, sizeof(ta)))
++		return 0;
++
++	if (!(ta.flags & TRIM_ACCESS_FLAG_CURRENT_USER)) {
++		/* querying another user's permission */
++		if (!capable(CAP_SYS_ADMIN))
++			return 0;
++		if (ta.gid_count < 1 || ta.gid_count > NGROUPS_MAX)
++			return 0;
++		size = ta.gid_count * sizeof(gid_t);
++		if (likely(size <= sizeof(gids))) {
++			buf = gids;
++		} else {
++			kgids = kmalloc(size, GFP_KERNEL);
++			if (!kgids)
++				return 0;
++			buf = kgids;
++		}
++		if (copy_from_user(buf, (const void __user *)ta.gids, size)) {
++			if (kgids)
++				kfree(kgids);
++			return 0;
++		}
++		ta.gids = buf;
++	}
++
++retry:
++	if (user_path_at(dfd, ta.filename, lookup_flags, &path)) {
++		perm = 0;
++		goto out;
++	}
++	inode = d_inode(path.dentry);
++	if (unlikely(inode->i_op->get_permission))
++		perm = inode->i_op->get_permission(mnt_idmap(path.mnt), path.dentry, &ta);
++	else
++		perm = get_permission(mnt_idmap(path.mnt), path.dentry, &ta);
++	path_put(&path);
++	if (retry_estale(perm, lookup_flags)) {
++		lookup_flags |= LOOKUP_REVAL;
++		goto retry;
++	}
++out:
++	if (kgids)
++		kfree(kgids);
++	return perm;
++}
++
++long trim_syscall_may_delete(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	struct trim_access_t ta = {};
++	gid_t gids[TRIM_SYSCALL_GIDS] = {};
++	gid_t *kgids = NULL, *buf;
++	unsigned int lookup_flags, size;
++	struct inode *inode;
++	int res;
++
++	if (flags & ~TRIM_SYSCALL_AT_FLAGS)
++		return -EINVAL;
++
++	lookup_flags = trim_syscall_lookup_flags(flags);
++	if (copy_from_user(&ta, filename, sizeof(ta)))
++		return -EFAULT;
++
++	if (!(ta.flags & TRIM_ACCESS_FLAG_CURRENT_USER)) {
++		/* checking another user's access */
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (ta.gid_count < 1 || ta.gid_count > NGROUPS_MAX)
++			return -EINVAL;
++		size = ta.gid_count * sizeof(gid_t);
++		if (likely(size <= sizeof(gids))) {
++			buf = gids;
++		} else {
++			kgids = kmalloc(size, GFP_KERNEL);
++			if (!kgids)
++				return -ENOMEM;
++			buf = kgids;
++		}
++		if (copy_from_user(buf, (const void __user *)ta.gids, size)) {
++			if (kgids)
++				kfree(kgids);
++			return -EFAULT;
++		}
++		ta.gids = buf;
++	}
++
++retry:
++	res = user_path_at(dfd, ta.filename, lookup_flags, &path);
++	if (res)
++		goto out;
++	inode = d_inode(path.dentry);
++	if (unlikely(inode->i_op->trim_access_delete))
++		res = inode->i_op->trim_access_delete(mnt_idmap(path.mnt), path.dentry, &ta);
++	else
++		res = trim_access_delete(mnt_idmap(path.mnt), path.dentry, &ta);
++	path_put(&path);
++	if (retry_estale(res, lookup_flags)) {
++		lookup_flags |= LOOKUP_REVAL;
++		goto retry;
++	}
++out:
++	if (kgids)
++		kfree(kgids);
++	return res;
++}
++
++long trim_syscall_set_external_disk_access(int mode)
++{
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	g_external_disk_access = mode;
++	return 0;
++}
++
++long trim_syscall_get_external_disk_access(void)
++{
++	return g_external_disk_access;
++}
++
++long trim_syscall_get_trimacl_xattr(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	struct trim_get_trimacl_xattr_t x;
++	unsigned int lookup_flags;
++	struct inode *inode;
++	int error;
++
++	if (flags & ~TRIM_SYSCALL_AT_FLAGS)
++		return -EINVAL;
++
++	memset(&x, 0, sizeof(x));
++	lookup_flags = trim_syscall_lookup_flags(flags);
++	if (copy_from_user(&x, filename, sizeof(x)))
++		return -EFAULT;
++
++	if (x.flags & TRIM_GET_TRIMACL_XATTR_FLAG_FD) {
++		CLASS(fd_raw, f)(x.fd);
++		struct file *file;
++
++		if (fd_empty(f))
++			return -EBADF;
++		file = fd_file(f);
++		inode = d_inode(file->f_path.dentry);
++		if (unlikely(inode->i_op->get_trimacl_xattr_all))
++			return inode->i_op->get_trimacl_xattr_all(file_mnt_idmap(file), file->f_path.dentry, x.flags,
++								   x.buffer, x.buffer_size);
++		return trimacl_get_trimacl_xattr_all(file_mnt_idmap(file), file->f_path.dentry, x.flags,
++						     x.buffer, x.buffer_size);
++	}
++
++retry:
++	error = user_path_at(dfd, x.filename, lookup_flags, &path);
++	if (error)
++		return error;
++	inode = d_inode(path.dentry);
++	if (unlikely(inode->i_op->get_trimacl_xattr_all))
++		error = inode->i_op->get_trimacl_xattr_all(mnt_idmap(path.mnt), path.dentry, x.flags, x.buffer,
++							    x.buffer_size);
++	else
++		error = trimacl_get_trimacl_xattr_all(mnt_idmap(path.mnt), path.dentry, x.flags, x.buffer,
++						      x.buffer_size);
++	path_put(&path);
++	if (retry_estale(error, lookup_flags)) {
++		lookup_flags |= LOOKUP_REVAL;
++		goto retry;
++	}
++	return error;
++}
++
++long trim_syscall_get_posix_mode(int dfd, const char __user *filename, int flags)
++{
++	struct path path = {};
++	int error;
++
++	if (flags & ~TRIM_SYSCALL_AT_FLAGS)
++		return -EINVAL;
++
++	error = user_path_at(dfd, filename, trim_syscall_lookup_flags(flags), &path);
++	if (error)
++		goto out;
++	error = d_inode(path.dentry)->i_mode;
++	path_put(&path);
++out:
++	return error;
++}
+diff --git a/fs/trimvfs_stub.c b/fs/trimvfs_stub.c
+new file mode 100755
+index 000000000..d184662e5
+--- /dev/null
++++ b/fs/trimvfs_stub.c
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * 临时桩: trim_trashbin() 在回收站字符设备 (trim_trashbin.c) 里实现,
++ * 那部分合并后删除本文件和 fs/Makefile 里的 trimvfs_stub.o。
++ */
++#include <linux/compiler.h>
++#include <linux/errno.h>
++
++int __weak trim_trashbin(const char *path) { return -ENODEV; }

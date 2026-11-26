@@ -1,0 +1,29 @@
+From 7fc30d055bb9b56005d5798ae9c1f82ff6cc10bd Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:09:18 +0000
+Subject: [PATCH 02/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-debug-?=
+ =?UTF-8?q?file-with-no-debug-symbols.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tools/aicrf_test/Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/tools/aicrf_test/Makefile b/src/tools/aicrf_test/Makefile
+index c3de1a1..165773a 100644
+--- a/src/tools/aicrf_test/Makefile
++++ b/src/tools/aicrf_test/Makefile
+@@ -13,7 +13,7 @@ bt_test: bt_test.o
+ 	$(CROSS_COMPILE)gcc $+ $(LDFLAGS) -o $@
+ 
+ %.o: %.c
+-	$(CROSS_COMPILE)gcc -c $+ -o $@
++	$(CROSS_COMPILE)gcc -g -c $+ -o $@
+ 
+ clean:
+ 	rm *.o wifi_test bt_test

@@ -1,0 +1,404 @@
+From 0e41ac39b3689393f30d9a047b8ff87371ae03bd Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:38:00 +0700
+Subject: [PATCH 038/110] =?UTF-8?q?ext4:=20trimacl=20=E6=94=AF=E6=8C=81=20?=
+ =?UTF-8?q?=E2=80=94=20system.trim=5Facl=20=E6=89=A9=E5=B1=95=E5=B1=9E?=
+ =?UTF-8?q?=E6=80=A7=E3=80=81trim=20flags=E3=80=81chmod=20=E5=90=8C?=
+ =?UTF-8?q?=E6=AD=A5=20(=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 新文件 fs/ext4/trim_acl.c: ext4_get_trim_acl / ext4_set_trim_acl (inode_operations
+  回调, 带 trim acl 缓存), ext4_get_trim_flags / ext4_set_trim_flags,
+  xattr 处理器 ext4_xattr_trimacl_access_handler ("system.trim_acl", list 只在 SB_TRIMACL 卷上显示)。
+- 磁盘格式: trim acl 存在 EXT4_XATTR_INDEX_SYSTEM(7) 下、名字为空 (与 inline data 的
+  "system.data" 共用索引); trim flags 用新索引 EXT4_XATTR_INDEX_TRIM_FLAGS(11), 名字为空。
+- 新日志句柄类型 EXT4_HT_TRIM_ACL=12 (EXT4_HT_MAX 改为 13), 额度 EXT4_DATA_TRANS_BLOCKS。
+- xattr.c: handler_map[7]=trimacl, [11]=trim_inode_flags_xattr_handler;
+  ext4_xattr_handlers 在 hurd 前加 trim flags、trimacl。声明放在 xattr.h (不在 .c 加 include 行,
+  保持与飞牛相同的 __LINE__)。
+- iops: file/dir/special 挂 get/set_trim_acl + get/set_trim_flags; 三种 symlink 只挂 trim flags。
+- ext4_setattr: SB_TRIMACL 卷上 ATTR_MODE 改走 trim_acl_chmod, 否则 posix_acl_chmod。
+
+比对: 新增 16 个函数全部一致 (含行号); ext4_setattr、ext4_evict_inode 一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/ext4/Makefile    |   1 +
+ fs/ext4/ext4_jbd2.h |   3 +-
+ fs/ext4/file.c      |   4 +
+ fs/ext4/inode.c     |  14 +++-
+ fs/ext4/namei.c     |   8 ++
+ fs/ext4/symlink.c   |   6 ++
+ fs/ext4/trim_acl.c  | 190 ++++++++++++++++++++++++++++++++++++++++++++
+ fs/ext4/xattr.c     |   4 +
+ fs/ext4/xattr.h     |  16 ++++
+ 9 files changed, 243 insertions(+), 3 deletions(-)
+ create mode 100755 fs/ext4/trim_acl.c
+
+diff --git a/fs/ext4/Makefile b/fs/ext4/Makefile
+index 72206a292..3010f8d45 100644
+--- a/fs/ext4/Makefile
++++ b/fs/ext4/Makefile
+@@ -18,3 +18,4 @@ ext4-inode-test-objs			+= inode-test.o
+ obj-$(CONFIG_EXT4_KUNIT_TESTS)		+= ext4-inode-test.o
+ ext4-$(CONFIG_FS_VERITY)		+= verity.o
+ ext4-$(CONFIG_FS_ENCRYPTION)		+= crypto.o
++ext4-y					+= trim_acl.o
+diff --git a/fs/ext4/ext4_jbd2.h b/fs/ext4/ext4_jbd2.h
+index 63d17c520..fc8bcb34a 100644
+--- a/fs/ext4/ext4_jbd2.h
++++ b/fs/ext4/ext4_jbd2.h
+@@ -120,7 +120,8 @@
+ #define EXT4_HT_MOVE_EXTENTS     9
+ #define EXT4_HT_XATTR           10
+ #define EXT4_HT_EXT_CONVERT     11
+-#define EXT4_HT_MAX             12
++#define EXT4_HT_TRIM_ACL        12
++#define EXT4_HT_MAX             13
+ 
+ int
+ ext4_mark_iloc_dirty(handle_t *handle,
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index 149a7fe5a..63ecfe10c 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -998,5 +998,9 @@ const struct inode_operations ext4_file_inode_operations = {
+ 	.fiemap		= ext4_fiemap,
+ 	.fileattr_get	= ext4_fileattr_get,
+ 	.fileattr_set	= ext4_fileattr_set,
++	.get_trim_acl	= ext4_get_trim_acl,
++	.set_trim_acl	= ext4_set_trim_acl,
++	.get_trim_flags	= ext4_get_trim_flags,
++	.set_trim_flags	= ext4_set_trim_flags,
+ };
+ 
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index d46d243d5..cda77957e 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -6131,8 +6131,18 @@ int ext4_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 	if (orphan && inode->i_nlink)
+ 		ext4_orphan_del(NULL, inode);
+ 
+-	if (!error && (ia_valid & ATTR_MODE))
+-		rc = posix_acl_chmod(idmap, dentry, inode->i_mode);
++	if (!error && (ia_valid & ATTR_MODE)) {
++		// shasure - trimacl -->
++		if (IS_TRIMACL(dentry)) {
++			/* trimacl 卷上 chmod 同步改 trim acl */
++			rc = trim_acl_chmod(idmap, dentry, inode->i_mode);
++		} else {
++		// <--
++			rc = posix_acl_chmod(idmap, dentry, inode->i_mode);
++		// shasure - trimacl -->
++		}
++		// <--
++	}
+ 
+ err_out:
+ 	if  (error)
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index 49bd70aab..852ff8a07 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -4233,6 +4233,10 @@ const struct inode_operations ext4_dir_inode_operations = {
+ 	.fiemap         = ext4_fiemap,
+ 	.fileattr_get	= ext4_fileattr_get,
+ 	.fileattr_set	= ext4_fileattr_set,
++	.get_trim_acl	= ext4_get_trim_acl,
++	.set_trim_acl	= ext4_set_trim_acl,
++	.get_trim_flags	= ext4_get_trim_flags,
++	.set_trim_flags	= ext4_set_trim_flags,
+ };
+ 
+ const struct inode_operations ext4_special_inode_operations = {
+@@ -4241,4 +4245,8 @@ const struct inode_operations ext4_special_inode_operations = {
+ 	.listxattr	= ext4_listxattr,
+ 	.get_inode_acl	= ext4_get_acl,
+ 	.set_acl	= ext4_set_acl,
++	.get_trim_acl	= ext4_get_trim_acl,
++	.set_trim_acl	= ext4_set_trim_acl,
++	.get_trim_flags	= ext4_get_trim_flags,
++	.set_trim_flags	= ext4_set_trim_flags,
+ };
+diff --git a/fs/ext4/symlink.c b/fs/ext4/symlink.c
+index 645240cc0..74c8f4807 100644
+--- a/fs/ext4/symlink.c
++++ b/fs/ext4/symlink.c
+@@ -119,6 +119,8 @@ const struct inode_operations ext4_encrypted_symlink_inode_operations = {
+ 	.setattr	= ext4_setattr,
+ 	.getattr	= ext4_encrypted_symlink_getattr,
+ 	.listxattr	= ext4_listxattr,
++	.get_trim_flags	= ext4_get_trim_flags,
++	.set_trim_flags	= ext4_set_trim_flags,
+ };
+ 
+ const struct inode_operations ext4_symlink_inode_operations = {
+@@ -126,6 +128,8 @@ const struct inode_operations ext4_symlink_inode_operations = {
+ 	.setattr	= ext4_setattr,
+ 	.getattr	= ext4_getattr,
+ 	.listxattr	= ext4_listxattr,
++	.get_trim_flags	= ext4_get_trim_flags,
++	.set_trim_flags	= ext4_set_trim_flags,
+ };
+ 
+ const struct inode_operations ext4_fast_symlink_inode_operations = {
+@@ -133,4 +137,6 @@ const struct inode_operations ext4_fast_symlink_inode_operations = {
+ 	.setattr	= ext4_setattr,
+ 	.getattr	= ext4_getattr,
+ 	.listxattr	= ext4_listxattr,
++	.get_trim_flags	= ext4_get_trim_flags,
++	.set_trim_flags	= ext4_set_trim_flags,
+ };
+diff --git a/fs/ext4/trim_acl.c b/fs/ext4/trim_acl.c
+new file mode 100755
+index 000000000..225fb6eef
+--- /dev/null
++++ b/fs/ext4/trim_acl.c
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * ext4 的 Trim-ACL 支持 (system.trim_acl 存在 EXT4_XATTR_INDEX_SYSTEM 下, 名字为空;
++ * trim flags 存在 EXT4_XATTR_INDEX_TRIM_FLAGS 下)。
++ * Copyright (C) T.R.I.M Inc.
++ */
++#include <linux/quotaops.h>
++#include <linux/trim_acl.h>
++#include "ext4_jbd2.h"
++#include "ext4.h"
++#include "xattr.h"
++#include "acl.h"
++
++ssize_t ext4_get_trim_flags(struct inode *inode, void *buffer, size_t size)
++{
++	return ext4_xattr_get(inode, EXT4_XATTR_INDEX_TRIM_FLAGS, "", buffer, size);
++}
++
++int ext4_set_trim_flags(struct inode *inode, const void *value, size_t size,
++			int flags)
++{
++	return ext4_xattr_set(inode, EXT4_XATTR_INDEX_TRIM_FLAGS, "", value, size,
++			      flags);
++}
++
++/*
++ * Inode operation get_trim_acl().
++ *
++ * inode->i_rwsem: don't care
++ */
++struct trim_acl *ext4_get_trim_acl(struct mnt_idmap *idmap, struct inode *inode)
++{
++	char *value = NULL;
++	struct trim_acl *acl;
++	int retval;
++
++	acl = get_cached_trim_acl(inode);
++	if (!is_uncached_trim_acl(acl))
++		return acl;
++
++	retval = ext4_xattr_get(inode, EXT4_XATTR_INDEX_TRIM_ACL, "", NULL, 0);
++	if (retval > 0) {
++		value = kmalloc(retval, GFP_NOFS);
++		if (!value)
++			return ERR_PTR(-ENOMEM);
++		retval = ext4_xattr_get(inode, EXT4_XATTR_INDEX_TRIM_ACL, "", value, retval);
++	}
++	if (retval > 0)
++		acl = trim_acl_from_disk(value, retval);
++	else if (retval == -ENODATA || retval == -ENOSYS || !retval)
++		acl = NULL;
++	else
++		acl = ERR_PTR(retval);
++	kfree(value);
++
++	if (!IS_ERR(acl))
++		set_cached_trim_acl(inode, acl);
++
++	return acl;
++}
++
++/*
++ * Set the trim acl of an inode.
++ *
++ * inode->i_rwsem: down
++ */
++static int __ext4_set_trim_acl(handle_t *handle, struct inode *inode,
++			       struct trim_acl *acl)
++{
++	void *value = NULL;
++	size_t size = 0;
++	int error;
++
++	if (acl) {
++		error = trim_acl_valid(acl);
++		if (error < 0)
++			return error;
++		value = trim_acl_to_disk(acl, &size);
++		if (IS_ERR(value))
++			return (int)PTR_ERR(value);
++	}
++
++	error = ext4_xattr_set_handle(handle, inode, EXT4_XATTR_INDEX_TRIM_ACL, "",
++				      value, size, 0);
++	kfree(value);
++	if (!error)
++		set_cached_trim_acl(inode, acl);
++
++	return error;
++}
++
++/*
++ * Inode operation set_trim_acl().
++ */
++int ext4_set_trim_acl(struct mnt_idmap *idmap, struct inode *inode,
++		      struct trim_acl *acl)
++{
++	handle_t *handle;
++	int error, retries = 0;
++
++	if (!inode)
++		return -EINVAL;
++
++	error = dquot_initialize(inode);
++	if (error)
++		return error;
++retry:
++	handle = ext4_journal_start(inode, EXT4_HT_TRIM_ACL,
++				    EXT4_DATA_TRANS_BLOCKS(inode->i_sb));
++	if (IS_ERR(handle))
++		return PTR_ERR(handle);
++
++	error = __ext4_set_trim_acl(handle, inode, acl);
++	ext4_journal_stop(handle);
++	if (error == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
++		goto retry;
++	return error;
++}
++
++static bool ext4_xattr_trim_acl_list(struct dentry *dentry)
++{
++	return IS_TRIMACL(dentry);
++}
++
++static int ext4_xattr_trim_acl_get(const struct xattr_handler *handler,
++				   struct dentry *unused, struct inode *inode,
++				   const char *name, void *buffer, size_t size)
++{
++	struct trim_acl *acl;
++	int error;
++
++	acl = ext4_get_trim_acl(&nop_mnt_idmap, inode);
++	if (IS_ERR(acl))
++		return PTR_ERR(acl);
++	if (acl == NULL)
++		return -ENODATA;
++	error = trim_acl_to_xattr(acl, buffer, size);
++	trim_acl_release(acl);
++
++	return error;
++}
++
++static int ext4_xattr_trim_acl_set(const struct xattr_handler *handler,
++				   struct mnt_idmap *idmap,
++				   struct dentry *unused, struct inode *inode,
++				   const char *name, const void *value,
++				   size_t size, int flags)
++{
++	handle_t *handle;
++	struct trim_acl *acl;
++	int error, retries = 0;
++
++	if (value) {
++		acl = trim_acl_from_xattr(value, size);
++		if (IS_ERR(acl))
++			return PTR_ERR(acl);
++		else if (acl) {
++			error = trim_acl_valid(acl);
++			if (error)
++				goto release_and_out;
++		}
++	} else
++		acl = NULL;
++
++	error = dquot_initialize(inode);
++	if (error)
++		goto release_and_out;
++retry:
++	handle = ext4_journal_start(inode, EXT4_HT_TRIM_ACL,
++				    EXT4_DATA_TRANS_BLOCKS(inode->i_sb));
++	if (IS_ERR(handle)) {
++		error = PTR_ERR(handle);
++		goto release_and_out;
++	}
++	error = __ext4_set_trim_acl(handle, inode, acl);
++	ext4_journal_stop(handle);
++	if (error == -ENOSPC && ext4_should_retry_alloc(inode->i_sb, &retries))
++		goto retry;
++
++release_and_out:
++	trim_acl_release(acl);
++	return error;
++}
++
++const struct xattr_handler ext4_xattr_trimacl_access_handler = {
++	.name	= TRIM_ACL_XATTR_ACCESS,
++	.list	= ext4_xattr_trim_acl_list,
++	.get	= ext4_xattr_trim_acl_get,
++	.set	= ext4_xattr_trim_acl_set,
++};
+diff --git a/fs/ext4/xattr.c b/fs/ext4/xattr.c
+index 789e7087a..750677c9e 100644
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@ -95,7 +95,9 @@ static const struct xattr_handler * const ext4_xattr_handler_map[] = {
+ #ifdef CONFIG_EXT4_FS_SECURITY
+ 	[EXT4_XATTR_INDEX_SECURITY]	     = &ext4_xattr_security_handler,
+ #endif
++	[EXT4_XATTR_INDEX_TRIM_ACL]	     = &ext4_xattr_trimacl_access_handler,
+ 	[EXT4_XATTR_INDEX_HURD]		     = &ext4_xattr_hurd_handler,
++	[EXT4_XATTR_INDEX_TRIM_FLAGS]	     = &trim_inode_flags_xattr_handler,
+ };
+ 
+ const struct xattr_handler * const ext4_xattr_handlers[] = {
+@@ -104,6 +106,8 @@ const struct xattr_handler * const ext4_xattr_handlers[] = {
+ #ifdef CONFIG_EXT4_FS_SECURITY
+ 	&ext4_xattr_security_handler,
+ #endif
++	&trim_inode_flags_xattr_handler,
++	&ext4_xattr_trimacl_access_handler,
+ 	&ext4_xattr_hurd_handler,
+ 	NULL
+ };
+diff --git a/fs/ext4/xattr.h b/fs/ext4/xattr.h
+index 1fedf44d4..15fa37227 100644
+--- a/fs/ext4/xattr.h
++++ b/fs/ext4/xattr.h
+@@ -26,6 +26,9 @@
+ #define EXT4_XATTR_INDEX_RICHACL		8
+ #define EXT4_XATTR_INDEX_ENCRYPTION		9
+ #define EXT4_XATTR_INDEX_HURD			10 /* Reserved for Hurd */
++// shasure - trimacl: trim acl 与 inline data 的 "system.data" 共用 SYSTEM (名字为空)
++#define EXT4_XATTR_INDEX_TRIM_ACL		EXT4_XATTR_INDEX_SYSTEM
++#define EXT4_XATTR_INDEX_TRIM_FLAGS		11
+ 
+ struct ext4_xattr_header {
+ 	__le32	h_magic;	/* magic number for identification */
+@@ -234,3 +237,16 @@ static inline void ext4_xattr_inode_set_class(struct inode *ea_inode) { }
+ #endif
+ 
+ extern int ext4_get_inode_usage(struct inode *inode, qsize_t *usage);
++
++// shasure - trimacl -->
++#include <linux/trim_acl.h>
++
++extern const struct xattr_handler ext4_xattr_trimacl_access_handler;
++
++extern ssize_t ext4_get_trim_flags(struct inode *inode, void *buffer, size_t size);
++extern int ext4_set_trim_flags(struct inode *inode, const void *value, size_t size,
++			       int flags);
++extern struct trim_acl *ext4_get_trim_acl(struct mnt_idmap *idmap, struct inode *inode);
++extern int ext4_set_trim_acl(struct mnt_idmap *idmap, struct inode *inode,
++			     struct trim_acl *acl);
++// <--

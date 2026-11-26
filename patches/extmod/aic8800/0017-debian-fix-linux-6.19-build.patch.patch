@@ -1,0 +1,90 @@
+From 22c9a84495b634377ab03dd5d15e820d20705765 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:11:59 +0000
+Subject: [PATCH 17/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-linux-?=
+ =?UTF-8?q?6.19-build.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c   | 8 ++++++++
+ .../driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c   | 8 ++++++++
+ src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c  | 4 ++++
+ 3 files changed, 20 insertions(+)
+
+diff --git a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
+index e390b59..aee98cb 100644
+--- a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
++++ b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
+@@ -320,7 +320,11 @@ static int rwnx_send_msg(struct rwnx_hw *rwnx_hw, const void *msg_params,
+ 
+ 	//RWNX_DBG(RWNX_FN_ENTRY_STR);
+     AICWFDBG(LOGTRACE, "%s (%d)%s reqcfm:%d in_irq:%d in_softirq:%d in_atomic:%d\r\n",
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(6, 18, 0))
+     __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_irq(), (int)in_softirq(), (int)in_atomic());
++#else
++    __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_hardirq(), (int)in_softirq(), (int)in_atomic());
++#endif
+ 
+ 
+ #ifdef AICWF_USB_SUPPORT
+@@ -452,7 +456,11 @@ static int rwnx_send_msg1(struct rwnx_hw *rwnx_hw, const void *msg_params,
+ 
+ //	RWNX_DBG(RWNX_FN_ENTRY_STR);
+     printk("%s (%d)%s reqcfm:%d in_irq:%d in_softirq:%d in_atomic:%d\r\n",
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(6, 18, 0))
+     __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_irq(), (int)in_softirq(), (int)in_atomic());
++#else
++    __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_hardirq(), (int)in_softirq(), (int)in_atomic());
++#endif
+ 
+ #ifdef AICWF_SDIO_SUPPORT
+ 	rwnx_pm_stay_awake(rwnx_hw->sdiodev);
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
+index 893faa4..c9acbd0 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_msg_tx.c
+@@ -308,7 +308,11 @@ static int rwnx_send_msg(struct rwnx_hw *rwnx_hw, const void *msg_params,
+ 
+ 	//RWNX_DBG(RWNX_FN_ENTRY_STR);
+     AICWFDBG(LOGTRACE, "%s (%d)%s reqcfm:%d in_irq:%d in_softirq:%d in_atomic:%d\r\n",
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(6, 18, 0))
+     __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_irq(), (int)in_softirq(), (int)in_atomic());
++#else
++    __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_hardirq(), (int)in_softirq(), (int)in_atomic());
++#endif
+ 
+ 
+ #ifdef AICWF_USB_SUPPORT
+@@ -416,7 +420,11 @@ static int rwnx_send_msg1(struct rwnx_hw *rwnx_hw, const void *msg_params,
+ 
+ //	RWNX_DBG(RWNX_FN_ENTRY_STR);
+     printk("%s (%d)%s reqcfm:%d in_irq:%d in_softirq:%d in_atomic:%d\r\n",
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(6, 18, 0))
+     __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_irq(), (int)in_softirq(), (int)in_atomic());
++#else
++    __func__, reqid, RWNX_ID2STR(reqid), reqcfm, (int)in_hardirq(), (int)in_softirq(), (int)in_atomic());
++#endif
+ 
+ 	rwnx_wakeup_lock(rwnx_hw->ws_tx);
+ 	msg = container_of((void *)msg_params, struct lmac_msg, param);
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
+index 5ed6811..6a72cc3 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/rwnx_rx.c
+@@ -1638,7 +1638,11 @@ void reord_deinit_sta(struct aicwf_rx_priv* rx_priv, struct reord_ctrl_info *reo
+             reord_rxframe_free(&rx_priv->freeq_lock, &rx_priv->rxframes_freequeue, &req->rxframe_list);
+         }
+ 
++#if (LINUX_VERSION_CODE <= KERNEL_VERSION(6, 18, 0))
+ 		AICWFDBG(LOGINFO, "reord dinit in_irq():%d in_atomic:%d in_softirq:%d\r\n", (int)in_irq()
++#else
++		AICWFDBG(LOGINFO, "reord dinit in_irq():%d in_atomic:%d in_softirq:%d\r\n", (int)in_hardirq()
++#endif
+ 			,(int)in_atomic(), (int)in_softirq());
+         spin_unlock_bh(&preorder_ctrl->reord_list_lock);
+     }

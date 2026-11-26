@@ -1,0 +1,1137 @@
+From 54bfd7152c087b546bc0b9903af5a513540a8894 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:13:42 +0700
+Subject: [PATCH 016/110] =?UTF-8?q?trimacl:=20trim=5Facl.c=20=E5=AE=8C?=
+ =?UTF-8?q?=E6=88=90=E3=80=81=E6=8B=86=E5=87=BA=20trim=5Fflags.c=E3=80=81a?=
+ =?UTF-8?q?ttr.c=20=E7=AD=96=E7=95=A5=E5=88=A4=E6=96=AD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- trimacl_resolve_policy / trim_inode_flags_* 放在独立的 fs/trim_flags.c
+  (飞牛里 &policy 逃逸导致 trim_acl.c 不能尾调用, 拆开后 trim_may_delete 变为 ≈)
+- trim_permission: unlikely 注解、devcgroup 只在 MAY_READ|MAY_WRITE 时检查
+- setattr_prepare 按 vol_is_admin_or_homeowner 返回值处理 chown/chgrp
+- 调试字符串、debugfs trimacl_debug_print_level 与飞牛一致
+
+逐函数比对(37 个): 一致 16、≈ 2、不一致 19。
+tokdiff: 不一致的函数调用、字符串、结构体偏移集合与飞牛相同,
+只差栈大小、分支排布、内联/克隆(read_disk 在还原版多了 .constprop)。
+导出符号和许可与飞牛一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/Makefile     |   2 +-
+ fs/attr.c       |   2 +-
+ fs/trim_acl.c   | 580 +++++++++++-------------------------------------
+ fs/trim_flags.c | 386 ++++++++++++++++++++++++++++++++
+ 4 files changed, 520 insertions(+), 450 deletions(-)
+ create mode 100755 fs/trim_flags.c
+
+diff --git a/fs/Makefile b/fs/Makefile
+index 6db0d973e..ef988a9b7 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -45,7 +45,7 @@ obj-$(CONFIG_BINFMT_FLAT)	+= binfmt_flat.o
+ obj-$(CONFIG_FS_STACK)		+= backing-file.o
+ obj-$(CONFIG_FS_MBCACHE)	+= mbcache.o
+ obj-$(CONFIG_FS_POSIX_ACL)	+= posix_acl.o
+-obj-$(CONFIG_FS_TRIM_ACL)	+= trim_acl.o
++obj-$(CONFIG_FS_TRIM_ACL)	+= trim_acl.o trim_flags.o
+ obj-$(CONFIG_NFS_COMMON)	+= nfs_common/
+ obj-$(CONFIG_COREDUMP)		+= coredump.o
+ obj-$(CONFIG_SYSCTL)		+= drop_caches.o sysctls.o
+diff --git a/fs/attr.c b/fs/attr.c
+index acada3a44..04e8a53a6 100644
+--- a/fs/attr.c
++++ b/fs/attr.c
+@@ -444,7 +444,7 @@ int may_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 			error = trimacl_resolve_policy(dentry, 0, &policy);
+ 			if (error)
+ 				return error;
+-			if (policy == TRIMACL_POLICY_TRIM)
++			if (policy != TRIMACL_POLICY_POSIX)
+ 				return trim_permission(idmap, dentry,
+ 						       MAY_WRITE_ATTR | MAY_WRITE_EXT_ATTR);
+ 		}
+diff --git a/fs/trim_acl.c b/fs/trim_acl.c
+index 4bf33fa6b..506b947e7 100755
+--- a/fs/trim_acl.c
++++ b/fs/trim_acl.c
+@@ -734,7 +734,6 @@ static int trimacl_acl_permission(struct mnt_idmap *idmap, struct inode *inode,
+ 	const struct trim_acl_entry *pa, *pe;
+ 	unsigned int allowed = 0, perm;
+ 	int excluded = 0;
+-	bool match;
+ 
+ 	FOREACH_TRIMACL_ENTRY(pa, acl, pe) {
+ 		if (pa->e_inherit & TRIM_ACL_INHERIT_EXCLUDE) {
+@@ -745,28 +744,48 @@ static int trimacl_acl_permission(struct mnt_idmap *idmap, struct inode *inode,
+ 			continue;
+ 
+ 		perm = pa->e_perm & TRIM_PERM_FULL_CONTROL;
+-		switch (pa->e_tag) {
+-		case TRIM_ACL_EVERYONE:
+-			match = true;
+-			break;
+-		case TRIM_ACL_USER:
+-			match = ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id)));
+-			break;
+-		case TRIM_ACL_GROUP:
+-			match = ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id)));
+-			break;
+-		case TRIM_ACL_OWNER:
+-			match = ta_vfsuid_eq(ta, owner);
+-			break;
+-		default:
+-			return -EIO;
++		if (pa->e_allow & TRIM_ACL_ALLOW) {
++			switch (pa->e_tag) {
++			case TRIM_ACL_EVERYONE:
++				allowed |= perm;
++				break;
++			case TRIM_ACL_USER:
++				if (ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id))))
++					allowed |= perm;
++				break;
++			case TRIM_ACL_GROUP:
++				if (ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id))))
++					allowed |= perm;
++				break;
++			case TRIM_ACL_OWNER:
++				if (ta_vfsuid_eq(ta, owner))
++					allowed |= perm;
++				break;
++			default:
++				return -EIO;
++			}
++		} else {
++			switch (pa->e_tag) {
++			case TRIM_ACL_EVERYONE:
++				break;
++			case TRIM_ACL_USER:
++				if (!ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id))))
++					continue;
++				break;
++			case TRIM_ACL_GROUP:
++				if (!ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id))))
++					continue;
++				break;
++			case TRIM_ACL_OWNER:
++				if (!ta_vfsuid_eq(ta, owner))
++					continue;
++				break;
++			default:
++				return -EIO;
++			}
++			if (perm & want)
++				return -EACCES;
+ 		}
+-		if (!match)
+-			continue;
+-		if (pa->e_allow & TRIM_ACL_ALLOW)
+-			allowed |= perm;
+-		else if (perm & want)
+-			return -EACCES;
+ 	}
+ 
+ 	allowed &= want;
+@@ -908,7 +927,10 @@ int trim_generic_permission_ta(struct mnt_idmap *idmap, struct dentry *dentry, i
+ 	goto check;
+ 
+ read_access:
+-	mask &= ~(TRIM_PERM_READABLE | (S_ISDIR(d_inode(dentry)->i_mode) ? MAY_EXEC : 0));
++	if (S_ISDIR(d_inode(dentry)->i_mode))
++		mask &= ~(TRIM_PERM_READABLE | MAY_EXEC);
++	else
++		mask &= ~TRIM_PERM_READABLE;
+ 
+ check:
+ 	if (!(mask & TRIM_PERM_FULL_CONTROL))
+@@ -924,7 +946,7 @@ int trim_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask)
+ 	trimacl_debug_path(dentry, "trim_permission: '%s', uid=%u, mask=%X\n",
+ 			   __kuid_val(current_fsuid()), mask);
+ 
+-	if (mask & TRIM_PERM_FULL_WRITABLE) {
++	if (unlikely(mask & TRIM_PERM_FULL_WRITABLE)) {
+ 		struct super_block *sb = inode->i_sb;
+ 		umode_t mode = inode->i_mode;
+ 
+@@ -934,22 +956,22 @@ int trim_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask)
+ 			return -EROFS;
+ 	}
+ 
+-	if (mask & MAY_WRITE) {
++	if (unlikely(mask & MAY_WRITE)) {
+ 		/* Nobody gets write access to an immutable file. */
+-		if (IS_IMMUTABLE(inode))
++		if (unlikely(IS_IMMUTABLE(inode)))
+ 			return -EPERM;
+-		if (HAS_UNMAPPED_ID(idmap, inode))
++		if (unlikely(HAS_UNMAPPED_ID(idmap, inode)))
+ 			return -EACCES;
+ 	}
+ 
+-	if (mask & MAY_NOT_BLOCK)
++	if (unlikely(mask & MAY_NOT_BLOCK))
+ 		return -ECHILD;
+ 
+ 	if (inode->i_op->trim_permission)
+ 		retval = inode->i_op->trim_permission(idmap, dentry, mask);
+ 	else
+ 		retval = trim_generic_permission(idmap, dentry, mask);
+-	if (!retval)
++	if (!retval && (mask & (MAY_READ | MAY_WRITE)))
+ 		retval = devcgroup_inode_permission(inode, mask);
+ 
+ 	trimacl_debug_path(dentry, "trim_permission: '%s', uid=%u, mask=%X, return %d\n",
+@@ -1074,7 +1096,7 @@ int trimacl_get_trimacl_xattr_all(struct mnt_idmap *idmap, struct dentry *dentry
+ 			if (new_excluded)
+ 				excluded = new_excluded;
+ 			trim_acl_release(acl);
+-			trimacl_debug(" '%s' __trimacl_get_acl_xattr: return %d\n", dentry->d_name.name, ret);
++			trimacl_debug("    '%s' __trimacl_get_acl_xattr: return %d\n", dentry->d_name.name, ret);
+ 			if (ret == 1)
+ 				break;
+ 			if (ret)
+@@ -1166,7 +1188,6 @@ static int __trimacl_calc_permission(struct mnt_idmap *idmap, struct inode *inod
+ 	const struct trim_acl_entry *pa, *pe;
+ 	unsigned int allow = 0, deny = 0, perm;
+ 	int excluded = 0, ret;
+-	bool match;
+ 
+ 	FOREACH_TRIMACL_ENTRY(pa, acl, pe) {
+ 		if (pa->e_inherit & TRIM_ACL_INHERIT_EXCLUDE) {
+@@ -1177,29 +1198,49 @@ static int __trimacl_calc_permission(struct mnt_idmap *idmap, struct inode *inod
+ 			continue;
+ 
+ 		perm = pa->e_perm & TRIM_PERM_FULL_CONTROL;
+-		switch (pa->e_tag) {
+-		case TRIM_ACL_EVERYONE:
+-			match = true;
+-			break;
+-		case TRIM_ACL_USER:
+-			match = ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id)));
+-			break;
+-		case TRIM_ACL_GROUP:
+-			match = ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id)));
+-			break;
+-		case TRIM_ACL_OWNER:
+-			match = ta_vfsuid_eq(ta, owner);
+-			break;
+-		default:
+-			ret = -EIO;
+-			goto out;
++		if (pa->e_allow & TRIM_ACL_ALLOW) {
++			switch (pa->e_tag) {
++			case TRIM_ACL_EVERYONE:
++				allow |= perm;
++				break;
++			case TRIM_ACL_USER:
++				if (ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id))))
++					allow |= perm;
++				break;
++			case TRIM_ACL_GROUP:
++				if (ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id))))
++					allow |= perm;
++				break;
++			case TRIM_ACL_OWNER:
++				if (ta_vfsuid_eq(ta, owner))
++					allow |= perm;
++				break;
++			default:
++				ret = -EIO;
++				goto out;
++			}
++		} else {
++			switch (pa->e_tag) {
++			case TRIM_ACL_EVERYONE:
++				deny |= perm;
++				break;
++			case TRIM_ACL_USER:
++				if (ta_vfsuid_eq(ta, make_vfsuid(idmap, ns, make_kuid(ns, pa->e_id))))
++					deny |= perm;
++				break;
++			case TRIM_ACL_GROUP:
++				if (ta_vfsgid_in_group(ta, make_vfsgid(idmap, ns, make_kgid(ns, pa->e_id))))
++					deny |= perm;
++				break;
++			case TRIM_ACL_OWNER:
++				if (ta_vfsuid_eq(ta, owner))
++					deny |= perm;
++				break;
++			default:
++				ret = -EIO;
++				goto out;
++			}
+ 		}
+-		if (!match)
+-			continue;
+-		if (pa->e_allow & TRIM_ACL_ALLOW)
+-			allow |= perm;
+-		else
+-			deny |= perm;
+ 	}
+ 	ret = excluded ? 0 : 1;
+ out:
+@@ -1357,33 +1398,44 @@ static int __trimacl_to_mode(struct inode *owner_inode, struct trim_acl *acl, um
+ 			continue;
+ 
+ 		perm = pa->e_perm & TRIM_PERM_FULL_CONTROL;
+-		switch (pa->e_tag) {
+-		case TRIM_ACL_EVERYONE:
+-			if (pa->e_allow & TRIM_ACL_ALLOW)
++		if (pa->e_allow & TRIM_ACL_ALLOW) {
++			switch (pa->e_tag) {
++			case TRIM_ACL_EVERYONE:
+ 				e_allow |= perm;
+-			else
+-				e_deny |= perm;
+-			break;
+-		case TRIM_ACL_OWNER:
+-			if (pa->e_allow & TRIM_ACL_ALLOW)
++				break;
++			case TRIM_ACL_OWNER:
+ 				o_allow |= perm;
+-			else
++				break;
++			case TRIM_ACL_GROUP:
++				gid = make_kgid(ns, pa->e_id);
++				if (gid_valid(gid) && gid_eq(gid, owner_inode->i_gid))
++					g_allow |= perm;
++				break;
++			case TRIM_ACL_USER:
++				break;
++			default:
++				ret = -EIO;
++				goto out;
++			}
++		} else {
++			switch (pa->e_tag) {
++			case TRIM_ACL_EVERYONE:
++				e_deny |= perm;
++				break;
++			case TRIM_ACL_OWNER:
+ 				o_deny |= perm;
+-			break;
+-		case TRIM_ACL_GROUP:
+-			gid = make_kgid(ns, pa->e_id);
+-			if (!gid_valid(gid) || !gid_eq(gid, owner_inode->i_gid))
+ 				break;
+-			if (pa->e_allow & TRIM_ACL_ALLOW)
+-				g_allow |= perm;
+-			else
+-				g_deny |= perm;
+-			break;
+-		case TRIM_ACL_USER:
+-			break;
+-		default:
+-			ret = -EIO;
+-			goto out;
++			case TRIM_ACL_GROUP:
++				gid = make_kgid(ns, pa->e_id);
++				if (gid_valid(gid) && gid_eq(gid, owner_inode->i_gid))
++					g_deny |= perm;
++				break;
++			case TRIM_ACL_USER:
++				break;
++			default:
++				ret = -EIO;
++				goto out;
++			}
+ 		}
+ 	}
+ 	ret = excluded ? 0 : 1;
+@@ -1431,7 +1483,7 @@ unsigned int trimacl_to_mode(struct mnt_idmap *idmap, struct dentry *dentry)
+ 			mp.e_allow |= cur.e_allow;
+ 			mp.e_deny |= cur.e_deny;
+ 			trim_acl_release(acl);
+-			trimacl_debug(" '%s' __trimacl_to_mode: (o_allow: %X, o_deny: %X, e_allow: %X, e_deny: %X) return %d\n",
++			trimacl_debug("    '%s' __trimacl_to_mode: (o_allow: %X, o_deny: %X, e_allow: %X, e_deny: %X) return %d\n",
+ 				      dentry->d_name.name, cur.o_allow, cur.o_deny, cur.e_allow, cur.e_deny, ret);
+ 			if (!ret)
+ 				break;
+@@ -1469,6 +1521,7 @@ int trim_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *s
+ {
+ 	struct inode *inode = d_inode(dentry);
+ 	enum trimacl_policy policy = TRIMACL_POLICY_TRIM;
++	umode_t mode;
+ 	int error;
+ 
+ 	if (inode->i_op->trim_acl_to_mode)
+@@ -1478,381 +1531,12 @@ int trim_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *s
+ 	if (error || policy == TRIMACL_POLICY_POSIX)
+ 		return error;
+ 
+-	stat->mode = (stat->mode & ~S_IRWXUGO) | (trimacl_to_mode(idmap, dentry) & S_IRWXUGO);
++	mode = trimacl_to_mode(idmap, dentry);
++	stat->mode = (stat->mode & ~S_IRWXUGO) | (mode & S_IRWXUGO);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(trim_to_mode);
+ 
+-/* -------------------------------------------------------------------------- */
+-/* system.trim_flags: per-inode flags, cached in the inode */
+-
+-void trim_inode_flags_forget(struct inode *inode)
+-{
+-	spin_lock(&inode->i_lock);
+-	inode->i_trim_flags_generation++;
+-	inode->i_trim_flags_state = TRIM_INODE_FLAGS_UNKNOWN;
+-	spin_unlock(&inode->i_lock);
+-}
+-EXPORT_SYMBOL(trim_inode_flags_forget);
+-
+-void trim_inode_flags_init_new(struct inode *inode)
+-{
+-	if (!IS_TRIMACL_INODE(inode))
+-		return;
+-
+-	spin_lock(&inode->i_lock);
+-	if (inode->i_trim_flags_state == TRIM_INODE_FLAGS_UNKNOWN) {
+-		inode->i_trim_flags_generation++;
+-		atomic64_set(&inode->i_trim_flags, 0);
+-		inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
+-	}
+-	spin_unlock(&inode->i_lock);
+-}
+-EXPORT_SYMBOL(trim_inode_flags_init_new);
+-
+-static int trim_inode_flags_read_disk(struct inode *inode, u64 *flags, bool *found, bool *unsupported)
+-{
+-	struct trim_inode_flags_xattr_v1 *buf;
+-	int retries = 3;
+-	ssize_t size;
+-	int ret;
+-
+-	if (!inode->i_op->get_trim_flags)
+-		return -EOPNOTSUPP;
+-retry:
+-	size = inode->i_op->get_trim_flags(inode, NULL, 0);
+-	if (size == -ENODATA || size == -ENOENT)
+-		return 0;
+-	if (size < 0)
+-		return size;
+-	if (size == 0 || size > XATTR_SIZE_MAX)
+-		return -EUCLEAN;
+-
+-	buf = kmalloc(size, GFP_NOFS);
+-	if (!buf)
+-		return -ENOMEM;
+-
+-	size = inode->i_op->get_trim_flags(inode, buf, size);
+-	if (size == -ERANGE) {
+-		kfree(buf);
+-		if (--retries)
+-			goto retry;
+-		return -EAGAIN;
+-	}
+-	if (size == -ENODATA || size == -ENOENT) {
+-		ret = 0;
+-		goto out;
+-	}
+-	if (size < 0) {
+-		ret = size;
+-		goto out;
+-	}
+-
+-	*found = true;
+-	if (size < sizeof(*buf)) {
+-		ret = -EUCLEAN;
+-		goto out;
+-	}
+-	if (le16_to_cpu(buf->version) != TRIM_INODE_FLAGS_XATTR_VERSION) {
+-		if (unsupported)
+-			*unsupported = true;
+-		ret = -EOPNOTSUPP;
+-		goto out;
+-	}
+-	if (le16_to_cpu(buf->size) != sizeof(*buf) || size != sizeof(*buf) || buf->reserved) {
+-		ret = -EUCLEAN;
+-		goto out;
+-	}
+-	*flags = le64_to_cpu(buf->flags);
+-	ret = 0;
+-out:
+-	kfree(buf);
+-	return ret;
+-}
+-
+-static int trim_inode_flags_xattr_get(const struct xattr_handler *handler, struct dentry *unused,
+-				      struct inode *inode, const char *name, void *buffer, size_t size)
+-{
+-	struct trim_inode_flags_xattr_v1 *xattr = buffer;
+-	bool found = false;
+-	u64 flags = 0;
+-	int ret;
+-
+-	ret = trim_inode_flags_read_disk(inode, &flags, &found, NULL);
+-	if (ret)
+-		return ret;
+-	if (!found)
+-		return -ENODATA;
+-	if (!buffer)
+-		return sizeof(*xattr);
+-	if (size < sizeof(*xattr))
+-		return -ERANGE;
+-
+-	xattr->version = cpu_to_le16(TRIM_INODE_FLAGS_XATTR_VERSION);
+-	xattr->size = cpu_to_le16(sizeof(*xattr));
+-	xattr->reserved = 0;
+-	xattr->flags = cpu_to_le64(flags);
+-	return sizeof(*xattr);
+-}
+-
+-int trim_inode_flags_load(struct inode *inode, u64 *flags)
+-{
+-	bool found = false, unsupported = false;
+-	u64 disk_flags = 0;
+-	unsigned int gen;
+-	int ret;
+-
+-	for (;;) {
+-		switch (READ_ONCE(inode->i_trim_flags_state)) {
+-		case TRIM_INODE_FLAGS_VALID:
+-			*flags = atomic64_read(&inode->i_trim_flags);
+-			return 0;
+-		case TRIM_INODE_FLAGS_CORRUPT:
+-			return -EUCLEAN;
+-		case TRIM_INODE_FLAGS_UNSUPPORTED:
+-			return -EOPNOTSUPP;
+-		}
+-
+-		found = false;
+-		disk_flags = 0;
+-		unsupported = false;
+-		gen = READ_ONCE(inode->i_trim_flags_generation);
+-		ret = trim_inode_flags_read_disk(inode, &disk_flags, &found, &unsupported);
+-
+-		spin_lock(&inode->i_lock);
+-		if (inode->i_trim_flags_generation != gen ||
+-		    inode->i_trim_flags_state != TRIM_INODE_FLAGS_UNKNOWN) {
+-			/* Raced with an update, look again */
+-			spin_unlock(&inode->i_lock);
+-			continue;
+-		}
+-		if (!ret) {
+-			atomic64_set(&inode->i_trim_flags, disk_flags);
+-			inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
+-			*flags = disk_flags;
+-		} else if (ret == -EUCLEAN) {
+-			atomic64_set(&inode->i_trim_flags, 0);
+-			inode->i_trim_flags_state = TRIM_INODE_FLAGS_CORRUPT;
+-		} else if (ret == -EOPNOTSUPP && unsupported) {
+-			atomic64_set(&inode->i_trim_flags, 0);
+-			inode->i_trim_flags_state = TRIM_INODE_FLAGS_UNSUPPORTED;
+-		}
+-		spin_unlock(&inode->i_lock);
+-		return ret;
+-	}
+-}
+-EXPORT_SYMBOL(trim_inode_flags_load);
+-
+-/* Top-level directories of a volume that always use POSIX ACLs */
+-static bool trimacl_is_posix_top_dir(const char *name)
+-{
+-	return !strcmp(name, "docker") || !strcmp(name, "@appcenter") || !strcmp(name, "@appconf") ||
+-	       !strcmp(name, "@appdata") || !strcmp(name, "@apphome") || !strcmp(name, "@appmeta") ||
+-	       !strcmp(name, "@apptemp") || name[0] == '_';
+-}
+-
+-/*
+- * Find the directory right below the root of the filesystem that
+- * contains @dentry (and the one below that).  Called under RCU.
+- */
+-static void trimacl_top_dirs(struct dentry *dentry, struct dentry **top, struct dentry **second)
+-{
+-	struct dentry *root = dentry->d_sb->s_root;
+-	struct dentry *d = dentry, *child = NULL, *grandchild = NULL;
+-
+-	if (!root)
+-		return;
+-	if (dentry && dentry != root) {
+-		while (!IS_ROOT(d)) {
+-			struct dentry *parent = d->d_parent;
+-
+-			grandchild = child;
+-			child = d;
+-			d = parent;
+-			if (!parent || parent == root)
+-				break;
+-		}
+-	}
+-	if (d != root)
+-		return;
+-	*top = child;
+-	*second = grandchild;
+-}
+-
+-/*
+- * TRIM ACL or POSIX ACL for @dentry?  The filesystem can decide with
+- * ->is_trimacl, otherwise app/docker directories are POSIX and the
+- * TRIM_INODE_F_POSIX_ACL flag of the nearest ancestor decides.
+- */
+-int trimacl_resolve_policy(struct dentry *dentry, unsigned int flags, enum trimacl_policy *policy)
+-{
+-	struct inode *inode = d_inode(dentry);
+-	struct dentry *d, *top, *second;
+-	unsigned int seq;
+-	u64 tflags;
+-	int ret;
+-
+-	if (!inode)
+-		return -ENOENT;
+-	if (!IS_TRIMACL_INODE(inode))
+-		goto posix;
+-
+-	if (inode->i_op->is_trimacl) {
+-		if (flags & MAY_NOT_BLOCK)
+-			return -ECHILD;
+-		ret = inode->i_op->is_trimacl(dentry);
+-		if (ret < 0)
+-			return ret;
+-		*policy = ret ? TRIMACL_POLICY_TRIM : TRIMACL_POLICY_POSIX;
+-		return 0;
+-	}
+-
+-	for (;;) {
+-		bool posix_dir = false;
+-
+-		top = second = NULL;
+-		rcu_read_lock();
+-		seq = read_seqbegin(&rename_lock);
+-		trimacl_top_dirs(dentry, &top, &second);
+-		if (top && d_is_dir(top))
+-			posix_dir = trimacl_is_posix_top_dir(top->d_name.name);
+-		if (!read_seqretry(&rename_lock, seq)) {
+-			rcu_read_unlock();
+-			if (posix_dir)
+-				goto posix;
+-			break;
+-		}
+-		rcu_read_unlock();
+-	}
+-
+-retry:
+-	tflags = 0;
+-	*policy = TRIMACL_POLICY_TRIM;
+-	rcu_read_lock();
+-	seq = read_seqbegin(&rename_lock);
+-	ret = 0;
+-	for (d = dentry;; d = d->d_parent) {
+-		inode = d_inode(d);
+-		if (!inode) {
+-			ret = -ESTALE;
+-			break;
+-		}
+-		if (inode->i_op->get_trim_flags) {
+-			switch (READ_ONCE(inode->i_trim_flags_state)) {
+-			case TRIM_INODE_FLAGS_UNKNOWN:
+-				/* Load the flags outside RCU and look again */
+-				if (flags & MAY_NOT_BLOCK)
+-					goto echild;
+-				if (!lockref_get_not_dead(&d->d_lockref)) {
+-					if (read_seqretry(&rename_lock, seq))
+-						goto resched;
+-					rcu_read_unlock();
+-					return -ESTALE;
+-				}
+-				if (read_seqretry(&rename_lock, seq)) {
+-					rcu_read_unlock();
+-					dput(d);
+-					cond_resched();
+-					goto retry;
+-				}
+-				rcu_read_unlock();
+-				if (!d_inode(d)) {
+-					dput(d);
+-					return -ESTALE;
+-				}
+-				ret = trim_inode_flags_load(d_inode(d), &tflags);
+-				dput(d);
+-				if (ret)
+-					return ret;
+-				goto retry;
+-			case TRIM_INODE_FLAGS_CORRUPT:
+-				ret = -EUCLEAN;
+-				goto done;
+-			case TRIM_INODE_FLAGS_UNSUPPORTED:
+-				ret = -EOPNOTSUPP;
+-				goto done;
+-			}
+-			tflags = atomic64_read(&inode->i_trim_flags);
+-			if (tflags & TRIM_INODE_F_POSIX_ACL) {
+-				*policy = TRIMACL_POLICY_POSIX;
+-				break;
+-			}
+-		}
+-		if (IS_ROOT(d))
+-			break;
+-	}
+-done:
+-	if (read_seqretry(&rename_lock, seq)) {
+-		if (flags & MAY_NOT_BLOCK)
+-			goto echild;
+-resched:
+-		rcu_read_unlock();
+-		cond_resched();
+-		goto retry;
+-	}
+-	rcu_read_unlock();
+-	return ret;
+-
+-echild:
+-	rcu_read_unlock();
+-	return -ECHILD;
+-
+-posix:
+-	*policy = TRIMACL_POLICY_POSIX;
+-	return 0;
+-}
+-EXPORT_SYMBOL(trimacl_resolve_policy);
+-
+-static int trim_inode_flags_xattr_set(const struct xattr_handler *handler, struct mnt_idmap *idmap,
+-				      struct dentry *dentry, struct inode *inode, const char *name,
+-				      const void *value, size_t size, int flags)
+-{
+-	struct trim_inode_flags_xattr_v1 xattr = {};
+-	const struct trim_inode_flags_xattr_v1 *in = value;
+-	u64 new_flags = 0;
+-	int ret;
+-
+-	if (!inode->i_op->set_trim_flags)
+-		return -EOPNOTSUPP;
+-	if (!capable(CAP_SYS_ADMIN) && vol_is_admin_or_homeowner(idmap, dentry) <= 0)
+-		return -EPERM;
+-
+-	if (value) {
+-		if (size < sizeof(*in))
+-			return -EUCLEAN;
+-		if (le16_to_cpu(in->version) != TRIM_INODE_FLAGS_XATTR_VERSION)
+-			return -EOPNOTSUPP;
+-		if (le16_to_cpu(in->size) != sizeof(*in) || size != sizeof(*in) || in->reserved)
+-			return -EUCLEAN;
+-		new_flags = le64_to_cpu(in->flags);
+-		xattr.version = cpu_to_le16(TRIM_INODE_FLAGS_XATTR_VERSION);
+-		xattr.size = cpu_to_le16(sizeof(xattr));
+-		xattr.flags = cpu_to_le64(new_flags);
+-		value = &xattr;
+-		size = sizeof(xattr);
+-	} else {
+-		size = 0;
+-	}
+-
+-	ret = inode->i_op->set_trim_flags(inode, value, size, flags);
+-	if (ret)
+-		return ret;
+-
+-	spin_lock(&inode->i_lock);
+-	inode->i_trim_flags_generation++;
+-	atomic64_set(&inode->i_trim_flags, new_flags);
+-	inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
+-	spin_unlock(&inode->i_lock);
+-	return ret;
+-}
+-
+-const struct xattr_handler trim_inode_flags_xattr_handler = {
+-	.name = TRIM_INODE_FLAGS_XATTR,
+-	.get = trim_inode_flags_xattr_get,
+-	.set = trim_inode_flags_xattr_set,
+-};
+-EXPORT_SYMBOL(trim_inode_flags_xattr_handler);
+-
+ static int __init trimacl_debug_init_function(void)
+ {
+ 	debugfs_create_u32("trimacl_debug_print_level", 0644, NULL, &trimacl_debug_level);
+diff --git a/fs/trim_flags.c b/fs/trim_flags.c
+new file mode 100755
+index 000000000..3994cc1be
+--- /dev/null
++++ b/fs/trim_flags.c
+@@ -0,0 +1,386 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * fnOS system.trim_flags: per-inode flags (TRIM_INODE_F_POSIX_ACL) and the
++ * TRIM-or-POSIX ACL policy.  Reconstructed from the fnOS 6.18.18.c1186-trim binary.
++ */
++#include <linux/kernel.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/dcache.h>
++#include <linux/namei.h>
++#include <linux/seqlock.h>
++#include <linux/capability.h>
++#include <linux/xattr.h>
++#include <linux/export.h>
++#include <linux/trim_acl.h>
++#include <linux/trim_flags.h>
++#include <linux/trimvfs.h>
++
++
++void trim_inode_flags_forget(struct inode *inode)
++{
++	spin_lock(&inode->i_lock);
++	inode->i_trim_flags_generation++;
++	inode->i_trim_flags_state = TRIM_INODE_FLAGS_UNKNOWN;
++	spin_unlock(&inode->i_lock);
++}
++EXPORT_SYMBOL(trim_inode_flags_forget);
++
++void trim_inode_flags_init_new(struct inode *inode)
++{
++	if (!IS_TRIMACL_INODE(inode))
++		return;
++
++	spin_lock(&inode->i_lock);
++	if (inode->i_trim_flags_state == TRIM_INODE_FLAGS_UNKNOWN) {
++		inode->i_trim_flags_generation++;
++		atomic64_set(&inode->i_trim_flags, 0);
++		inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
++	}
++	spin_unlock(&inode->i_lock);
++}
++EXPORT_SYMBOL(trim_inode_flags_init_new);
++
++static int trim_inode_flags_read_disk(struct inode *inode, u64 *flags, bool *found, bool *unsupported)
++{
++	struct trim_inode_flags_xattr_v1 *buf;
++	int retries = 3;
++	ssize_t size;
++	int ret;
++
++	if (!inode->i_op->get_trim_flags)
++		return -EOPNOTSUPP;
++retry:
++	size = inode->i_op->get_trim_flags(inode, NULL, 0);
++	if (size == -ENODATA || size == -ENOENT)
++		return 0;
++	if (size < 0)
++		return size;
++	if (size == 0 || size > XATTR_SIZE_MAX)
++		return -EUCLEAN;
++
++	buf = kmalloc(size, GFP_NOFS);
++	if (!buf)
++		return -ENOMEM;
++
++	size = inode->i_op->get_trim_flags(inode, buf, size);
++	if (size == -ERANGE) {
++		kfree(buf);
++		if (--retries)
++			goto retry;
++		return -EAGAIN;
++	}
++	if (size == -ENODATA || size == -ENOENT) {
++		ret = 0;
++		goto out;
++	}
++	if (size < 0) {
++		ret = size;
++		goto out;
++	}
++
++	*found = true;
++	if (size < sizeof(*buf)) {
++		ret = -EUCLEAN;
++		goto out;
++	}
++	if (le16_to_cpu(buf->version) != TRIM_INODE_FLAGS_XATTR_VERSION) {
++		if (unsupported)
++			*unsupported = true;
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++	if (le16_to_cpu(buf->size) != sizeof(*buf) || size != sizeof(*buf) || buf->reserved) {
++		ret = -EUCLEAN;
++		goto out;
++	}
++	*flags = le64_to_cpu(buf->flags);
++	ret = 0;
++out:
++	kfree(buf);
++	return ret;
++}
++
++static int trim_inode_flags_xattr_get(const struct xattr_handler *handler, struct dentry *unused,
++				      struct inode *inode, const char *name, void *buffer, size_t size)
++{
++	struct trim_inode_flags_xattr_v1 *xattr = buffer;
++	bool found = false;
++	u64 flags = 0;
++	int ret;
++
++	ret = trim_inode_flags_read_disk(inode, &flags, &found, NULL);
++	if (ret)
++		return ret;
++	if (!found)
++		return -ENODATA;
++	if (!buffer)
++		return sizeof(*xattr);
++	if (size < sizeof(*xattr))
++		return -ERANGE;
++
++	xattr->version = cpu_to_le16(TRIM_INODE_FLAGS_XATTR_VERSION);
++	xattr->size = cpu_to_le16(sizeof(*xattr));
++	xattr->reserved = 0;
++	xattr->flags = cpu_to_le64(flags);
++	return sizeof(*xattr);
++}
++
++int trim_inode_flags_load(struct inode *inode, u64 *flags)
++{
++	bool found = false, unsupported = false;
++	u64 disk_flags = 0;
++	unsigned int gen;
++	int ret;
++
++	for (;;) {
++		switch (READ_ONCE(inode->i_trim_flags_state)) {
++		case TRIM_INODE_FLAGS_VALID:
++			*flags = atomic64_read(&inode->i_trim_flags);
++			return 0;
++		case TRIM_INODE_FLAGS_CORRUPT:
++			return -EUCLEAN;
++		case TRIM_INODE_FLAGS_UNSUPPORTED:
++			return -EOPNOTSUPP;
++		}
++
++		found = false;
++		disk_flags = 0;
++		unsupported = false;
++		gen = READ_ONCE(inode->i_trim_flags_generation);
++		ret = trim_inode_flags_read_disk(inode, &disk_flags, &found, &unsupported);
++
++		spin_lock(&inode->i_lock);
++		if (inode->i_trim_flags_generation != gen ||
++		    inode->i_trim_flags_state != TRIM_INODE_FLAGS_UNKNOWN) {
++			/* Raced with an update, look again */
++			spin_unlock(&inode->i_lock);
++			continue;
++		}
++		if (!ret) {
++			atomic64_set(&inode->i_trim_flags, disk_flags);
++			inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
++			*flags = disk_flags;
++		} else if (ret == -EUCLEAN) {
++			atomic64_set(&inode->i_trim_flags, 0);
++			inode->i_trim_flags_state = TRIM_INODE_FLAGS_CORRUPT;
++		} else if (ret == -EOPNOTSUPP && unsupported) {
++			atomic64_set(&inode->i_trim_flags, 0);
++			inode->i_trim_flags_state = TRIM_INODE_FLAGS_UNSUPPORTED;
++		}
++		spin_unlock(&inode->i_lock);
++		return ret;
++	}
++}
++EXPORT_SYMBOL(trim_inode_flags_load);
++
++/* Top-level directories of a volume that always use POSIX ACLs */
++static bool trimacl_is_posix_top_dir(const char *name)
++{
++	return !strcmp(name, "docker") || !strcmp(name, "@appcenter") || !strcmp(name, "@appconf") ||
++	       !strcmp(name, "@appdata") || !strcmp(name, "@apphome") || !strcmp(name, "@appmeta") ||
++	       !strcmp(name, "@apptemp") || name[0] == '_';
++}
++
++/*
++ * Find the directory right below the root of the filesystem that
++ * contains @dentry (and the one below that).  Called under RCU.
++ */
++static void trimacl_top_dirs(struct dentry *dentry, struct dentry **top, struct dentry **second)
++{
++	struct dentry *root = dentry->d_sb->s_root;
++	struct dentry *d = dentry, *child = NULL, *grandchild = NULL;
++
++	if (!root)
++		return;
++	if (dentry && dentry != root) {
++		while (!IS_ROOT(d)) {
++			struct dentry *parent = d->d_parent;
++
++			grandchild = child;
++			child = d;
++			d = parent;
++			if (!parent || parent == root)
++				break;
++		}
++	}
++	if (d != root)
++		return;
++	*top = child;
++	*second = grandchild;
++}
++
++/*
++ * TRIM ACL or POSIX ACL for @dentry?  The filesystem can decide with
++ * ->is_trimacl, otherwise app/docker directories are POSIX and the
++ * TRIM_INODE_F_POSIX_ACL flag of the nearest ancestor decides.
++ */
++int trimacl_resolve_policy(struct dentry *dentry, unsigned int flags, enum trimacl_policy *policy)
++{
++	struct inode *inode = d_inode(dentry);
++	struct dentry *d, *top, *second;
++	unsigned int seq;
++	u64 tflags;
++	int ret;
++
++	if (!inode)
++		return -ENOENT;
++	if (!IS_TRIMACL_INODE(inode))
++		goto posix;
++
++	if (inode->i_op->is_trimacl) {
++		if (flags & MAY_NOT_BLOCK)
++			return -ECHILD;
++		ret = inode->i_op->is_trimacl(dentry);
++		if (ret < 0)
++			return ret;
++		*policy = ret ? TRIMACL_POLICY_TRIM : TRIMACL_POLICY_POSIX;
++		return 0;
++	}
++
++	for (;;) {
++		bool posix_dir = false;
++
++		top = second = NULL;
++		rcu_read_lock();
++		seq = read_seqbegin(&rename_lock);
++		trimacl_top_dirs(dentry, &top, &second);
++		if (top && d_is_dir(top))
++			posix_dir = trimacl_is_posix_top_dir(top->d_name.name);
++		if (!read_seqretry(&rename_lock, seq)) {
++			rcu_read_unlock();
++			if (posix_dir)
++				goto posix;
++			break;
++		}
++		rcu_read_unlock();
++	}
++
++retry:
++	tflags = 0;
++	*policy = TRIMACL_POLICY_TRIM;
++	rcu_read_lock();
++	seq = read_seqbegin(&rename_lock);
++	ret = 0;
++	for (d = dentry;; d = d->d_parent) {
++		inode = d_inode(d);
++		if (!inode) {
++			ret = -ESTALE;
++			break;
++		}
++		if (inode->i_op->get_trim_flags) {
++			switch (READ_ONCE(inode->i_trim_flags_state)) {
++			case TRIM_INODE_FLAGS_UNKNOWN:
++				/* Load the flags outside RCU and look again */
++				if (flags & MAY_NOT_BLOCK)
++					goto echild;
++				if (!lockref_get_not_dead(&d->d_lockref)) {
++					if (read_seqretry(&rename_lock, seq))
++						goto resched;
++					rcu_read_unlock();
++					return -ESTALE;
++				}
++				if (read_seqretry(&rename_lock, seq)) {
++					rcu_read_unlock();
++					dput(d);
++					cond_resched();
++					goto retry;
++				}
++				rcu_read_unlock();
++				if (!d_inode(d)) {
++					dput(d);
++					return -ESTALE;
++				}
++				ret = trim_inode_flags_load(d_inode(d), &tflags);
++				dput(d);
++				if (ret)
++					return ret;
++				goto retry;
++			case TRIM_INODE_FLAGS_CORRUPT:
++				ret = -EUCLEAN;
++				goto done;
++			case TRIM_INODE_FLAGS_UNSUPPORTED:
++				ret = -EOPNOTSUPP;
++				goto done;
++			}
++			tflags = atomic64_read(&inode->i_trim_flags);
++			if (tflags & TRIM_INODE_F_POSIX_ACL) {
++				*policy = TRIMACL_POLICY_POSIX;
++				break;
++			}
++		}
++		if (IS_ROOT(d))
++			break;
++	}
++done:
++	if (read_seqretry(&rename_lock, seq)) {
++		if (flags & MAY_NOT_BLOCK)
++			goto echild;
++resched:
++		rcu_read_unlock();
++		cond_resched();
++		goto retry;
++	}
++	rcu_read_unlock();
++	return ret;
++
++echild:
++	rcu_read_unlock();
++	return -ECHILD;
++
++posix:
++	*policy = TRIMACL_POLICY_POSIX;
++	return 0;
++}
++EXPORT_SYMBOL(trimacl_resolve_policy);
++
++static int trim_inode_flags_xattr_set(const struct xattr_handler *handler, struct mnt_idmap *idmap,
++				      struct dentry *dentry, struct inode *inode, const char *name,
++				      const void *value, size_t size, int flags)
++{
++	struct trim_inode_flags_xattr_v1 xattr = {};
++	const struct trim_inode_flags_xattr_v1 *in = value;
++	u64 new_flags = 0;
++	int ret;
++
++	if (!inode->i_op->set_trim_flags)
++		return -EOPNOTSUPP;
++	if (!capable(CAP_SYS_ADMIN) && vol_is_admin_or_homeowner(idmap, dentry) <= 0)
++		return -EPERM;
++
++	if (value) {
++		if (size < sizeof(*in))
++			return -EUCLEAN;
++		if (le16_to_cpu(in->version) != TRIM_INODE_FLAGS_XATTR_VERSION)
++			return -EOPNOTSUPP;
++		if (le16_to_cpu(in->size) != sizeof(*in) || size != sizeof(*in) || in->reserved)
++			return -EUCLEAN;
++		new_flags = le64_to_cpu(in->flags);
++		xattr.version = cpu_to_le16(TRIM_INODE_FLAGS_XATTR_VERSION);
++		xattr.size = cpu_to_le16(sizeof(xattr));
++		xattr.flags = cpu_to_le64(new_flags);
++		value = &xattr;
++		size = sizeof(xattr);
++	} else {
++		size = 0;
++	}
++
++	ret = inode->i_op->set_trim_flags(inode, value, size, flags);
++	if (ret)
++		return ret;
++
++	spin_lock(&inode->i_lock);
++	inode->i_trim_flags_generation++;
++	atomic64_set(&inode->i_trim_flags, new_flags);
++	inode->i_trim_flags_state = TRIM_INODE_FLAGS_VALID;
++	spin_unlock(&inode->i_lock);
++	return ret;
++}
++
++const struct xattr_handler trim_inode_flags_xattr_handler = {
++	.name = TRIM_INODE_FLAGS_XATTR,
++	.get = trim_inode_flags_xattr_get,
++	.set = trim_inode_flags_xattr_set,
++};
++EXPORT_SYMBOL(trim_inode_flags_xattr_handler);
++

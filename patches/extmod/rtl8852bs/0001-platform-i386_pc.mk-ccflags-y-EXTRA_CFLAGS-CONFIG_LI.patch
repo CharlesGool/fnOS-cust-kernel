@@ -1,0 +1,76 @@
+From 2a75d82ed5f3e65c4c300ed3936ba722becaaa2c Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 00:44:09 +0000
+Subject: [PATCH] =?UTF-8?q?platform/i386=5Fpc.mk:=20=E8=A1=A5=20ccflags-y(?=
+ =?UTF-8?q?=E6=96=B0=E5=86=85=E6=A0=B8=E4=B8=8D=E5=86=8D=E8=AF=86=E5=88=AB?=
+ =?UTF-8?q?=20EXTRA=5FCFLAGS,=20=E7=BC=BA=20CONFIG=5FLITTLE=5FENDIAN=20?=
+ =?UTF-8?q?=E7=BC=96=E4=B8=8D=E8=BF=87)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ platform/i386_pc.mk | 55 ++++++++++++++++++++++++---------------------
+ 1 file changed, 30 insertions(+), 25 deletions(-)
+
+diff --git a/platform/i386_pc.mk b/platform/i386_pc.mk
+index 459161d..15d13eb 100644
+--- a/platform/i386_pc.mk
++++ b/platform/i386_pc.mk
+@@ -1,25 +1,30 @@
+-ifeq ($(CONFIG_PLATFORM_I386_PC), y)
+-EXTRA_CFLAGS += -DCONFIG_LITTLE_ENDIAN
+-EXTRA_CFLAGS += -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT
+-
+-EXTRA_CFLAGS += -DCONFIG_RADIO_WORK
+-#EXTRA_CFLAGS += -DCONFIG_CONCURRENT_MODE
+-
+-ifeq ($(CONFIG_SDIO_HCI), y)
+-EXTRA_CFLAGS += -DRTW_WKARD_SDIO_TX_USE_YIELD
+-endif
+-SUBARCH := $(shell uname -m | sed -e s/i.86/i386/)
+-ARCH ?= $(SUBARCH)
+-CROSS_COMPILE ?=
+-KVER  := $(shell uname -r)
+-KSRC := /lib/modules/$(KVER)/build
+-MODDESTDIR := /lib/modules/$(KVER)/kernel/drivers/net/wireless/
+-INSTALL_PREFIX :=
+-STAGINGMODDIR := /lib/modules/$(KVER)/kernel/drivers/staging
+-ifeq ($(CONFIG_PCI_HCI), y)
+-EXTRA_CFLAGS += -DCONFIG_PLATFORM_OPS
+-_PLATFORM_FILES := platform/platform_linux_pc_pci.o
+-OBJS += $(_PLATFORM_FILES)
+-endif
+-_PLATFORM_FILES += platform/platform_ops.o
+-endif
++ifeq ($(CONFIG_PLATFORM_I386_PC), y)
++EXTRA_CFLAGS += -DCONFIG_LITTLE_ENDIAN
++ccflags-y += -DCONFIG_LITTLE_ENDIAN
++EXTRA_CFLAGS += -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT
++ccflags-y += -DCONFIG_IOCTL_CFG80211 -DRTW_USE_CFG80211_STA_EVENT
++
++EXTRA_CFLAGS += -DCONFIG_RADIO_WORK
++ccflags-y += -DCONFIG_RADIO_WORK
++#EXTRA_CFLAGS += -DCONFIG_CONCURRENT_MODE
++
++ifeq ($(CONFIG_SDIO_HCI), y)
++EXTRA_CFLAGS += -DRTW_WKARD_SDIO_TX_USE_YIELD
++ccflags-y += -DRTW_WKARD_SDIO_TX_USE_YIELD
++endif
++SUBARCH := $(shell uname -m | sed -e s/i.86/i386/)
++ARCH ?= $(SUBARCH)
++CROSS_COMPILE ?=
++KVER  := $(shell uname -r)
++KSRC := /lib/modules/$(KVER)/build
++MODDESTDIR := /lib/modules/$(KVER)/kernel/drivers/net/wireless/
++INSTALL_PREFIX :=
++STAGINGMODDIR := /lib/modules/$(KVER)/kernel/drivers/staging
++ifeq ($(CONFIG_PCI_HCI), y)
++EXTRA_CFLAGS += -DCONFIG_PLATFORM_OPS
++ccflags-y += -DCONFIG_PLATFORM_OPS
++_PLATFORM_FILES := platform/platform_linux_pc_pci.o
++OBJS += $(_PLATFORM_FILES)
++endif
++_PLATFORM_FILES += platform/platform_ops.o
++endif

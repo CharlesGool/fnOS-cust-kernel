@@ -1,0 +1,40 @@
+From 7ee98fd2914e4ddd25f481da6a7ba7f7f815f4ae Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:47:37 +0700
+Subject: [PATCH 025/110] =?UTF-8?q?r8169:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E9=BB=98=E8=AE=A4=E5=85=B3=E9=97=AD=20EEE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 r8169_mdio_register(内联进 rtl_init_one)在 phy_support_eee()
+之后多了一句 tp->phydev->eee_cfg.eee_enabled = false(phy_device+0x4b1),
+即支持 EEE 的芯片默认不开 EEE, 需要时用 ethtool --set-eee 打开。
+
+来源: 飞牛私有(上游 6.18~7.3、ImmortalWrt/OpenWrt 补丁中均未找到)。
+对比: rtl_init_one 1450/1450, 剩余差异只有 .LC 常量编号
+(飞牛多一个 .rodata.cst2 常量)和 init_napi 中一处比较方向(cmovl/cmovg),
+语义相同。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/realtek/r8169_main.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index 96378c1ce..6d35271dc 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -6436,8 +6436,11 @@ static int r8169_mdio_register(struct rtl8169_private *tp)
+ 	}
+ 
+ 	tp->phydev->mac_managed_pm = true;
+-	if (rtl_supports_eee(tp))
++	if (rtl_supports_eee(tp)) {
+ 		phy_support_eee(tp->phydev);
++		/* keep EEE disabled by default, it can be enabled via ethtool */
++		tp->phydev->eee_cfg.eee_enabled = false;
++	}
+ 	phy_support_asym_pause(tp->phydev);
+ 
+ 	/* mimic behavior of r8125/r8126 vendor drivers */

@@ -1,0 +1,35 @@
+From 6e691976df39c9326e58ca1c3a28bfb91ea422e1 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:21:35 +0000
+Subject: [PATCH 1/4] =?UTF-8?q?=E5=BA=94=E7=94=A8=20ImmortalWrt=20?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=81=20001-r8168=5Fn-fix-proc=5Fdump=5Frx=5Fdesc?=
+ =?UTF-8?q?=5F2-on-32-bits.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来源: immortalwrt/immortalwrt package/kernel/r8168/patches/001-r8168_n-fix-proc_dump_rx_desc_2-on-32-bits.patch
+(飞牛的 r8168.ko 带有该补丁的行为, 见笔记 step14-extmod-net.md)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/r8168_n.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/r8168_n.c b/src/r8168_n.c
+index fa691d8..de8570e 100755
+--- a/src/r8168_n.c
++++ b/src/r8168_n.c
+@@ -1671,9 +1671,9 @@ static int proc_dump_rx_desc_2(struct seq_file *m, void *v)
+                                                           j, k);
+                         for (i=0; i<(tp->RxDescLength/4); i++) {
+                                 if (!(i % 4))
+-                                        seq_printf(m, "\n%04llx ",
+-                                                   ((u64)pdword + (i * 4) -
+-                                                    (u64)tp->RxDescArray));
++                                        seq_printf(m, "\n%04x ",
++                                                   (u32) ((uintptr_t)pdword + (i * 4) -
++                                                    (uintptr_t)tp->RxDescArray));
+                                 seq_printf(m, "%08x ", pdword[i]);
+                         }
+                 }

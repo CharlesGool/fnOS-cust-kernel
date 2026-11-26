@@ -1,0 +1,97 @@
+From 3515de100b2582fbadefb13754063b8924e838d8 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:25 +0000
+Subject: [PATCH 066/110] =?UTF-8?q?block:=20=E5=85=AC=E5=85=B1=E5=A4=B4?=
+ =?UTF-8?q?=E5=A2=9E=E5=8A=A0=20REQ=5FOP=5FUNUSED=5FHINT=E3=80=81QUEUE=5FF?=
+ =?UTF-8?q?LAG=5FUNUSED=5FHINT=E3=80=81BIO=5FDELAYED=E3=80=81BIO=5FFULL=5F?=
+ =?UTF-8?q?STRIPE=5FMERGE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛私有(上游 6.18~7.3 都没有), 逐字取自飞牛内核头文件(/k/fnos-headers), 只动 3 个头:
+
+include/linux/blk_types.h
+  - enum 的 bio 标志在 BIO_EMULATES_ZONE_APPEND 后加
+      BIO_DELAYED = 13          (submit_bio_noacct 里把 bio 排到同层 bio 之后、先前积压的 bio 之前)
+      BIO_FULL_STRIPE_MERGE = 14 (raid5 整条带合并用, __bio_clone 会复制)
+    BIO_FLAG_LAST 由 13 变 15(bi_flags 是 unsigned short, 仍够用)。
+  - enum req_op 加 REQ_OP_UNUSED_HINT = 128("这段空间没在用"的提示, 发给 raid 驱动)。
+    不改 REQ_OP_LAST(仍 36), 128 落在 REQ_OP_BITS=8 范围内; 最低位 0 = 按"读"方向算(op_is_write 为假)。
+include/linux/blkdev.h
+  - QUEUE_FLAG_UNUSED_HINT = 17(QUEUE_FLAG_MAX 变 18), 宏 blk_queue_unused_hint(q)。
+  - 声明 blkdev_hint_unused(); 内联 sb_hint_unused()(按 sb 块号换算成扇区再调 blkdev_hint_unused, 给 ext4 用)。
+include/linux/bio.h
+  - bio_has_data / bio_no_advance_iter / bio_segments 把 REQ_OP_UNUSED_HINT 当成无数据 bio(同 DISCARD)。
+
+这几个头之后要合进 work-md 给 md 用; device-mapper.h 的 num_unused_hint_bios 属 dm, 不在本提交。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/linux/bio.h       |  3 +++
+ include/linux/blk_types.h | 17 +++++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index a5763f11f..7d49d6029 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -55,6 +55,7 @@ static inline bool bio_has_data(struct bio *bio)
+ 	    bio->bi_iter.bi_size &&
+ 	    bio_op(bio) != REQ_OP_DISCARD &&
+ 	    bio_op(bio) != REQ_OP_SECURE_ERASE &&
++	    bio_op(bio) != REQ_OP_UNUSED_HINT &&
+ 	    bio_op(bio) != REQ_OP_WRITE_ZEROES)
+ 		return true;
+ 
+@@ -65,6 +66,7 @@ static inline bool bio_no_advance_iter(const struct bio *bio)
+ {
+ 	return bio_op(bio) == REQ_OP_DISCARD ||
+ 	       bio_op(bio) == REQ_OP_SECURE_ERASE ||
++	       bio_op(bio) == REQ_OP_UNUSED_HINT ||
+ 	       bio_op(bio) == REQ_OP_WRITE_ZEROES;
+ }
+ 
+@@ -183,6 +185,7 @@ static inline unsigned bio_segments(struct bio *bio)
+ 	switch (bio_op(bio)) {
+ 	case REQ_OP_DISCARD:
+ 	case REQ_OP_SECURE_ERASE:
++	case REQ_OP_UNUSED_HINT:
+ 	case REQ_OP_WRITE_ZEROES:
+ 		return 0;
+ 	default:
+diff --git a/include/linux/blk_types.h b/include/linux/blk_types.h
+index 47fe5631d..fd8e80eb1 100644
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@ -315,6 +315,21 @@ enum {
+ 	BIO_REMAPPED,
+ 	BIO_ZONE_WRITE_PLUGGING, /* bio handled through zone write plugging */
+ 	BIO_EMULATES_ZONE_APPEND, /* bio emulates a zone append operation */
++	/**
++	 * Make the bio be rearranged behind the other bios which are submitted
++	 * after it in current ->submit_bio.
++	 *
++	 * submit_bio_noacct() will sort bios by following order:
++	 * 1. bios to lower level.
++	 * 2. bios to same level.
++	 * 3. bios with BIO_DELAYED flags.
++	 * 4. bios submitted before current->make_request_fn.
++	 *
++	 * Note that bios with BIO_DELAYED flags will be sorted by
++	 * last-in-first-out order.
++	 */
++	BIO_DELAYED,
++	BIO_FULL_STRIPE_MERGE,     /* This bio should apply full stripe merge */
+ 	BIO_FLAG_LAST
+ };
+ 
+@@ -368,6 +383,8 @@ enum req_op {
+ 	REQ_OP_DRV_OUT		= (__force blk_opf_t)35,
+ 
+ 	REQ_OP_LAST		= (__force blk_opf_t)36,
++	/* Unused hint to raid driver */
++	REQ_OP_UNUSED_HINT	= (__force blk_opf_t)128,
+ };
+ 
+ /* Keep cmd_flag_name[] in sync with the definitions below */

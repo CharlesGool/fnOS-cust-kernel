@@ -1,0 +1,32 @@
+From afd9617348c6b24dfa25b0206183974fd46f063d Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:08:00 +0700
+Subject: [PATCH 3/8] =?UTF-8?q?zcommon:=20acltype=20=E5=B1=9E=E6=80=A7?=
+ =?UTF-8?q?=E5=8A=A0=20"trimacl"=20=E5=8F=96=E5=80=BC(=E9=A3=9E=E7=89=9B)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 zfs.ko 的 acltype 索引表在 posixacl 之后多一项 {"trimacl", 9},
+用户可以 zfs set acltype=trimacl。注意下一个提交起内核侧实际上
+不看这个值: 所有数据集挂载后一律按 trimacl 处理。
+
+来源: 飞牛私有改动。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ module/zcommon/zfs_prop.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/module/zcommon/zfs_prop.c b/module/zcommon/zfs_prop.c
+index 9190ae0..7bcb38a 100644
+--- a/module/zcommon/zfs_prop.c
++++ b/module/zcommon/zfs_prop.c
+@@ -264,6 +264,7 @@ zfs_prop_init(void)
+ 		{ "disabled",	ZFS_ACLTYPE_OFF }, /* bkwrd compatibility */
+ 		{ "noacl",	ZFS_ACLTYPE_OFF }, /* bkwrd compatibility */
+ 		{ "posixacl",	ZFS_ACLTYPE_POSIX }, /* bkwrd compatibility */
++		{ "trimacl",	ZFS_ACLTYPE_TRIMACL },	/* fnOS */
+ 		{ NULL }
+ 	};
+ 

@@ -1,0 +1,54 @@
+From ff6c564094a31ec9e2f15ca7c744371c71df29bd Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 21:44:30 +0000
+Subject: [PATCH 110/110] =?UTF-8?q?trimafs2:=20=E5=8F=AA=E6=9C=89=E4=B8=8A?=
+ =?UTF-8?q?=E5=B1=82=E5=86=85=E9=83=A8=E7=9A=84=E7=AC=AC=E4=BA=8C=E7=BA=A7?=
+ =?UTF-8?q?=20nfs=20=E7=9B=AE=E5=BD=95=E6=89=8D=E7=AE=97=20NFS=20=E5=85=B1?=
+ =?UTF-8?q?=E4=BA=AB=E8=B7=AF=E5=BE=84(=E5=AE=89=E5=85=A8=E4=BF=AE?=
+ =?UTF-8?q?=E5=A4=8D)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题: trimafs2_is_nfs_path 只看第二级目录名是否叫 nfs, 用户在桥下自己建的
+nfs 目录也会让 getattr 报 0777、隐藏 ACL。
+
+修法: 第二级 dentry 的 inode 还必须是上层内部对象(branch_id 为 0),
+桥下的下层对象 branch_id 非 0 不算。RCU 下用 d_inode_rcu 取 inode,
+trimafs2 的 inode 经 call_rcu 释放、dentry 也经 RCU 释放, 读取安全。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/trimafs2/inode.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/fs/trimafs2/inode.c b/fs/trimafs2/inode.c
+index a8694dc9c..468b63a91 100644
+--- a/fs/trimafs2/inode.c
++++ b/fs/trimafs2/inode.c
+@@ -109,7 +109,7 @@ static void trimafs2_init_inode_ops(struct inode *inode)
+ }
+ 
+ /*
+- * 路径第二级目录名为 "nfs"(且至少三级)视为 NFS 共享路径, 这类路径
++ * 路径第二级是名为 "nfs" 的上层内部目录(且至少三级)视为 NFS 共享路径, 这类路径
+  * getattr 时权限放开到 0777, 也不返回 ACL.
+  */
+ bool trimafs2_is_nfs_path(const struct dentry *dentry)
+@@ -138,6 +138,16 @@ bool trimafs2_is_nfs_path(const struct dentry *dentry)
+ 				break;
+ 		}
+ 		ret = l1 && l2 && l3 && l2->d_name.len == 3 && !memcmp(l2->d_name.name, "nfs", 3);
++		if (ret) {
++			/*
++			 * 第二级必须是上层内部目录(branch_id 为 0), 桥下用户自己建的
++			 * nfs 目录不算. RCU 下: dentry 和 inode 都经 RCU 释放, 用
++			 * d_inode_rcu 取; 并发 rename 由 rename_lock 重试, 其余过期值无害.
++			 */
++			const struct inode *inode = d_inode_rcu(l2);
++
++			ret = inode && !TRIMAFS2_I(inode)->branch_id;
++		}
+ 	}
+ 	if (read_seqretry(&rename_lock, seq)) {
+ 		rcu_read_unlock();

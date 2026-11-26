@@ -1,0 +1,47 @@
+From 3409082ad3f8162645e2541719fc57bbdf8b44b3 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:10:23 +0700
+Subject: [PATCH 050/110] =?UTF-8?q?btrfs:=20compat.h=20=E7=9A=84=20k*alloc?=
+ =?UTF-8?q?=5Fobjs=20=E6=94=B9=E7=94=A8=20kmalloc=5Farray/kcalloc/kvmalloc?=
+ =?UTF-8?q?=5Farray/kvcalloc?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 69050f8d6d 把 kmalloc_array/kcalloc 等机械替换成 kmalloc_objs 系列
+(size_mul 饱和乘法); 飞牛回退了这次替换, 数组分配仍是溢出返回 NULL 的老接口。
+兼容宏改成映射到老接口, 语义与飞牛一致。
+
+比对: btrfs_ioctl_send、scrub_stripe、extent_fiemap 由 NG 变一致,
+btrfs_defrag_file 由 ≈ 变一致, 其他函数不变。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/compat.h | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/compat.h b/fs/btrfs/compat.h
+index 4c7fd7141..32c37c9be 100644
+--- a/fs/btrfs/compat.h
++++ b/fs/btrfs/compat.h
+@@ -29,16 +29,16 @@
+ 	__obj_ptr;							\
+ })
+ #define kmalloc_obj(P, ...)	__alloc_objs(kmalloc, default_gfp(__VA_ARGS__), typeof(P), 1)
+-#define kmalloc_objs(P, N, ...)	__alloc_objs(kmalloc, default_gfp(__VA_ARGS__), typeof(P), N)
++#define kmalloc_objs(P, N, ...)	((typeof(P) *)kmalloc_array(N, sizeof(P), default_gfp(__VA_ARGS__)))
+ #define kmalloc_flex(P, F, N, ...) __alloc_flex(kmalloc, default_gfp(__VA_ARGS__), typeof(P), F, N)
+ #define kzalloc_obj(P, ...)	__alloc_objs(kzalloc, default_gfp(__VA_ARGS__), typeof(P), 1)
+-#define kzalloc_objs(P, N, ...)	__alloc_objs(kzalloc, default_gfp(__VA_ARGS__), typeof(P), N)
++#define kzalloc_objs(P, N, ...)	((typeof(P) *)kcalloc(N, sizeof(P), default_gfp(__VA_ARGS__)))
+ #define kzalloc_flex(P, F, N, ...) __alloc_flex(kzalloc, default_gfp(__VA_ARGS__), typeof(P), F, N)
+ #define kvmalloc_obj(P, ...)	__alloc_objs(kvmalloc, default_gfp(__VA_ARGS__), typeof(P), 1)
+-#define kvmalloc_objs(P, N, ...) __alloc_objs(kvmalloc, default_gfp(__VA_ARGS__), typeof(P), N)
++#define kvmalloc_objs(P, N, ...) ((typeof(P) *)kvmalloc_array(N, sizeof(P), default_gfp(__VA_ARGS__)))
+ #define kvmalloc_flex(P, F, N, ...) __alloc_flex(kvmalloc, default_gfp(__VA_ARGS__), typeof(P), F, N)
+ #define kvzalloc_obj(P, ...)	__alloc_objs(kvzalloc, default_gfp(__VA_ARGS__), typeof(P), 1)
+-#define kvzalloc_objs(P, N, ...) __alloc_objs(kvzalloc, default_gfp(__VA_ARGS__), typeof(P), N)
++#define kvzalloc_objs(P, N, ...) ((typeof(P) *)kvcalloc(N, sizeof(P), default_gfp(__VA_ARGS__)))
+ #define kvzalloc_flex(P, F, N, ...) __alloc_flex(kvzalloc, default_gfp(__VA_ARGS__), typeof(P), F, N)
+ #endif
+ 

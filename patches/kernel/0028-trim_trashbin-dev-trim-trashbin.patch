@@ -1,0 +1,386 @@
+From 27e1b75237c4cb33e0c1c8457b8155fbc51319b8 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:56:47 +0700
+Subject: [PATCH 028/110] =?UTF-8?q?trim=5Ftrashbin:=20=E8=BF=98=E5=8E=9F?=
+ =?UTF-8?q?=E5=9B=9E=E6=94=B6=E7=AB=99=E5=AD=97=E7=AC=A6=E8=AE=BE=E5=A4=87?=
+ =?UTF-8?q?=20/dev/trim-trashbin?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+新增 fs/trim_trashbin/(trim_trashbin.c/.h、Makefile), fs/Makefile 加
+obj-$(CONFIG_FS_TRIM_ACL) += trim_trashbin/。
+
+内核 unlink/rmdir 要进回收站时 trim_trashbin(path) 把请求挂到
+trashbin_pending_list 并睡在请求自己的等待队列上; 用户态守护进程(只允许
+一个) read() 一次取走能放下的请求包, write() 回 12 字节一条的
+{u64 serial; int ret_code;} 应答; 守护进程关闭设备时处理中的请求以 -EIO 结束。
+
+vmlinux fcmp (10 个函数):
+- 一致 8: open/release/read/request_put/processing_set_comp.isra.0/init/cleanup
+  (仅全局地址差), 全局变量与 bss 次序同飞牛。
+- 不一致 2, 语义等价:
+  trim_trashbin 184/184 只差被信号打断分支的跳转极性;
+  trim_trashbin_write 111/111 寄存器分配和 shrink-wrap(飞牛把 INT_MAX 上限
+  常量提到循环外)。
+- initcall 源码行号 268 (飞牛 329), 仅文件行数差。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/Makefile                      |   1 +
+ fs/trim_trashbin/Makefile        |   2 +
+ fs/trim_trashbin/trim_trashbin.c | 269 +++++++++++++++++++++++++++++++
+ fs/trim_trashbin/trim_trashbin.h |  50 ++++++
+ 4 files changed, 322 insertions(+)
+ create mode 100644 fs/trim_trashbin/Makefile
+ create mode 100644 fs/trim_trashbin/trim_trashbin.c
+ create mode 100644 fs/trim_trashbin/trim_trashbin.h
+
+diff --git a/fs/Makefile b/fs/Makefile
+index 80631b1bd..05338d7fa 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -132,3 +132,4 @@ obj-$(CONFIG_VBOXSF_FS)		+= vboxsf/
+ obj-$(CONFIG_ZONEFS_FS)		+= zonefs/
+ obj-$(CONFIG_BPF_LSM)		+= bpf_fs_kfuncs.o
+ obj-$(CONFIG_RESCTRL_FS)	+= resctrl/
++obj-$(CONFIG_FS_TRIM_ACL) += trim_trashbin/
+diff --git a/fs/trim_trashbin/Makefile b/fs/trim_trashbin/Makefile
+new file mode 100644
+index 000000000..151301a4f
+--- /dev/null
++++ b/fs/trim_trashbin/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_FS_TRIM_ACL) += trim_trashbin.o
+diff --git a/fs/trim_trashbin/trim_trashbin.c b/fs/trim_trashbin/trim_trashbin.c
+new file mode 100644
+index 000000000..6bb03b1b5
+--- /dev/null
++++ b/fs/trim_trashbin/trim_trashbin.c
+@@ -0,0 +1,269 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * fnOS trim 回收站字符设备 /dev/trim-trashbin
++ *
++ * unlink/rmdir 在卷上要进回收站时, trim_do_trashbin() 调 trim_trashbin(path):
++ * 请求挂到 trashbin_pending_list, 唤醒读者, 然后睡在请求自己的等待队列上。
++ * 用户态守护进程(只允许一个)read() 一次取走尽可能多的请求(移到
++ * trashbin_processing_list), 处理完 write() 回 12 字节一条的应答
++ * { u64 serial; int ret_code; }, 按 serial 找到请求填结果并唤醒。
++ * 守护进程关闭设备时, 所有在处理中的请求以 -EIO 结束。
++ */
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/cdev.h>
++#include <linux/device.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/spinlock.h>
++#include <linux/completion.h>
++#include <linux/uaccess.h>
++#include <linux/sched.h>
++#include <linux/cred.h>
++#include <linux/pid.h>
++
++#include "trim_trashbin.h"
++
++DECLARE_COMPLETION(req_comp);
++LIST_HEAD(trashbin_pending_list);
++LIST_HEAD(trashbin_processing_list);
++atomic64_t trim_trashbin_request_serial;
++
++static dev_t trim_trashbin_devid;
++static struct cdev trim_trashbin_cdev;
++static struct class *trim_trashbin_class;
++
++static spinlock_t trashbin_dev_locker;
++static volatile int connected;
++static spinlock_t trashbin_request_list_locker;
++
++static void trim_trashbin_request_put(struct trim_trashbin_request *req)
++{
++	if (refcount_dec_and_test(&req->refcount))
++		kfree(req);
++}
++
++static bool trim_trashbin_processing_set_comp(u64 serial, int ret_code)
++{
++	struct trim_trashbin_request *req;
++
++	spin_lock(&trashbin_request_list_locker);
++	list_for_each_entry(req, &trashbin_processing_list, head) {
++		if (req->trashbin_packet.serial == serial) {
++			req->ret_code = ret_code;
++			req->done = 1;
++			wake_up(&req->waitq);
++			break;
++		}
++	}
++	spin_unlock(&trashbin_request_list_locker);
++	return true;
++}
++
++static int trim_trashbin_open(struct inode *inode, struct file *file)
++{
++	spin_lock(&trashbin_dev_locker);
++	if (connected) {
++		spin_unlock(&trashbin_dev_locker);
++		return -EBUSY;
++	}
++	connected = 1;
++	spin_unlock(&trashbin_dev_locker);
++	printk("trim_trashbin_open\n");
++	return 0;
++}
++
++static int trim_trashbin_release(struct inode *inode, struct file *file)
++{
++	struct trim_trashbin_request *req;
++
++	spin_lock(&trashbin_dev_locker);
++	connected = 0;
++	spin_lock(&trashbin_request_list_locker);
++	list_for_each_entry(req, &trashbin_processing_list, head) {
++		req->done = 1;
++		req->ret_code = -EIO;
++		wake_up(&req->waitq);
++	}
++	spin_unlock(&trashbin_request_list_locker);
++	spin_unlock(&trashbin_dev_locker);
++	printk("trim_trashbin_release\n");
++	return 0;
++}
++
++static ssize_t trim_trashbin_read(struct file *file, char __user *buffer, size_t size, loff_t *ppos)
++{
++	struct trim_trashbin_request *req;
++	LIST_HEAD(read_list);
++	size_t total, len, copied = 0;
++	u64 serial;
++	int ret;
++
++	do {
++		ret = wait_for_completion_interruptible_timeout(&req_comp, msecs_to_jiffies(5000));
++		if (ret == -ERESTARTSYS)
++			return -EINTR;
++
++		total = 0;
++		spin_lock(&trashbin_request_list_locker);
++		while (!list_empty(&trashbin_pending_list)) {
++			req = list_first_entry(&trashbin_pending_list, struct trim_trashbin_request, head);
++			if (total + req->trashbin_packet.size > size) {
++				WARN_ON(req->trashbin_packet.size > size);
++				break;
++			}
++			total += req->trashbin_packet.size;
++			refcount_inc(&req->refcount);
++			list_move_tail(&req->head, &trashbin_processing_list);
++			list_add_tail(&req->read_head, &read_list);
++		}
++		spin_unlock(&trashbin_request_list_locker);
++	} while (!total);
++
++	while (!list_empty(&read_list)) {
++		req = list_first_entry(&read_list, struct trim_trashbin_request, read_head);
++		list_del_init(&req->read_head);
++		len = req->trashbin_packet.size;
++		serial = req->trashbin_packet.serial;
++		if (unlikely(!connected))
++			trim_trashbin_processing_set_comp(serial, -EIO);
++		else if (unlikely(copy_to_user(buffer + copied, &req->trashbin_packet, len)))
++			trim_trashbin_processing_set_comp(serial, -EFAULT);
++		else
++			copied += len;
++		trim_trashbin_request_put(req);
++	}
++
++	if (copied)
++		return copied;
++	return -EFAULT;
++}
++
++static ssize_t trim_trashbin_write(struct file *file, const char __user *buffer, size_t size, loff_t *ppos)
++{
++	static char res_buf[1024];
++	static int res_buf_len;
++	struct trim_trashbin_res *res;
++	size_t left = size, off = 0, n;
++	int i, done, remain;
++
++	if (!size)
++		return 0;
++
++	while (left) {
++		n = min_t(size_t, left, sizeof(res_buf) - res_buf_len);
++		if (copy_from_user(res_buf + res_buf_len, buffer + off, n))
++			return -EFAULT;
++		res_buf_len += n;
++
++		/* 每条应答 12 字节: u64 serial + int ret_code */
++		done = 0;
++		for (i = 12; i <= res_buf_len; i += 12) {
++			res = (struct trim_trashbin_res *)&res_buf[i - 12];
++			trim_trashbin_processing_set_comp(res->serial, res->ret_code);
++			done = i;
++		}
++		remain = res_buf_len - done;
++		if (remain <= 0) {
++			res_buf_len = 0;
++		} else if (done > 0) {
++			memmove(res_buf, res_buf + done, remain);
++			res_buf_len = remain;
++		}
++
++		left -= n;
++		off += n;
++	}
++	return size;
++}
++
++/* 把 path 交给用户态守护进程放进回收站, 等它处理完, 返回它给的结果 */
++int trim_trashbin(const char *path)
++{
++	struct trim_trashbin_request *req;
++	struct user_namespace *user_ns;
++	int len, ret;
++
++	if (!connected)
++		return -EIO;
++
++	len = strlen(path);
++	if (len >= PATH_MAX)
++		return -ENAMETOOLONG;
++
++	req = kmalloc(sizeof(*req) + len + 1, GFP_KERNEL);
++	if (!req)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&req->head);
++	INIT_LIST_HEAD(&req->read_head);
++	refcount_set(&req->refcount, 1);
++	init_waitqueue_head(&req->waitq);
++	req->done = 0;
++	req->trashbin_packet.size = sizeof(req->trashbin_packet) + len + 1;
++	req->trashbin_packet.version = 0;
++	req->trashbin_packet.serial = atomic64_inc_return(&trim_trashbin_request_serial);
++	user_ns = current_user_ns();
++	req->trashbin_packet.uid = from_kuid(user_ns, current_fsuid());
++	req->trashbin_packet.gid = from_kgid(user_ns, current_fsgid());
++	req->trashbin_packet.pid = pid_vnr(task_pid(current));
++	memcpy(req->trashbin_packet.path, path, len + 1);
++
++	spin_lock(&trashbin_request_list_locker);
++	list_add_tail(&req->head, &trashbin_pending_list);
++	spin_unlock(&trashbin_request_list_locker);
++	complete(&req_comp);
++
++	ret = wait_event_interruptible(req->waitq, !connected || req->done);
++	if (!ret) {
++		if (req->done)
++			ret = req->ret_code;
++		else if (!connected)
++			ret = -EIO;	/* 守护进程断开 */
++		else
++			ret = -EIO;
++	}
++
++	spin_lock(&trashbin_request_list_locker);
++	if (!list_empty(&req->head))
++		list_del_init(&req->head);
++	spin_unlock(&trashbin_request_list_locker);
++	trim_trashbin_request_put(req);
++	return ret;
++}
++
++static const struct file_operations trim_trashbin_fops = {
++	.owner = THIS_MODULE,
++	.open = trim_trashbin_open,
++	.release = trim_trashbin_release,
++	.read = trim_trashbin_read,
++	.write = trim_trashbin_write,
++};
++
++static int __init trim_trashbin_init(void)
++{
++	printk("trim_trashbin_init\n");
++	spin_lock_init(&trashbin_request_list_locker);
++	spin_lock_init(&trashbin_dev_locker);
++	alloc_chrdev_region(&trim_trashbin_devid, 0, 1, "trim-trashbin");
++	printk("trim-trashbin driver major=%d,minor=%d\n", MAJOR(trim_trashbin_devid), MINOR(trim_trashbin_devid));
++	trim_trashbin_cdev.owner = THIS_MODULE;
++	cdev_init(&trim_trashbin_cdev, &trim_trashbin_fops);
++	cdev_add(&trim_trashbin_cdev, trim_trashbin_devid, 1);
++	trim_trashbin_class = class_create("trim_trashbin_class");
++	device_create(trim_trashbin_class, NULL, trim_trashbin_devid, NULL, "trim-trashbin");
++	return 0;
++}
++
++static void __exit trim_trashbin_cleanup(void)
++{
++	printk("trim_trashbin_cleanup\n");
++	cdev_del(&trim_trashbin_cdev);
++	unregister_chrdev_region(trim_trashbin_devid, 1);
++	device_destroy(trim_trashbin_class, trim_trashbin_devid);
++	class_destroy(trim_trashbin_class);
++}
++
++module_init(trim_trashbin_init);
++module_exit(trim_trashbin_cleanup);
+diff --git a/fs/trim_trashbin/trim_trashbin.h b/fs/trim_trashbin/trim_trashbin.h
+new file mode 100644
+index 000000000..2152f6730
+--- /dev/null
++++ b/fs/trim_trashbin/trim_trashbin.h
+@@ -0,0 +1,50 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * fnOS trim 回收站字符设备 /dev/trim-trashbin
++ *
++ * 内核把要放进回收站的路径排进 trashbin_pending_list, 用户态守护进程
++ * read() 取走请求(struct trim_trashbin_packet), 处理完 write() 回
++ * 12 字节应答 { u64 serial; int ret_code; }。
++ */
++#ifndef _FS_TRIM_TRASHBIN_H
++#define _FS_TRIM_TRASHBIN_H
++
++#include <linux/types.h>
++#include <linux/list.h>
++#include <linux/wait.h>
++#include <linux/refcount.h>
++
++struct trim_trashbin_packet {
++	u32 size;		/* 整个包长度, 含 path 末尾的 '\0' */
++	u64 serial;
++	uid_t uid;
++	gid_t gid;
++	pid_t pid;
++	u32 version;
++	char reserved[24];
++	char path[];
++} __packed;
++
++struct trim_trashbin_request {
++	struct list_head head;		/* pending 或 processing 链表 */
++	struct list_head read_head;	/* read() 里的临时链表 */
++	wait_queue_head_t waitq;
++	refcount_t refcount;
++	int done;
++	int ret_code;
++	struct trim_trashbin_packet trashbin_packet;
++};
++
++/* write() 的应答, 一条 12 字节 */
++struct trim_trashbin_res {
++	u64 serial;
++	int ret_code;
++} __packed;
++
++extern struct list_head trashbin_processing_list;
++extern struct list_head trashbin_pending_list;
++extern atomic64_t trim_trashbin_request_serial;
++
++int trim_trashbin(const char *path);
++
++#endif

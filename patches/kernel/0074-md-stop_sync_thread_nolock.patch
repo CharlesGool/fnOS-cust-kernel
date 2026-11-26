@@ -1,0 +1,58 @@
+From bd053550c6de241901ca102f3f80c0ed56abc4e0 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:46:05 +0000
+Subject: [PATCH 074/110] =?UTF-8?q?md:=20=E6=8B=86=E5=87=BA=20stop=5Fsync?=
+ =?UTF-8?q?=5Fthread=5Fnolock?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 34f9baee7..2a9b852de 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -5599,18 +5599,11 @@ action_show(struct mddev *mddev, char *page)
+  *		return; if not set, reconfig_mutex will be released after this
+  *		function return.
+  */
+-static void stop_sync_thread(struct mddev *mddev, bool locked)
++/* fnnas: also used by dfr, caller must not hold reconfig_mutex */
++void stop_sync_thread_nolock(struct mddev *mddev)
+ {
+ 	int sync_seq = atomic_read(&mddev->sync_seq);
+ 
+-	if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
+-		if (!locked)
+-			mddev_unlock(mddev);
+-		return;
+-	}
+-
+-	mddev_unlock(mddev);
+-
+ 	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 	/*
+ 	 * Thread might be blocked waiting for metadata update which will now
+@@ -5624,6 +5617,18 @@ static void stop_sync_thread(struct mddev *mddev, bool locked)
+ 		   !test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) ||
+ 		   (!test_bit(MD_RECOVERY_FROZEN, &mddev->recovery) &&
+ 		    sync_seq != atomic_read(&mddev->sync_seq)));
++}
++
++static void stop_sync_thread(struct mddev *mddev, bool locked)
++{
++	if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
++		if (!locked)
++			mddev_unlock(mddev);
++		return;
++	}
++
++	mddev_unlock(mddev);
++	stop_sync_thread_nolock(mddev);
+ 
+ 	if (locked)
+ 		mddev_lock_nointr(mddev);

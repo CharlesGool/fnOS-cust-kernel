@@ -1,0 +1,38 @@
+From 4ec536c0f474790952d2d953d92b4b4ffc3f3680 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 10:14:43 +0700
+Subject: [PATCH 009/110] =?UTF-8?q?quota:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E6=94=B9=E5=8A=A8,=20CAP=5FSYS=5FRESOURCE=20=E4=B8=8D?=
+ =?UTF-8?q?=E5=86=8D=E7=BB=95=E8=BF=87=E9=85=8D=E9=A2=9D=E9=99=90=E5=88=B6?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/quota/dquot.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/fs/quota/dquot.c b/fs/quota/dquot.c
+index c91076c3f..45cb0e816 100644
+--- a/fs/quota/dquot.c
++++ b/fs/quota/dquot.c
+@@ -1304,13 +1304,13 @@ static void flush_warnings(struct dquot_warn *warn)
+ 	}
+ }
+ 
++/*
++ * fnOS: CAP_SYS_RESOURCE no longer bypasses quota limits. NAS services
++ * write on behalf of users as root, so the limits must hold for them too.
++ */
+ static int ignore_hardlimit(struct dquot *dquot)
+ {
+-	struct mem_dqinfo *info = &sb_dqopt(dquot->dq_sb)->info[dquot->dq_id.type];
+-
+-	return capable(CAP_SYS_RESOURCE) &&
+-	       (info->dqi_format->qf_fmt_id != QFMT_VFS_OLD ||
+-		!(info->dqi_flags & DQF_ROOT_SQUASH));
++	return 0;
+ }
+ 
+ static int dquot_add_inodes(struct dquot *dquot, qsize_t inodes,

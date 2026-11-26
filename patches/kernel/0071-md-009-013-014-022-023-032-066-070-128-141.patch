@@ -1,0 +1,315 @@
+From cbccaba34b4699bde8ca819161027ccc8054329b Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:27:39 +0000
+Subject: [PATCH 071/110] =?UTF-8?q?md:=20=E7=A7=BB=E6=A4=8D=E4=B8=8A?=
+ =?UTF-8?q?=E6=B8=B8=20009/013/014/022/023/032/066/070/128/141?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 md.c 已含的上游改动(按字符串/函数/反汇编确认), 原样 git apply 到 6.18.18:
+- 009 6c6b66f65e55 禁止加入 logical_block_size 更大的盘
+- 013 9c47127a807d check_new_feature 模块参数
+- 014 62ed1b582246 可配置 logical_block_size(md.c 部分)
+- 022 864466c38c4a / 023 a4166f1c4893 lbs 修正
+- 032 2a5d4549a28d md_sync_error
+- 066 09af77365002 bitmap 版本不符时回退
+- 070 cf86bb53b9c9 suspend 前唤醒 raid456 reshape 等待者
+- 128 35d522bd3246 bblog_shift 溢出检查
+- 141 ffd3e73d6e0c mddev_bio_split_at_reshape_offset
+之后的提交再按飞牛反汇编调整(飞牛是早期版本)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.c | 194 +++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 184 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 45ff61770..25d33ab62 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -341,6 +341,7 @@ static int start_readonly;
+  */
+ static bool create_on_open = true;
+ static bool legacy_async_del_gendisk = true;
++static bool check_new_feature = true;
+ 
+ /*
+  * We have a system wide 'event count' that is incremented
+@@ -1875,9 +1876,13 @@ static int super_1_load(struct md_rdev *rdev, struct md_rdev *refdev, int minor_
+ 	}
+ 	if (sb->pad0 ||
+ 	    sb->pad3[0] ||
+-	    memcmp(sb->pad3, sb->pad3+1, sizeof(sb->pad3) - sizeof(sb->pad3[1])))
+-		/* Some padding is non-zero, might be a new feature */
+-		return -EINVAL;
++	    memcmp(sb->pad3, sb->pad3+1, sizeof(sb->pad3) - sizeof(sb->pad3[1]))) {
++		pr_warn("Some padding is non-zero on %pg, might be a new feature\n",
++			rdev->bdev);
++		if (check_new_feature)
++			return -EINVAL;
++		pr_warn("check_new_feature is disabled, data corruption possible\n");
++	}
+ 
+ 	rdev->preferred_minor = 0xffff;
+ 	rdev->data_offset = le64_to_cpu(sb->data_offset);
+@@ -2043,6 +2048,9 @@ static int super_1_validate(struct mddev *mddev, struct md_rdev *freshest, struc
+ 
+ 		mddev->max_disks =  (4096-256)/2;
+ 
++		if (!mddev->logical_block_size)
++			mddev->logical_block_size = le32_to_cpu(sb->logical_block_size);
++
+ 		if ((le32_to_cpu(sb->feature_map) & MD_FEATURE_BITMAP_OFFSET) &&
+ 		    mddev->bitmap_info.file == NULL) {
+ 			mddev->bitmap_info.offset =
+@@ -2237,6 +2245,7 @@ static void super_1_sync(struct mddev *mddev, struct md_rdev *rdev)
+ 	sb->chunksize = cpu_to_le32(mddev->chunk_sectors);
+ 	sb->level = cpu_to_le32(mddev->level);
+ 	sb->layout = cpu_to_le32(mddev->layout);
++	sb->logical_block_size = cpu_to_le32(mddev->logical_block_size);
+ 	if (test_bit(FailFast, &rdev->flags))
+ 		sb->devflags |= FailFast1;
+ 	else
+@@ -5987,6 +5996,88 @@ static struct md_sysfs_entry md_serialize_policy =
+ __ATTR(serialize_policy, S_IRUGO | S_IWUSR, serialize_policy_show,
+        serialize_policy_store);
+ 
++static int mddev_set_logical_block_size(struct mddev *mddev,
++				unsigned int lbs)
++{
++	int err = 0;
++	struct queue_limits lim;
++
++	if (queue_logical_block_size(mddev->gendisk->queue) >= lbs) {
++		pr_err("%s: Cannot set LBS smaller than mddev LBS %u\n",
++		       mdname(mddev), lbs);
++		return -EINVAL;
++	}
++
++	lim = queue_limits_start_update(mddev->gendisk->queue);
++	lim.logical_block_size = lbs;
++	pr_info("%s: logical_block_size is changed, data may be lost\n",
++		mdname(mddev));
++	err = queue_limits_commit_update(mddev->gendisk->queue, &lim);
++	if (err)
++		return err;
++
++	mddev->logical_block_size = lbs;
++	/* New lbs will be written to superblock after array is running */
++	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
++	return 0;
++}
++
++static ssize_t
++lbs_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "%u\n", mddev->logical_block_size);
++}
++
++static ssize_t
++lbs_store(struct mddev *mddev, const char *buf, size_t len)
++{
++	unsigned int lbs;
++	int err = -EBUSY;
++
++	/* Only 1.x meta supports configurable LBS */
++	if (mddev->major_version == 0)
++		return -EINVAL;
++
++	err = kstrtouint(buf, 10, &lbs);
++	if (err < 0)
++		return -EINVAL;
++
++	if (mddev->pers) {
++		unsigned int curr_lbs;
++
++		if (mddev->logical_block_size)
++			return -EBUSY;
++		/*
++		 * To fix forward compatibility issues, LBS is not
++		 * configured for arrays from old kernels (<=6.18) by default.
++		 * If the user confirms no rollback to old kernels,
++		 * enable LBS by writing current LBS — to prevent data
++		 * loss from LBS changes.
++		 */
++		curr_lbs = queue_logical_block_size(mddev->gendisk->queue);
++		if (lbs != curr_lbs)
++			return -EINVAL;
++
++		mddev->logical_block_size = curr_lbs;
++		set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
++		pr_info("%s: logical block size configured successfully, array will not be assembled in old kernels (<= 6.18)\n",
++			mdname(mddev));
++		return len;
++	}
++
++	err = mddev_lock(mddev);
++	if (err)
++		goto unlock;
++
++	err = mddev_set_logical_block_size(mddev, lbs);
++
++unlock:
++	mddev_unlock(mddev);
++	return err ?: len;
++}
++
++static struct md_sysfs_entry md_logical_block_size =
++__ATTR(logical_block_size, 0644, lbs_show, lbs_store);
+ 
+ static struct attribute *md_default_attrs[] = {
+ 	&md_level.attr,
+@@ -6009,6 +6100,7 @@ static struct attribute *md_default_attrs[] = {
+ 	&md_consistency_policy.attr,
+ 	&md_fail_last_dev.attr,
+ 	&md_serialize_policy.attr,
++	&md_logical_block_size.attr,
+ 	NULL,
+ };
+ 
+@@ -6145,6 +6237,37 @@ int mddev_stack_rdev_limits(struct mddev *mddev, struct queue_limits *lim,
+ 			return -EINVAL;
+ 	}
+ 
++	/*
++	 * Before RAID adding folio support, the logical_block_size
++	 * should be smaller than the page size.
++	 */
++	if (lim->logical_block_size > PAGE_SIZE) {
++		pr_err("%s: logical_block_size must not larger than PAGE_SIZE\n",
++			mdname(mddev));
++		return -EINVAL;
++	}
++
++	/* Only 1.x meta needs to set logical block size */
++	if (mddev->major_version == 0)
++		return 0;
++
++	/*
++	 * Fix forward compatibility issue. Only set LBS by default for
++	 * new arrays, mddev->events == 0 indicates the array was just
++	 * created. When assembling an array, read LBS from the superblock
++	 * instead — LBS is 0 in superblocks created by old kernels.
++	 */
++	if (!mddev->events) {
++		pr_info("%s: array will not be assembled in old kernels that lack configurable LBS support (<= 6.18)\n",
++			mdname(mddev));
++		mddev->logical_block_size = lim->logical_block_size;
++	}
++
++	if (!mddev->logical_block_size)
++		pr_warn("%s: echo current LBS to md/logical_block_size to prevent data loss issues from LBS changes.\n"
++			"\tNote: After setting, array will not be assembled in old kernels (<= 6.18)\n",
++			mdname(mddev));
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(mddev_stack_rdev_limits);
+@@ -6157,6 +6280,13 @@ int mddev_stack_new_rdev(struct mddev *mddev, struct md_rdev *rdev)
+ 	if (mddev_is_dm(mddev))
+ 		return 0;
+ 
++	if (queue_logical_block_size(rdev->bdev->bd_disk->queue) >
++	    queue_logical_block_size(mddev->gendisk->queue)) {
++		pr_err("%s: incompatible logical_block_size, can not add\n",
++		       mdname(mddev));
++		return -EINVAL;
++	}
++
+ 	lim = queue_limits_start_update(mddev->gendisk->queue);
+ 	queue_limits_stack_bdev(&lim, rdev->bdev, rdev->data_offset,
+ 				mddev->gendisk->disk_name);
+@@ -6907,6 +7037,7 @@ static void md_clean(struct mddev *mddev)
+ 	mddev->chunk_sectors = 0;
+ 	mddev->ctime = mddev->utime = 0;
+ 	mddev->layout = 0;
++	mddev->logical_block_size = 0;
+ 	mddev->max_disks = 0;
+ 	mddev->events = 0;
+ 	mddev->can_decrease_events = 0;
+@@ -9178,20 +9309,23 @@ static bool is_mddev_idle(struct mddev *mddev, int init)
+ 	return idle;
+ }
+ 
+-void md_done_sync(struct mddev *mddev, int blocks, int ok)
++void md_done_sync(struct mddev *mddev, int blocks)
+ {
+ 	/* another "blocks" (512byte) blocks have been synced */
+ 	atomic_sub(blocks, &mddev->recovery_active);
+ 	wake_up(&mddev->recovery_wait);
+-	if (!ok) {
+-		set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+-		set_bit(MD_RECOVERY_ERROR, &mddev->recovery);
+-		md_wakeup_thread(mddev->thread);
+-		// stop recovery, signal do_sync ....
+-	}
+ }
+ EXPORT_SYMBOL(md_done_sync);
+ 
++void md_sync_error(struct mddev *mddev)
++{
++	// stop recovery, signal do_sync ....
++	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
++	set_bit(MD_RECOVERY_ERROR, &mddev->recovery);
++	md_wakeup_thread(mddev->thread);
++}
++EXPORT_SYMBOL(md_sync_error);
++
+ /* md_write_start(mddev, bi)
+  * If we need to update some array metadata (e.g. 'active' flag
+  * in superblock) before writing, schedule a superblock update
+@@ -9293,6 +9427,45 @@ void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
+ }
+ EXPORT_SYMBOL_GPL(md_submit_discard_bio);
+ 
++struct bio *mddev_bio_split_at_reshape_offset(struct mddev *mddev,
++					      struct bio *bio,
++					      unsigned int *max_sectors,
++					      struct bio_set *bs)
++{
++	sector_t boundary;
++	sector_t start;
++	sector_t end;
++	unsigned int split_sectors;
++
++	split_sectors = bio_sectors(bio);
++	if (max_sectors && *max_sectors && *max_sectors < split_sectors)
++		split_sectors = *max_sectors;
++
++	if (!test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
++		goto split;
++
++	boundary = READ_ONCE(mddev->reshape_position);
++	start = bio->bi_iter.bi_sector;
++	end = bio_end_sector(bio);
++	if (start >= boundary || end <= boundary)
++		goto split;
++
++	if (boundary - start < split_sectors)
++		split_sectors = boundary - start;
++
++split:
++	if (max_sectors)
++		*max_sectors = split_sectors;
++	if (split_sectors < bio_sectors(bio)) {
++		bio = bio_submit_split_bioset(bio, split_sectors, bs);
++		if (bio)
++			bio->bi_opf |= REQ_NOMERGE;
++	}
++
++	return bio;
++}
++EXPORT_SYMBOL_GPL(mddev_bio_split_at_reshape_offset);
++
+ static void md_bitmap_start(struct mddev *mddev,
+ 			    struct md_io_clone *md_io_clone)
+ {
+@@ -10961,6 +11134,7 @@ module_param(start_dirty_degraded, int, S_IRUGO|S_IWUSR);
+ module_param_call(new_array, add_named_array, NULL, NULL, S_IWUSR);
+ module_param(create_on_open, bool, S_IRUSR|S_IWUSR);
+ module_param(legacy_async_del_gendisk, bool, 0600);
++module_param(check_new_feature, bool, 0600);
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("MD RAID framework");

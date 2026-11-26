@@ -1,0 +1,1015 @@
+From 1e91f58fbf04234693aa9d7a150dfd9a24805158 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:34:57 +0000
+Subject: [PATCH 091/110] =?UTF-8?q?md/raid5:=20=E5=88=86=E7=BB=84=E5=BB=B6?=
+ =?UTF-8?q?=E8=BF=9F=E4=B8=8B=E5=8F=91(defer=20groups)=E3=80=81stable=5Fli?=
+ =?UTF-8?q?st=E3=80=81=E9=BB=98=E8=AE=A4=E5=A4=9A=E7=BA=BF=E7=A8=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛私有, 移植自群晖 DSM 内核 raid5.c 的 syno_defer(GPL 源码, 去掉 syno_ 前缀):
+- 每 4 块盘一组(defer_group_cnt = (raid_disks-1)/4+1, 最多 6 组), 每组一个 "defer%d"
+  线程(ext_flush_deferred_bios), ops_run_io 在 defer_mode 下把 bio 按 i %% defer_group_cnt
+  放进组队列, 超过 defer_flush_threshold 唤醒组线程按扇区排序后成批下发;
+  raid5d/raid5_do_work 最后一个 worker 退出时(active_stripe_workers 归零)让各组全部下发。
+- sysfs(md/ 下, 0644): defer_group_cnt(1..6 且 <= raid_disks)、defer_mode(0/1)、
+  defer_flush_threshold(1..32768)、defer_group_disk_cnt_max(1..4)、
+  defer_flush_batch_size(1..32768)、defer_skip_sort(0/1)。
+  默认: 有转盘成员时 threshold=2048/skip_sort=0, 全 SSD 时 64/1; batch 512; mode=1。
+- stable_list: 写完成(reconstruct 结束)的条带置 STRIPE_STABLE_STATE, 延迟时进
+  stable_list, raid5_activate_delayed 不受 preread 门限限制直接激活(handle_stripe 部分后续提交)。
+- setup_conf: RAID5/6 默认 worker_cnt_per_group = min(raid_disks/8, 在线CPU/2)。
+- raid5_do_work/raid5d: 用 md_sb_pending() 代替 MD_SB_CHANGE_PENDING 判断, worker 等待前先唤醒 md 线程。
+- do_release_stripe: 释放时 test_and_clear STRIPE_DFR 则 stripe_end_dfr()。
+- ops_run_io: llbitmap 阵列的 R5_Discard 改发 REQ_OP_WRITE_ZEROES。
+
+同函数 stable 修复(6.18.65 已有, 因 raid5d 有私有改动一并打上):
+- 上游 110 f565925810cb md/raid5: protect bitmap batch counters aka seq_flush/seq_write
+- 上游 071 7f9f7c697474 md/raid5: fix soft lockup in retry_aligned_read()(内联进 raid5d)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid5.c | 764 +++++++++++++++++++++++++++++++++++++++++++--
+ drivers/md/raid5.h |  21 +-
+ 2 files changed, 766 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 0bf8227ec..5e6c9ebe3 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -253,14 +253,18 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh,
+ 
+ 	if (test_bit(STRIPE_HANDLE, &sh->state)) {
+ 		if (test_bit(STRIPE_DELAYED, &sh->state) &&
+-		    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+-			list_add_tail(&sh->lru, &conf->delayed_list);
+-		else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
++		    !test_bit(STRIPE_PREREAD_ACTIVE, &sh->state)) {
++			if (test_bit(STRIPE_STABLE_STATE, &sh->state))
++				list_add_tail(&sh->lru, &conf->stable_list);
++			else
++				list_add_tail(&sh->lru, &conf->delayed_list);
++		} else if (test_bit(STRIPE_BIT_DELAY, &sh->state) &&
+ 			   sh->bm_seq - conf->seq_write > 0)
+ 			list_add_tail(&sh->lru, &conf->bitmap_list);
+ 		else {
+ 			clear_bit(STRIPE_DELAYED, &sh->state);
+ 			clear_bit(STRIPE_BIT_DELAY, &sh->state);
++			clear_bit(STRIPE_STABLE_STATE, &sh->state);
+ 			if (conf->worker_cnt_per_group == 0) {
+ 				if (stripe_is_lowprio(sh))
+ 					list_add_tail(&sh->lru,
+@@ -276,10 +280,13 @@ static void do_release_stripe(struct r5conf *conf, struct stripe_head *sh,
+ 		md_wakeup_thread(conf->mddev->thread);
+ 	} else {
+ 		BUG_ON(stripe_operations_active(sh));
++		clear_bit(STRIPE_STABLE_STATE, &sh->state);
+ 		if (test_and_clear_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
+ 			if (atomic_dec_return(&conf->preread_active_stripes)
+ 			    < IO_THRESHOLD)
+ 				md_wakeup_thread(conf->mddev->thread);
++		if (test_and_clear_bit(STRIPE_DFR, &sh->state))
++			stripe_end_dfr(sh);
+ 		atomic_dec(&conf->active_stripes);
+ 		if (!test_bit(STRIPE_EXPANDING, &sh->state)) {
+ 			if (!r5c_is_writeback(conf->log))
+@@ -1134,6 +1141,186 @@ static void defer_issue_bios(struct r5conf *conf, sector_t sector,
+ 	dispatch_bio_list(&tmp);
+ }
+ 
++/*
++ * fnnas: deferred io dispatch groups, every group collects the bios of its
++ * member disks and lets its own thread submit them sorted by sector.
++ */
++static void wakeup_defer_threads(struct r5conf *conf)
++{
++	int i;
++	int group_cnt = conf->defer_group_cnt;
++	struct r5defer *group;
++
++	for (i = 0; i < group_cnt; ++i) {
++		group = &conf->defer_groups[i];
++		set_bit(DEFER_FLUSH_ALL, &group->state);
++		md_wakeup_thread(group->defer_thread);
++	}
++}
++
++static void sort_deferred_bios(struct r5defer *group,
++			       struct bio_list *pending_bios)
++{
++	int ent_cnt = 0;
++	struct bio *bio;
++	struct r5pending_data *ent = NULL;
++
++	while ((bio = bio_list_pop(pending_bios))) {
++		/* bios to the same or an adjacent location share one entry */
++		if (!ent || (ent->sector != bio->bi_iter.bi_sector &&
++			     ent->sector != bio->bi_iter.bi_sector -
++					    (bio->bi_iter.bi_size >> 9))) {
++			if (ent_cnt == DEFER_MAX_SORT_ENT_CNT) {
++				bio_list_add_head(pending_bios, bio);
++				break;
++			}
++			ent_cnt++;
++
++			ent = list_first_entry(&group->free_list,
++					       struct r5pending_data, sibling);
++			list_move_tail(&ent->sibling, &group->pending_list);
++			ent->sector = bio->bi_iter.bi_sector;
++			bio_list_init(&ent->bios);
++			ent->count = 0;
++		}
++		bio_list_add(&ent->bios, bio);
++		ent->count++;
++	}
++
++	list_sort(NULL, &group->pending_list, cmp_stripe);
++}
++
++static int merge_sorted_deferred_bios(struct r5defer *group,
++				      struct bio_list *sorted_bios,
++				      struct bio_list *pending_bios,
++				      int target_cnt)
++{
++	int sorted_cnt = 0;
++	struct r5pending_data *ent;
++
++	while (!list_empty(&group->pending_list)) {
++		ent = list_first_entry(&group->pending_list,
++				       struct r5pending_data, sibling);
++		if (sorted_cnt < target_cnt) {
++			bio_list_merge(sorted_bios, &ent->bios);
++			sorted_cnt += ent->count;
++		} else {
++			bio_list_merge_head(pending_bios, &ent->bios);
++		}
++		list_move_tail(&ent->sibling, &group->free_list);
++	}
++
++	return sorted_cnt;
++}
++
++static int group_sort_flush_deferred_bios(struct r5defer *group,
++					  struct bio_list *pending_bios,
++					  int target_cnt)
++{
++	int flushed_cnt = 0;
++	struct bio_list sorted_bios;
++
++	bio_list_init(&sorted_bios);
++	while (!bio_list_empty(pending_bios) && flushed_cnt < target_cnt) {
++		sort_deferred_bios(group, pending_bios);
++		flushed_cnt += merge_sorted_deferred_bios(group, &sorted_bios,
++					pending_bios, target_cnt - flushed_cnt);
++	}
++
++	dispatch_bio_list(&sorted_bios);
++
++	return flushed_cnt;
++}
++
++static int group_handle_deferred_bios(struct r5defer *group,
++				      struct r5conf *conf)
++{
++	struct bio_list tmp;
++	int pending_cnt;
++	int flushed_cnt;
++	int target_cnt;
++	bool flush_all;
++
++	bio_list_init(&tmp);
++	spin_lock(&group->pending_bios_lock);
++	flush_all = test_and_clear_bit(DEFER_FLUSH_ALL, &group->state);
++	if (!flush_all &&
++	    group->pending_data_cnt < conf->defer_flush_threshold) {
++		pending_cnt = group->pending_data_cnt;
++		spin_unlock(&group->pending_bios_lock);
++		return pending_cnt;
++	}
++
++	target_cnt = flush_all ? group->pending_data_cnt :
++				 conf->defer_flush_batch_size;
++	bio_list_merge(&tmp, &group->pending_bios);
++	bio_list_init(&group->pending_bios);
++	pending_cnt = group->pending_data_cnt;
++	group->pending_data_cnt = 0;
++	spin_unlock(&group->pending_bios_lock);
++
++	/* the group's sort lists are only used by its own defer thread */
++	flushed_cnt = group_sort_flush_deferred_bios(group, &tmp, target_cnt);
++
++	spin_lock(&group->pending_bios_lock);
++	if (!bio_list_empty(&tmp))
++		bio_list_merge_head(&group->pending_bios, &tmp);
++	group->pending_data_cnt += pending_cnt - flushed_cnt;
++	pending_cnt = group->pending_data_cnt;
++	spin_unlock(&group->pending_bios_lock);
++
++	return pending_cnt;
++}
++
++/* flush without sorting */
++static int group_flush_deferred_bios(struct r5defer *group)
++{
++	struct bio_list tmp;
++
++	bio_list_init(&tmp);
++	spin_lock(&group->pending_bios_lock);
++	bio_list_merge(&tmp, &group->pending_bios);
++	bio_list_init(&group->pending_bios);
++	group->pending_data_cnt = 0;
++	spin_unlock(&group->pending_bios_lock);
++
++	dispatch_bio_list(&tmp);
++
++	return group->pending_data_cnt;
++}
++
++static void group_defer_issue_bios(struct r5conf *conf, struct r5defer *group,
++				   struct bio_list *bios)
++{
++	struct bio *bio;
++	int pending_cnt;
++
++	clear_bit(DEFER_FLUSH_ALL, &group->state);
++	spin_lock(&group->pending_bios_lock);
++	while ((bio = bio_list_pop(bios)) != NULL) {
++		group->pending_data_cnt++;
++		bio_list_add(&group->pending_bios, bio);
++	}
++	pending_cnt = group->pending_data_cnt;
++	spin_unlock(&group->pending_bios_lock);
++
++	if (conf->defer_mode && pending_cnt >= conf->defer_flush_threshold)
++		md_wakeup_thread(group->defer_thread);
++}
++
++static void groups_defer_issue_bios(struct r5conf *conf,
++				    struct bio_list bios[DEFER_GROUP_CNT_MAX])
++{
++	int i;
++	int group_cnt = conf->defer_group_cnt;
++
++	for (i = 0; i < group_cnt; ++i) {
++		if (!bio_list_empty(&bios[i]))
++			group_defer_issue_bios(conf, &conf->defer_groups[i],
++					       &bios[i]);
++	}
++}
++
+ static void
+ raid5_end_read_request(struct bio *bi);
+ static void
+@@ -1145,11 +1332,16 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+ 	int i, disks = sh->disks;
+ 	struct stripe_head *head_sh = sh;
+ 	struct bio_list pending_bios = BIO_EMPTY_LIST;
++	struct bio_list group_pending_bios[DEFER_GROUP_CNT_MAX];
++	int defer_mode = conf->defer_mode;
+ 	struct r5dev *dev;
+ 	bool should_defer;
+ 
+ 	might_sleep();
+ 
++	for (i = 0; i < DEFER_GROUP_CNT_MAX; ++i)
++		bio_list_init(&group_pending_bios[i]);
++
+ 	if (log_stripe(sh, s) == 0)
+ 		return;
+ 
+@@ -1159,6 +1351,7 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+ 		enum req_op op;
+ 		blk_opf_t op_flags = 0;
+ 		int replace_only = 0;
++		int group_id = i % conf->defer_group_cnt;
+ 		struct bio *bi, *rbi;
+ 		struct md_rdev *rdev, *rrdev = NULL;
+ 
+@@ -1168,7 +1361,12 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+ 			if (test_and_clear_bit(R5_WantFUA, &sh->dev[i].flags))
+ 				op_flags = REQ_FUA;
+ 			if (test_bit(R5_Discard, &sh->dev[i].flags))
+-				op = REQ_OP_DISCARD;
++				/*
++				 * fnnas: llbitmap treats discarded data as
++				 * zeroes, make sure parity stays consistent.
++				 */
++				op = conf->mddev->bitmap_id == ID_LLBITMAP ?
++					REQ_OP_WRITE_ZEROES : REQ_OP_DISCARD;
+ 		} else if (test_and_clear_bit(R5_Wantread, &sh->dev[i].flags))
+ 			op = REQ_OP_READ;
+ 		else if (test_and_clear_bit(R5_WantReplace,
+@@ -1288,13 +1486,15 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+ 			 * If this is discard request, set bi_vcnt 0. We don't
+ 			 * want to confuse SCSI because SCSI will replace payload
+ 			 */
+-			if (op == REQ_OP_DISCARD)
++			if (op == REQ_OP_DISCARD || op == REQ_OP_WRITE_ZEROES)
+ 				bi->bi_vcnt = 0;
+ 			if (rrdev)
+ 				set_bit(R5_DOUBLE_LOCKED, &sh->dev[i].flags);
+ 
+ 			mddev_trace_remap(conf->mddev, bi, sh->dev[i].sector);
+-			if (should_defer && op_is_write(op))
++			if (defer_mode)
++				bio_list_add(&group_pending_bios[group_id], bi);
++			else if (should_defer && op_is_write(op))
+ 				bio_list_add(&pending_bios, bi);
+ 			else
+ 				submit_bio_noacct(bi);
+@@ -1331,10 +1531,12 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+ 			 * If this is discard request, set bi_vcnt 0. We don't
+ 			 * want to confuse SCSI because SCSI will replace payload
+ 			 */
+-			if (op == REQ_OP_DISCARD)
++			if (op == REQ_OP_DISCARD || op == REQ_OP_WRITE_ZEROES)
+ 				rbi->bi_vcnt = 0;
+ 			mddev_trace_remap(conf->mddev, rbi, sh->dev[i].sector);
+-			if (should_defer && op_is_write(op))
++			if (defer_mode)
++				bio_list_add(&group_pending_bios[group_id], rbi);
++			else if (should_defer && op_is_write(op))
+ 				bio_list_add(&pending_bios, rbi);
+ 			else
+ 				submit_bio_noacct(rbi);
+@@ -1354,7 +1556,9 @@ static void ops_run_io(struct stripe_head *sh, struct stripe_head_state *s)
+ 			goto again;
+ 	}
+ 
+-	if (should_defer && !bio_list_empty(&pending_bios))
++	if (defer_mode)
++		groups_defer_issue_bios(conf, group_pending_bios);
++	else if (should_defer && !bio_list_empty(&pending_bios))
+ 		defer_issue_bios(conf, head_sh->sector, &pending_bios);
+ }
+ 
+@@ -5356,6 +5560,21 @@ static void raid5_activate_delayed(struct r5conf *conf)
+ 			raid5_wakeup_stripe_thread(sh);
+ 		}
+ 	}
++
++	/* fnnas: stripes whose writes are done don't wait for preread */
++	while (!list_empty(&conf->stable_list)) {
++		struct stripe_head *sh;
++
++		sh = list_first_entry(&conf->stable_list, struct stripe_head,
++				      lru);
++		list_del_init(&sh->lru);
++		clear_bit(STRIPE_DELAYED, &sh->state);
++		clear_bit(STRIPE_STABLE_STATE, &sh->state);
++		if (!test_and_set_bit(STRIPE_PREREAD_ACTIVE, &sh->state))
++			atomic_inc(&conf->preread_active_stripes);
++		list_add_tail(&sh->lru, &conf->hold_list);
++		raid5_wakeup_stripe_thread(sh);
++	}
+ }
+ 
+ static void activate_bit_delay(struct r5conf *conf,
+@@ -6783,6 +7002,7 @@ static void raid5_do_work(struct work_struct *work)
+ 
+ 	pr_debug("+++ raid5worker active\n");
+ 
++	atomic_inc(&conf->active_stripe_workers);
+ 	blk_start_plug(&plug);
+ 	handled = 0;
+ 	spin_lock_irq(&conf->device_lock);
+@@ -6797,9 +7017,10 @@ static void raid5_do_work(struct work_struct *work)
+ 		if (!batch_size && !released)
+ 			break;
+ 		handled += batch_size;
+-		wait_event_lock_irq(mddev->sb_wait,
+-			!test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags),
+-			conf->device_lock);
++		if (md_sb_pending(mddev))
++			md_wakeup_thread(mddev->thread);
++		wait_event_lock_irq(mddev->sb_wait, !md_sb_pending(mddev),
++				    conf->device_lock);
+ 	}
+ 	pr_debug("%d stripes handled\n", handled);
+ 
+@@ -6812,6 +7033,10 @@ static void raid5_do_work(struct work_struct *work)
+ 	async_tx_issue_pending_all();
+ 	blk_finish_plug(&plug);
+ 
++	if (atomic_dec_and_test(&conf->active_stripe_workers) &&
++	    conf->defer_mode)
++		wakeup_defer_threads(conf);
++
+ 	pr_debug("--- raid5worker inactive\n");
+ }
+ 
+@@ -6833,6 +7058,7 @@ static void raid5d(struct md_thread *thread)
+ 
+ 	md_check_recovery(mddev);
+ 
++	atomic_inc(&conf->active_stripe_workers);
+ 	blk_start_plug(&plug);
+ 	handled = 0;
+ 	spin_lock_irq(&conf->device_lock);
+@@ -6841,8 +7067,7 @@ static void raid5d(struct md_thread *thread)
+ 		int batch_size, released;
+ 		unsigned int offset;
+ 
+-		if (md_is_rdwr(mddev) &&
+-		    test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags))
++		if (md_is_rdwr(mddev) && md_sb_pending(mddev))
+ 			break;
+ 
+ 		released = release_stripe_list(conf, conf->temp_inactive_list);
+@@ -6906,6 +7131,10 @@ static void raid5d(struct md_thread *thread)
+ 	async_tx_issue_pending_all();
+ 	blk_finish_plug(&plug);
+ 
++	if (atomic_dec_and_test(&conf->active_stripe_workers) &&
++	    conf->defer_mode)
++		wakeup_defer_threads(conf);
++
+ 	pr_debug("--- raid5d inactive\n");
+ }
+ 
+@@ -7301,6 +7530,462 @@ raid5_group_thread_cnt = __ATTR(group_thread_cnt, S_IRUGO | S_IWUSR,
+ 				raid5_show_group_thread_cnt,
+ 				raid5_store_group_thread_cnt);
+ 
++/*
++ * fnnas: deferred io dispatch groups, see group_handle_deferred_bios().
++ */
++static void ext_flush_deferred_bios(struct md_thread *thread)
++{
++	struct blk_plug plug;
++	struct mddev *mddev = thread->mddev;
++	struct r5conf *conf = mddev->private;
++	struct r5defer *group = thread->private;
++	int pending_cnt;
++
++	/* timeout wakeup, or the thread runs before the group is ready */
++	if (!conf->defer_mode || !group)
++		return;
++
++	blk_start_plug(&plug);
++	do {
++		if (conf->defer_skip_sort)
++			pending_cnt = group_flush_deferred_bios(group);
++		else
++			pending_cnt = group_handle_deferred_bios(group, conf);
++		cond_resched();
++	} while (pending_cnt >= conf->defer_flush_threshold);
++	blk_finish_plug(&plug);
++}
++
++static void free_raid5_defer_groups(struct mddev *mddev, int group_cnt,
++				    struct r5defer *defer_groups)
++{
++	int i;
++	struct r5defer *group;
++
++	if (!defer_groups)
++		return;
++
++	for (i = 0; i < group_cnt; ++i) {
++		group = &defer_groups[i];
++
++		WARN_ON(group->pending_data_cnt != 0);
++		WARN_ON(!bio_list_empty(&group->pending_bios));
++		WARN_ON(!list_empty(&group->pending_list));
++
++		md_unregister_thread(mddev, &group->defer_thread);
++		kfree(group->pending_data);
++		group->pending_data = NULL;
++	}
++
++	kfree(defer_groups);
++}
++
++static int alloc_raid5_defer_groups(struct mddev *mddev, int *group_cnt,
++				    struct r5defer **defer_groups)
++{
++	int i, j;
++	char name[TASK_COMM_LEN];
++	struct r5defer *group;
++	struct r5defer *groups;
++
++	if (*group_cnt <= 0 || *group_cnt > mddev->raid_disks) {
++		pr_err("%s: bad defer group count: %d, abort\n",
++		       mdname(mddev), *group_cnt);
++		return -EINVAL;
++	}
++
++	if (*group_cnt > DEFER_GROUP_CNT_MAX) {
++		pr_err("%s: bad defer group count: %d, wrap count to %d\n",
++		       mdname(mddev), *group_cnt, DEFER_GROUP_CNT_MAX);
++		*group_cnt = DEFER_GROUP_CNT_MAX;
++	}
++
++	groups = kcalloc(*group_cnt, sizeof(struct r5defer), GFP_NOIO);
++	if (!groups)
++		return -ENOMEM;
++
++	for (i = 0; i < *group_cnt; ++i) {
++		group = &groups[i];
++
++		INIT_LIST_HEAD(&group->free_list);
++		INIT_LIST_HEAD(&group->pending_list);
++		bio_list_init(&group->pending_bios);
++		spin_lock_init(&group->pending_bios_lock);
++		group->pending_data_cnt = 0;
++
++		group->pending_data = kcalloc(DEFER_MAX_SORT_ENT_CNT,
++					      sizeof(struct r5pending_data),
++					      GFP_NOIO);
++		if (!group->pending_data)
++			goto abort;
++		for (j = 0; j < DEFER_MAX_SORT_ENT_CNT; ++j)
++			list_add(&group->pending_data[j].sibling,
++				 &group->free_list);
++
++		sprintf(name, "defer%d", i);
++		group->defer_thread = md_register_thread(ext_flush_deferred_bios,
++							 mddev, name);
++		if (!group->defer_thread) {
++			pr_err("%s: failed to create defer_thread\n",
++			       mdname(mddev));
++			goto abort;
++		}
++		group->defer_thread->private = group;
++	}
++
++	*defer_groups = groups;
++	return 0;
++
++abort:
++	free_raid5_defer_groups(mddev, *group_cnt, groups);
++	return -ENOMEM;
++}
++
++/* fnnas: regroup the member disks after raid_disks or disk_cnt_max changed */
++static int adjust_raid5_defer_groups(struct mddev *mddev)
++{
++	int err;
++	int old_group_cnt, new_group_cnt;
++	struct r5defer *old_groups;
++	struct r5defer *new_groups = NULL;
++	struct r5conf *conf = mddev->private;
++
++	old_groups = conf->defer_groups;
++	old_group_cnt = conf->defer_group_cnt;
++	new_group_cnt = (mddev->raid_disks - 1) /
++			conf->defer_group_disk_cnt_max + 1;
++
++	if (new_group_cnt == old_group_cnt ||
++	    (new_group_cnt >= DEFER_GROUP_CNT_MAX &&
++	     old_group_cnt >= DEFER_GROUP_CNT_MAX))
++		return 0;
++
++	err = alloc_raid5_defer_groups(mddev, &new_group_cnt, &new_groups);
++	if (err) {
++		pr_err("md: %s: failed to adjust defer groups from %d to %d\n",
++		       mdname(mddev), old_group_cnt, new_group_cnt);
++		return err;
++	}
++
++	conf->defer_groups = new_groups;
++	conf->defer_group_cnt = new_group_cnt;
++	free_raid5_defer_groups(mddev, old_group_cnt, old_groups);
++	return 0;
++}
++
++static ssize_t
++raid5_show_defer_group_cnt(struct mddev *mddev, char *page)
++{
++	struct r5conf *conf;
++	int ret = 0;
++
++	spin_lock(&mddev->lock);
++	conf = mddev->private;
++	if (conf)
++		ret = sprintf(page, "%d\n", conf->defer_group_cnt);
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static ssize_t
++raid5_store_defer_group_cnt(struct mddev *mddev, const char *page, size_t len)
++{
++	struct r5conf *conf;
++	unsigned int new;
++	int old_group_cnt;
++	struct r5defer *old_groups;
++	struct r5defer *new_groups = NULL;
++	int err;
++
++	if (len >= PAGE_SIZE)
++		return -EINVAL;
++	if (kstrtouint(page, 10, &new))
++		return -EINVAL;
++
++	err = mddev_suspend_and_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf) {
++		err = -ENODEV;
++		goto out;
++	}
++	if (new == 0 || new > DEFER_GROUP_CNT_MAX || new > mddev->raid_disks) {
++		err = -EINVAL;
++		goto out;
++	}
++	if (new == conf->defer_group_cnt)
++		goto out;
++
++	old_groups = conf->defer_groups;
++	old_group_cnt = conf->defer_group_cnt;
++	err = alloc_raid5_defer_groups(mddev, (int *)&new, &new_groups);
++	if (err) {
++		pr_err("md: %s: failed to change defer groups\n",
++		       mdname(mddev));
++		goto out;
++	}
++
++	conf->defer_groups = new_groups;
++	conf->defer_group_cnt = new;
++	free_raid5_defer_groups(mddev, old_group_cnt, old_groups);
++	pr_warn("md: %s: change defer groups from %d to %d\n",
++		mdname(mddev), old_group_cnt, conf->defer_group_cnt);
++out:
++	mddev_unlock_and_resume(mddev);
++	return err ?: len;
++}
++
++static struct md_sysfs_entry
++raid5_defer_group_cnt = __ATTR(defer_group_cnt, S_IRUGO | S_IWUSR,
++			       raid5_show_defer_group_cnt,
++			       raid5_store_defer_group_cnt);
++
++static ssize_t
++raid5_show_defer_mode(struct mddev *mddev, char *page)
++{
++	struct r5conf *conf;
++	int ret = 0;
++
++	spin_lock(&mddev->lock);
++	conf = mddev->private;
++	if (conf)
++		ret = sprintf(page, "%d\n", conf->defer_mode);
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static ssize_t
++raid5_store_defer_mode(struct mddev *mddev, const char *page, size_t len)
++{
++	struct r5conf *conf;
++	unsigned long new;
++	int err;
++
++	if (len >= PAGE_SIZE)
++		return -EINVAL;
++	if (kstrtoul(page, 10, &new))
++		return -EINVAL;
++	new = !!new;
++
++	err = mddev_suspend_and_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf) {
++		err = -ENODEV;
++	} else if (!conf->defer_groups) {
++		pr_err("md: %s: defer_groups did not allocated, refuse to adjust defer_mode\n",
++		       mdname(mddev));
++		err = -ENODEV;
++	} else if (new != conf->defer_mode) {
++		conf->defer_mode = new;
++		pr_err("md: %s: change defer mode to %d\n",
++		       mdname(mddev), conf->defer_mode);
++	}
++	mddev_unlock_and_resume(mddev);
++	return err ?: len;
++}
++
++static struct md_sysfs_entry
++raid5_defer_mode = __ATTR(defer_mode, S_IRUGO | S_IWUSR,
++			  raid5_show_defer_mode,
++			  raid5_store_defer_mode);
++
++static ssize_t
++raid5_show_defer_flush_threshold(struct mddev *mddev, char *page)
++{
++	struct r5conf *conf;
++	int ret = 0;
++
++	spin_lock(&mddev->lock);
++	conf = mddev->private;
++	if (conf)
++		ret = sprintf(page, "%d\n", conf->defer_flush_threshold);
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static ssize_t
++raid5_store_defer_flush_threshold(struct mddev *mddev, const char *page,
++				  size_t len)
++{
++	struct r5conf *conf;
++	unsigned long new;
++	int err;
++
++	if (len >= PAGE_SIZE)
++		return -EINVAL;
++	if (kstrtoul(page, 10, &new))
++		return -EINVAL;
++	if (new == 0 || new > DEFER_FLUSH_MAX)
++		return -EINVAL;
++
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf)
++		err = -ENODEV;
++	else
++		conf->defer_flush_threshold = new;
++	mddev_unlock(mddev);
++	return err ?: len;
++}
++
++static struct md_sysfs_entry
++raid5_defer_flush_threshold = __ATTR(defer_flush_threshold,
++				     S_IRUGO | S_IWUSR,
++				     raid5_show_defer_flush_threshold,
++				     raid5_store_defer_flush_threshold);
++
++static ssize_t
++raid5_show_defer_group_disk_cnt_max(struct mddev *mddev, char *page)
++{
++	struct r5conf *conf;
++	int ret = 0;
++
++	spin_lock(&mddev->lock);
++	conf = mddev->private;
++	if (conf)
++		ret = sprintf(page, "%d\n", conf->defer_group_disk_cnt_max);
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static ssize_t
++raid5_store_defer_group_disk_cnt_max(struct mddev *mddev, const char *page,
++				     size_t len)
++{
++	struct r5conf *conf;
++	unsigned long new;
++	int old;
++	int err;
++
++	if (len >= PAGE_SIZE)
++		return -EINVAL;
++	if (kstrtoul(page, 10, &new))
++		return -EINVAL;
++	if (new == 0 || new > DEFER_GROUP_DISK_CNT_MAX)
++		return -EINVAL;
++
++	err = mddev_suspend_and_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf) {
++		err = -ENODEV;
++	} else if (new != conf->defer_group_disk_cnt_max) {
++		old = conf->defer_group_disk_cnt_max;
++		conf->defer_group_disk_cnt_max = new;
++		err = adjust_raid5_defer_groups(mddev);
++		if (err)
++			conf->defer_group_disk_cnt_max = old;
++		else
++			pr_err("md: %s: change defer group disk cnt max to %d\n",
++			       mdname(mddev), conf->defer_group_disk_cnt_max);
++	}
++	mddev_unlock_and_resume(mddev);
++	return err ?: len;
++}
++
++static struct md_sysfs_entry
++raid5_defer_group_disk_cnt_max = __ATTR(defer_group_disk_cnt_max,
++					S_IRUGO | S_IWUSR,
++					raid5_show_defer_group_disk_cnt_max,
++					raid5_store_defer_group_disk_cnt_max);
++
++static ssize_t
++raid5_show_defer_flush_batch_size(struct mddev *mddev, char *page)
++{
++	struct r5conf *conf;
++	int ret = 0;
++
++	spin_lock(&mddev->lock);
++	conf = mddev->private;
++	if (conf)
++		ret = sprintf(page, "%d\n", conf->defer_flush_batch_size);
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static ssize_t
++raid5_store_defer_flush_batch_size(struct mddev *mddev, const char *page,
++				   size_t len)
++{
++	struct r5conf *conf;
++	unsigned long new;
++	int err;
++
++	if (len >= PAGE_SIZE)
++		return -EINVAL;
++	if (kstrtoul(page, 10, &new))
++		return -EINVAL;
++	if (new == 0 || new > DEFER_FLUSH_MAX)
++		return -EINVAL;
++
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf)
++		err = -ENODEV;
++	else
++		conf->defer_flush_batch_size = new;
++	mddev_unlock(mddev);
++	return err ?: len;
++}
++
++static struct md_sysfs_entry
++raid5_defer_flush_batch_size = __ATTR(defer_flush_batch_size,
++				      S_IRUGO | S_IWUSR,
++				      raid5_show_defer_flush_batch_size,
++				      raid5_store_defer_flush_batch_size);
++
++static ssize_t
++raid5_show_defer_skip_sort(struct mddev *mddev, char *page)
++{
++	struct r5conf *conf;
++	int ret = 0;
++
++	spin_lock(&mddev->lock);
++	conf = mddev->private;
++	if (conf)
++		ret = sprintf(page, "%d\n", conf->defer_skip_sort);
++	spin_unlock(&mddev->lock);
++	return ret;
++}
++
++static ssize_t
++raid5_store_defer_skip_sort(struct mddev *mddev, const char *page, size_t len)
++{
++	struct r5conf *conf;
++	unsigned long new;
++	int err;
++
++	if (len >= PAGE_SIZE)
++		return -EINVAL;
++	if (kstrtoul(page, 10, &new))
++		return -EINVAL;
++	new = !!new;
++
++	err = mddev_lock(mddev);
++	if (err)
++		return err;
++	conf = mddev->private;
++	if (!conf)
++		err = -ENODEV;
++	else
++		conf->defer_skip_sort = new;
++	mddev_unlock(mddev);
++	return err ?: len;
++}
++
++static struct md_sysfs_entry
++raid5_defer_skip_sort = __ATTR(defer_skip_sort, S_IRUGO | S_IWUSR,
++			       raid5_show_defer_skip_sort,
++			       raid5_store_defer_skip_sort);
++
+ static struct attribute *raid5_attrs[] =  {
+ 	&raid5_stripecache_size.attr,
+ 	&raid5_stripecache_active.attr,
+@@ -7311,6 +7996,12 @@ static struct attribute *raid5_attrs[] =  {
+ 	&raid5_stripe_size.attr,
+ 	&r5c_journal_mode.attr,
+ 	&ppl_write_hint.attr,
++	&raid5_defer_group_cnt.attr,
++	&raid5_defer_mode.attr,
++	&raid5_defer_flush_threshold.attr,
++	&raid5_defer_group_disk_cnt_max.attr,
++	&raid5_defer_flush_batch_size.attr,
++	&raid5_defer_skip_sort.attr,
+ 	NULL,
+ };
+ static const struct attribute_group raid5_attrs_group = {
+@@ -7454,7 +8145,8 @@ static void free_conf(struct r5conf *conf)
+ 	kfree(conf->pending_data);
+ 
+ 	mempool_destroy(conf->ctx_pool);
+-
++	free_raid5_defer_groups(conf->mddev, conf->defer_group_cnt,
++				conf->defer_groups);
+ 	kfree(conf);
+ }
+ 
+@@ -7534,6 +8226,17 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+ 	int group_cnt;
+ 	struct r5worker_group *new_group;
+ 	int ret = -ENOMEM;
++	int worker_cnt = 0;
++	int defer_group_cnt = (mddev->raid_disks - 1) /
++			      DEFER_GROUP_DISK_CNT_MAX + 1;
++	struct r5defer *defer_groups = NULL;
++
++	/* fnnas: enable multi-threading by default for big arrays */
++	if (mddev->new_level == 5 || mddev->new_level == 6) {
++		worker_cnt = num_online_cpus() / 2;
++		if (worker_cnt)
++			worker_cnt = min(mddev->raid_disks / 8, worker_cnt);
++	}
+ 
+ 	if (mddev->new_level != 5
+ 	    && mddev->new_level != 4
+@@ -7585,13 +8288,37 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+ 		goto abort;
+ 	for (i = 0; i < PENDING_IO_MAX; i++)
+ 		list_add(&conf->pending_data[i].sibling, &conf->free_list);
+-	/* Don't enable multi-threading by default*/
+-	if (!alloc_thread_groups(conf, 0, &group_cnt, &new_group)) {
++	if (!alloc_thread_groups(conf, worker_cnt, &group_cnt, &new_group)) {
+ 		conf->group_cnt = group_cnt;
+-		conf->worker_cnt_per_group = 0;
++		conf->worker_cnt_per_group = worker_cnt;
+ 		conf->worker_groups = new_group;
+ 	} else
+ 		goto abort;
++
++	conf->defer_mode = 0;
++	conf->defer_flush_threshold = DEFER_NONROT_FLUSH_THRESHOLD;
++	conf->defer_flush_batch_size = DEFER_DEFAULT_FLUSH_BATCH;
++	conf->defer_group_disk_cnt_max = DEFER_GROUP_DISK_CNT_MAX;
++	conf->defer_skip_sort = true;
++	atomic_set(&conf->active_stripe_workers, 0);
++	rdev_for_each(rdev, mddev)
++		if (!bdev_nonrot(rdev->bdev)) {
++			conf->defer_flush_threshold =
++				DEFER_DEFAULT_FLUSH_THRESHOLD;
++			conf->defer_skip_sort = false;
++			break;
++		}
++
++	if (!alloc_raid5_defer_groups(mddev, &defer_group_cnt, &defer_groups)) {
++		conf->defer_group_cnt = defer_group_cnt;
++		conf->defer_groups = defer_groups;
++		conf->defer_mode = 1;
++	} else {
++		conf->defer_groups = NULL;
++		pr_err("md: %s: defer_groups did not allocated\n",
++		       mdname(mddev));
++	}
++
+ 	spin_lock_init(&conf->device_lock);
+ 	seqcount_spinlock_init(&conf->gen_lock, &conf->device_lock);
+ 	mutex_init(&conf->cache_size_mutex);
+@@ -7604,6 +8331,7 @@ static struct r5conf *setup_conf(struct mddev *mddev)
+ 	INIT_LIST_HEAD(&conf->hold_list);
+ 	INIT_LIST_HEAD(&conf->delayed_list);
+ 	INIT_LIST_HEAD(&conf->bitmap_list);
++	INIT_LIST_HEAD(&conf->stable_list);
+ 	init_llist_head(&conf->released_stripes);
+ 	atomic_set(&conf->active_stripes, 0);
+ 	atomic_set(&conf->preread_active_stripes, 0);
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 53eb0c606..4bdac4154 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -561,7 +561,26 @@ struct r5pending_data {
+ 	int count;	/* fnnas: number of bios */
+ };
+ 
+-/* fnnas: deferred io dispatch group, see r5conf->defer_groups */
++/*
++ * fnnas: deferred io dispatch groups (derived from Synology's raid5
++ * "syno_defer" code). Member disk i belongs to group i % defer_group_cnt,
++ * every group has its own "defer%d" thread which sorts the pending bios
++ * by sector and submits them in batches.
++ */
++#define DEFER_MAX_SORT_ENT_CNT		512
++#define DEFER_DEFAULT_FLUSH_THRESHOLD	2048	/* rotational member disks */
++#define DEFER_NONROT_FLUSH_THRESHOLD	64
++#define DEFER_DEFAULT_FLUSH_BATCH	512
++#define DEFER_FLUSH_MAX			32768
++#define DEFER_GROUP_CNT_MAX		6
++#define DEFER_GROUP_DISK_CNT_MAX	4
++
++enum r5defer_flags {
++	DEFER_FLUSH_ALL,	/* flush all bios when all stripes have
++				 * been handled
++				 */
++};
++
+ struct r5defer {
+ 	struct list_head	free_list;
+ 	struct list_head	pending_list;

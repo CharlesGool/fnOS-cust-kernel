@@ -1,0 +1,1307 @@
+From fcae1453668007e0ee1e74b60525f9fa704e0429 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:30 +0000
+Subject: [PATCH 056/110] =?UTF-8?q?trimafs2:=20=E6=96=B0=E5=A2=9E=E5=86=85?=
+ =?UTF-8?q?=E9=83=A8=E5=A4=B4=E6=96=87=E4=BB=B6=E3=80=81=E8=B6=85=E7=BA=A7?=
+ =?UTF-8?q?=E5=9D=97=E4=B8=8E=20dentry=20=E6=93=8D=E4=BD=9C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+还原飞牛私有的 TRIM aggregate stacking filesystem(trimafs2.ko)的
+super.c / dentry.c / internal.h. 结构体布局按 BTF, 源文件按函数地址
+区间和 WARN 行号划分. 上层是内存目录树, 桥(bridge)下的对象转发给
+下层文件系统.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/trimafs2/dentry.c   | 179 ++++++++++
+ fs/trimafs2/internal.h | 346 +++++++++++++++++++
+ fs/trimafs2/super.c    | 739 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 1264 insertions(+)
+ create mode 100644 fs/trimafs2/dentry.c
+ create mode 100644 fs/trimafs2/internal.h
+ create mode 100644 fs/trimafs2/super.c
+
+diff --git a/fs/trimafs2/dentry.c b/fs/trimafs2/dentry.c
+new file mode 100644
+index 000000000..083e647df
+--- /dev/null
++++ b/fs/trimafs2/dentry.c
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TRIM aggregate stacking filesystem: dentry 操作
++ */
++#include <linux/slab.h>
++#include "internal.h"
++
++static void trimafs2_d_release(struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++
++	if (!di)
++		return;
++
++	if (WARN_ON_ONCE(di->pinned)) {
++		struct trimafs2_fs_info *fsi = dentry->d_sb->s_fs_info;
++
++		spin_lock(&fsi->pinned_lock);
++		if (di->pinned) {
++			list_del_init(&di->pinned_node);
++			di->pinned = false;
++		}
++		spin_unlock(&fsi->pinned_lock);
++	}
++
++	dentry->d_fsdata = NULL;
++	if (di->lower_dentry)
++		dput(di->lower_dentry);
++	if (di->branch)
++		trimafs2_branch_put(di->branch);
++	kfree(di);
++}
++
++/* 顶层桥的下层已失效: 拆掉桥, 更新父目录 */
++static void trimafs2_expire_top_bridge(struct dentry *dentry)
++{
++	struct inode *dir = d_inode(dentry->d_parent);
++
++	if (trimafs2_drop_top_branch(dentry) && dir) {
++		if (dir->i_nlink)
++			drop_nlink(dir);
++		inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
++	}
++}
++
++static int trimafs2_d_init(struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di;
++
++	di = kzalloc(sizeof(*di), GFP_KERNEL);
++	if (!di)
++		return -ENOMEM;
++	di->dentry = dentry;
++	INIT_LIST_HEAD(&di->pinned_node);
++	dentry->d_fsdata = di;
++	return 0;
++}
++
++static int trimafs2_d_revalidate(struct inode *dir, const struct qstr *name,
++				 struct dentry *dentry, unsigned int flags)
++{
++	struct trimafs2_dentry_info *di;
++	struct path lower_path = {};
++	struct dentry *lower, *parent;
++	struct inode *inode, *lower_inode;
++	bool top;
++	int ret;
++
++	if (flags & LOOKUP_RCU)
++		return -ECHILD;
++
++	if (!trimafs2_has_lower(dentry)) {
++		struct path parent_path = {};
++		struct qstr this = *name;
++		struct dentry *child;
++
++		/* 上层对象, 或者桥下的负 dentry: 下层出现同名对象就作废 */
++		if (d_really_is_positive(dentry))
++			return 1;
++		parent = dget_parent(dentry);
++		if (!trimafs2_has_lower(parent)) {
++			dput(parent);
++			return 1;
++		}
++		trimafs2_get_lower_path(parent, &parent_path);
++		child = lookup_noperm_positive_unlocked(&this, parent_path.dentry);
++		path_put(&parent_path);
++		dput(parent);
++		if (IS_ERR(child))
++			return PTR_ERR(child) == -ENOENT;
++		dput(child);
++		return 0;
++	}
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	lower = lower_path.dentry;
++	di = TRIMAFS2_D(dentry);
++	top = di && di->pinned && di->lower_dentry && di->branch;
++
++	if (trimafs2_validate_lower_runtime_path(&lower_path)) {
++		if (top)
++			trimafs2_expire_top_bridge(dentry);
++		goto invalid;
++	}
++
++	if (dentry->d_flags & DCACHE_DISCONNECTED) {
++		inode = d_inode(dentry);
++		lower_inode = d_inode(lower);
++		if (!lower_inode)
++			goto invalid;
++		if (!trimafs2_inode_matches_lower(inode, trimafs2_dentry_branch_id(dentry), lower_inode))
++			goto invalid;
++		fsstack_copy_attr_all(inode, lower_inode);
++		fsstack_copy_inode_size(inode, lower_inode);
++		ret = inode->i_nlink != 0;
++		goto out;
++	}
++
++	if (d_unlinked(lower)) {
++		if (top)
++			trimafs2_expire_top_bridge(dentry);
++		goto invalid;
++	}
++
++	if ((lower->d_flags & DCACHE_OP_REVALIDATE) && !top) {
++		struct name_snapshot n = {};
++		struct dentry *lower_parent = dget_parent(lower);
++
++		take_dentry_name_snapshot(&n, lower);
++		ret = lower->d_op->d_revalidate(d_inode(lower_parent), &n.name, lower, flags);
++		release_dentry_name_snapshot(&n);
++		dput(lower_parent);
++		if (ret <= 0)
++			goto out;
++	}
++
++	ret = 1;
++	if (!d_inode(dentry))
++		goto out;
++
++	parent = dget_parent(dentry);
++	if (trimafs2_has_lower(parent)) {
++		struct dentry *lower_parent = dget_parent(lower);
++		struct trimafs2_dentry_info *pdi = TRIMAFS2_D(parent);
++
++		if (lower_parent != (pdi ? pdi->lower_dentry : NULL) ||
++		    !d_same_name(lower, lower_parent, name) || d_really_is_negative(lower)) {
++			dput(lower_parent);
++			dput(parent);
++			goto invalid;
++		}
++		dput(lower_parent);
++	}
++	dput(parent);
++
++	inode = d_inode(dentry);
++	lower_inode = d_inode(lower);
++	if (!inode || !lower_inode)
++		goto out;
++	if (!trimafs2_inode_matches_lower(inode, trimafs2_dentry_branch_id(dentry), lower_inode))
++		goto invalid;
++	fsstack_copy_attr_all(inode, lower_inode);
++	fsstack_copy_inode_size(inode, lower_inode);
++	if (!inode->i_nlink)
++		goto invalid;
++	goto out;
++
++invalid:
++	ret = 0;
++out:
++	path_put(&lower_path);
++	return ret;
++}
++
++const struct dentry_operations trimafs2_dops = {
++	.d_revalidate	= trimafs2_d_revalidate,
++	.d_init		= trimafs2_d_init,
++	.d_release	= trimafs2_d_release,
++};
+diff --git a/fs/trimafs2/internal.h b/fs/trimafs2/internal.h
+new file mode 100644
+index 000000000..167322bf4
+--- /dev/null
++++ b/fs/trimafs2/internal.h
+@@ -0,0 +1,346 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * TRIM aggregate stacking filesystem (trimafs2)
++ *
++ * 上层是一棵内存目录树(类似 ramfs), 由 root 在其中用绝对路径 symlink
++ * 建立"桥"(bridge), 每个桥对应一个下层目录(branch). 桥以下的对象全部
++ * 转发到下层文件系统.
++ */
++#ifndef _FS_TRIMAFS2_INTERNAL_H
++#define _FS_TRIMAFS2_INTERNAL_H
++
++#include <linux/fs.h>
++#include <linux/dcache.h>
++#include <linux/mount.h>
++#include <linux/namei.h>
++#include <linux/path.h>
++#include <linux/xarray.h>
++#include <linux/siphash.h>
++#include <linux/hash.h>
++#include <linux/fs_stack.h>
++#include <linux/exportfs.h>
++#include <linux/fs_parser.h>
++#include <linux/trim_acl.h>
++
++#define TRIMAFS2_SUPER_MAGIC	0x7125af01
++
++#define TRIMAFS2_MAX_SYNC_MNTS		256
++#define TRIMAFS2_MAX_STATFS_SB		256
++#define TRIMAFS2_MAX_STATFS_DEPTH	4096
++#define TRIMAFS2_MAX_DECODE_DEPTH	4096
++
++/* 文件句柄类型 */
++#define TRIMAFS2_FILEID_ROOT	0xa1
++#define TRIMAFS2_FILEID_LOWER	0xa2
++#define TRIMAFS2_FID_ROOT_WORDS	3
++#define TRIMAFS2_FID_LOWER_HDR_WORDS	5
++#define TRIMAFS2_FID_LOWER_FH_WORDS	24
++
++enum trimafs2_ino_mode {
++	TRIMAFS2_INO_MODE_32 = 0,
++	TRIMAFS2_INO_MODE_64 = 1,
++};
++
++enum trimafs2_fs_type {
++	TRIMAFS2_FS_TYPE_DEFAULT,
++	TRIMAFS2_FS_TYPE_NFS,
++};
++
++struct trimafs2_mount_opts {
++	umode_t mode;
++	bool trimacl;
++	enum trimafs2_ino_mode ino_mode;
++};
++
++struct trimafs2_fs_info {
++	struct trimafs2_mount_opts mount_opts;
++	atomic64_t next_branch_id;
++	atomic64_t next_internal_id;
++	u32 fh_gen;
++	siphash_key_t ino_hash_key;
++	u64 ino_mix_seed;
++	struct xarray branches;
++	spinlock_t stack_depth_lock;
++	spinlock_t pinned_lock;
++	struct list_head pinned_dentries;
++};
++
++struct trimafs2_inode_info {
++	u64 branch_id;
++	u64 internal_id;
++	dev_t lower_dev;
++	unsigned long lower_ino;
++	u32 lower_generation;
++	umode_t lower_type;
++	struct inode *lower_inode;
++	struct rcu_head rcu;
++	struct inode vfs_inode;
++};
++
++struct trimafs2_branch {
++	refcount_t refs;
++	struct super_block *sb;
++	u64 branch_id;
++	struct dentry *upper_dentry;
++	struct vfsmount *lower_mnt;
++};
++
++struct trimafs2_dentry_info {
++	struct dentry *lower_dentry;
++	struct trimafs2_branch *branch;
++	u64 branch_id;
++	struct dentry *dentry;
++	struct list_head pinned_node;
++	bool pinned;
++	bool disconnected_nfs_path;
++};
++
++struct trimafs2_file_info {
++	struct file *lower_file;
++};
++
++struct trimafs2_inode_key {
++	u64 branch_id;
++	dev_t lower_dev;
++	unsigned long lower_ino;
++	u32 lower_generation;
++	umode_t lower_type;
++	u64 upper_ino;
++	struct inode *lower_inode;
++};
++
++struct trimafs2_fid_root {
++	__u32 gen;
++	__u64 object_id;
++} __packed;
++
++struct trimafs2_fid_lower {
++	__u32 gen;
++	__u32 fh_type;
++	__u32 fh_len;
++	__u64 branch_id;
++	__u32 lower_fh[TRIMAFS2_FID_LOWER_FH_WORDS];
++} __packed;
++
++union trimafs2_fid {
++	struct trimafs2_fid_root root;
++	struct trimafs2_fid_lower lower;
++};
++
++static inline struct trimafs2_fs_info *TRIMAFS2_SB(const struct super_block *sb)
++{
++	return sb->s_fs_info;
++}
++
++static inline struct trimafs2_inode_info *TRIMAFS2_I(const struct inode *inode)
++{
++	return container_of(inode, struct trimafs2_inode_info, vfs_inode);
++}
++
++static inline struct trimafs2_dentry_info *TRIMAFS2_D(const struct dentry *dentry)
++{
++	return dentry->d_fsdata;
++}
++
++/* dentry 是否已经接到下层(桥本身或桥以下的对象) */
++static inline struct trimafs2_file_info *TRIMAFS2_F(const struct file *file)
++{
++	return file->private_data;
++}
++
++static inline bool trimafs2_has_lower(const struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++
++	return di && di->lower_dentry && di->branch;
++}
++
++/* 调用方先确认 trimafs2_has_lower() */
++static inline void trimafs2_get_lower_path(const struct dentry *dentry, struct path *path)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++
++	path->dentry = dget(di->lower_dentry);
++	path->mnt = mntget(di->branch->lower_mnt);
++}
++
++static inline u64 trimafs2_dentry_branch_id(const struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++
++	return di && di->branch ? di->branch->branch_id : 0;
++}
++
++static inline struct vfsmount *trimafs2_dentry_lower_mnt(const struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++
++	return di && di->branch ? di->branch->lower_mnt : NULL;
++}
++
++/* 打开的下层文件; 不是下层对象时返回 NULL */
++static inline struct file *trimafs2_lower_file(const struct file *file)
++{
++	struct trimafs2_file_info *fi;
++
++	if (!trimafs2_has_lower(file->f_path.dentry))
++		return NULL;
++	fi = file->private_data;
++	return fi ? fi->lower_file : NULL;
++}
++
++/* 上层 inode 记录的下层身份和当前下层 inode 是否一致 */
++static inline bool trimafs2_inode_matches_lower(const struct inode *inode, u64 branch_id,
++						const struct inode *lower_inode)
++{
++	const struct trimafs2_inode_info *ii = TRIMAFS2_I(inode);
++
++	return ii->branch_id == branch_id &&
++	       ii->lower_dev == lower_inode->i_sb->s_dev &&
++	       ii->lower_ino == lower_inode->i_ino &&
++	       ii->lower_generation == lower_inode->i_generation &&
++	       ii->lower_type == (lower_inode->i_mode & S_IFMT);
++}
++
++/* 复制下层属性, 但保留上层自己的 inode 号 */
++static inline void trimafs2_copy_lower_attrs(struct inode *inode, struct inode *lower_inode)
++{
++	unsigned long ino = inode->i_ino;
++
++	fsstack_copy_attr_all(inode, lower_inode);
++	fsstack_copy_inode_size(inode, lower_inode);
++	inode->i_ino = ino;
++}
++
++static inline u32 trimafs2_hash(u64 v)
++{
++	return v * GOLDEN_RATIO_64;
++}
++
++/* super.c */
++extern atomic64_t trimafs2_inode_count;
++extern const struct fs_parameter_spec trimafs2_fs_parameters[];
++int trimafs2_init_fs_context(struct fs_context *fc);
++void trimafs2_kill_sb(struct super_block *sb);
++void trimafs2_note_dentry_path_release_queued(void);
++void trimafs2_note_dentry_path_release_done(void);
++u64 trimafs2_alloc_internal_id(struct super_block *sb);
++u64 trimafs2_map_ino(struct super_block *sb, u64 branch_id, u64 lower_ino);
++u64 trimafs2_dentry_ino(struct dentry *dentry);
++void trimafs2_pin_dentry(struct dentry *dentry);
++bool trimafs2_forget_dentry_pin(struct dentry *dentry);
++void trimafs2_repin_dentry(struct dentry *dentry);
++void trimafs2_drop_pinned_dentries(struct super_block *sb);
++
++/* dentry.c */
++extern const struct dentry_operations trimafs2_dops;
++
++/* inode.c */
++extern const struct inode_operations trimafs2_dir_iops;
++extern const struct inode_operations trimafs2_file_iops;
++extern const struct inode_operations trimafs2_symlink_iops;
++extern const struct inode_operations trimafs2_special_iops;
++extern const struct xattr_handler * const trimafs2_xattr_handlers[];
++bool trimafs2_is_nfs_path(const struct dentry *dentry);
++struct inode *trimafs2_find_internal_inode(struct super_block *sb, u64 object_id);
++struct inode *trimafs2_get_lower_inode(struct super_block *sb, const struct path *lower_path,
++				       u64 branch_id);
++struct inode *trimafs2_get_inode(struct super_block *sb, struct inode *dir, umode_t mode, dev_t dev);
++int trimafs2_interpose(struct dentry *dentry, const struct path *lower_path, u64 branch_id);
++bool trimafs2_drop_top_branch(struct dentry *dentry);
++struct posix_acl *trimafs2_get_inode_acl(struct inode *inode, int type, bool rcu);
++int trimafs2_permission(struct mnt_idmap *idmap, struct inode *inode, int mask);
++int trimafs2_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat,
++		     u32 request_mask, unsigned int query_flags);
++int trimafs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *ia);
++ssize_t trimafs2_listxattr(struct dentry *dentry, char *buffer, size_t size);
++int trimafs2_set_acl(struct mnt_idmap *idmap, struct dentry *dentry, struct posix_acl *acl, int type);
++int trimafs2_is_trimacl(struct dentry *dentry);
++int trimafs2_trimacl_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask);
++int trimafs2_trim_acl_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *stat);
++int trimafs2_get_trimacl_xattr_all(struct mnt_idmap *idmap, struct dentry *dentry, unsigned int flags,
++				   void __user *buffer, size_t buffer_size);
++int trimafs2_trim_access(struct mnt_idmap *idmap, struct dentry *dentry, int mode,
++			 struct trim_access_t *ta);
++int trimafs2_trim_access_delete(struct mnt_idmap *idmap, struct dentry *dentry,
++				struct trim_access_t *ta);
++int trimafs2_get_permission(struct mnt_idmap *idmap, struct dentry *dentry,
++			    struct trim_access_t *ta);
++
++/* file.c */
++extern const struct file_operations trimafs2_dir_fops;
++extern const struct file_operations trimafs2_file_fops;
++int trimafs2_open(struct inode *inode, struct file *file);
++int trimafs2_release(struct inode *inode, struct file *file);
++int trimafs2_dir_open(struct inode *inode, struct file *file);
++int trimafs2_dir_release(struct inode *inode, struct file *file);
++
++/* export.c */
++extern const struct export_operations trimafs2_export_ops;
++int trimafs2_validate_lower_path(const struct path *lower_path);
++int trimafs2_validate_lower_runtime_path(const struct path *lower_path);
++struct trimafs2_branch *trimafs2_branch_get(struct super_block *sb, u64 branch_id);
++void trimafs2_branch_put(struct trimafs2_branch *branch);
++int trimafs2_check_stack_depth(struct super_block *sb, const struct path *lower_path);
++int trimafs2_register_branch(struct dentry *upper_dentry, const struct path *lower_path, u64 branch_id);
++void trimafs2_unregister_branch(struct super_block *sb, u64 branch_id);
++void trimafs2_destroy_branches(struct super_block *sb);
++
++/*
++ * 把 dentry 接到下层 lower_path. 已经接过的只核对是否同一个下层对象.
++ */
++static inline int trimafs2_set_lower(struct dentry *dentry, const struct path *lower_path,
++				     u64 branch_id)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++	struct trimafs2_branch *branch;
++
++	if (WARN_ON_ONCE(!di))
++		return -EINVAL;
++
++	if (di->lower_dentry || di->branch) {
++		if (WARN_ON_ONCE(di->lower_dentry != lower_path->dentry || !di->branch ||
++				 di->branch->lower_mnt != lower_path->mnt ||
++				 di->branch->branch_id != branch_id))
++			return -ESTALE;
++		return 0;
++	}
++
++	branch = trimafs2_branch_get(dentry->d_sb, branch_id);
++	if (!branch)
++		return -ESTALE;
++	if (branch->lower_mnt != lower_path->mnt) {
++		trimafs2_branch_put(branch);
++		return -ESTALE;
++	}
++	di->lower_dentry = dget(lower_path->dentry);
++	di->branch = branch;
++	di->branch_id = branch_id;
++	return 0;
++}
++
++static inline void trimafs2_clear_lower(struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++	struct trimafs2_branch *branch;
++	struct dentry *lower;
++	struct inode *lower_inode = NULL;
++
++	if (!di)
++		return;
++
++	lower = di->lower_dentry;
++	branch = di->branch;
++	if (lower && d_inode(lower))
++		lower_inode = igrab(d_inode(lower));
++	di->lower_dentry = NULL;
++	di->branch = NULL;
++	di->branch_id = 0;
++	if (lower)
++		dput(lower);
++	iput(lower_inode);
++	if (branch)
++		trimafs2_branch_put(branch);
++}
++
++#endif /* _FS_TRIMAFS2_INTERNAL_H */
+diff --git a/fs/trimafs2/super.c b/fs/trimafs2/super.c
+new file mode 100644
+index 000000000..fa031f68e
+--- /dev/null
++++ b/fs/trimafs2/super.c
+@@ -0,0 +1,739 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TRIM aggregate stacking filesystem: 超级块、挂载参数、统计
++ */
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/statfs.h>
++#include <linux/seq_file.h>
++#include <linux/debugfs.h>
++#include <linux/random.h>
++#include <linux/percpu.h>
++#include <linux/pagemap.h>
++#include "internal.h"
++
++struct trimafs2_ino_stats {
++	u64 ino32_direct;
++	u64 ino32_fallback;
++	u64 ino64_direct;
++	u64 ino64_fallback;
++};
++
++struct trimafs2_statfs_sum {
++	struct super_block *seen[TRIMAFS2_MAX_STATFS_SB];
++	u64 bytes_free;
++	u64 bytes_total;
++	u64 bytes_avail;
++	u64 files;
++	u64 ffree;
++};
++
++struct trimafs2_statfs_frame {
++	struct dentry *parent;
++	struct dentry *cursor;
++};
++
++enum trimafs2_param {
++	Opt_mode,
++	Opt_trimacl,
++	Opt_ino,
++};
++
++atomic64_t trimafs2_inode_count;
++static atomic64_t trimafs2_inode_free_done;
++static atomic64_t trimafs2_inode_free_deferred;
++static atomic64_t trimafs2_dentry_path_release_done;
++static atomic64_t trimafs2_dentry_path_release_queued;
++static unsigned int trimafs2_release_max_active;
++static u32 trimafs2_debug_level;
++static struct kmem_cache *trimafs2_inode_cachep;
++static DEFINE_PER_CPU(struct trimafs2_ino_stats, trimafs2_ino_stats);
++
++module_param_named(release_max_active, trimafs2_release_max_active, uint, 0644);
++MODULE_PARM_DESC(release_max_active,
++		 "Deprecated compatibility parameter; lower path releases are synchronous");
++
++static int trimafs2_fill_super(struct super_block *sb, struct fs_context *fc);
++
++static int trimafs2_get_tree(struct fs_context *fc)
++{
++	return get_tree_nodev(fc, trimafs2_fill_super);
++}
++
++static const struct super_operations trimafs2_sops;
++
++static int trimafs2_fill_super(struct super_block *sb, struct fs_context *fc)
++{
++	struct trimafs2_fs_info *fsi = sb->s_fs_info;
++	struct inode *inode;
++
++	sb->s_maxbytes = MAX_LFS_FILESIZE;
++	sb->s_iflags |= SB_I_SKIP_SYNC;
++	sb->s_blocksize = PAGE_SIZE;
++	sb->s_blocksize_bits = PAGE_SHIFT;
++	sb->s_magic = TRIMAFS2_SUPER_MAGIC;
++	sb->s_op = &trimafs2_sops;
++	sb->s_export_op = &trimafs2_export_ops;
++	sb->s_time_gran = 1;
++	sb->s_stack_depth = 1;
++	sb->s_flags |= SB_POSIXACL;
++	if (fsi->mount_opts.trimacl)
++		sb->s_flags |= SB_TRIMACL;
++	sb->s_xattr = trimafs2_xattr_handlers;
++	set_default_d_op(sb, &trimafs2_dops);
++	sb->s_d_flags |= DCACHE_DONTCACHE;
++
++	inode = trimafs2_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0);
++	if (!inode)
++		return -ENOMEM;
++	sb->s_root = d_make_root(inode);
++	if (!sb->s_root)
++		return -ENOMEM;
++	return 0;
++}
++
++static int trimafs2_show_options(struct seq_file *m, struct dentry *root)
++{
++	struct trimafs2_fs_info *fsi = root->d_sb->s_fs_info;
++
++	if (fsi->mount_opts.mode != 0777)
++		seq_printf(m, ",mode=%o", fsi->mount_opts.mode);
++	if (fsi->mount_opts.trimacl)
++		seq_puts(m, ",trimacl");
++	seq_printf(m, ",ino_mode=%u",
++		   fsi->mount_opts.ino_mode == TRIMAFS2_INO_MODE_32 ? 32 : 64);
++	return 0;
++}
++
++/* 每个下层超级块只累计一次 */
++static int trimafs2_statfs_add_lower(struct trimafs2_statfs_sum *sum, const struct path *path)
++{
++	struct super_block *sb = path->dentry->d_sb;
++	struct kstatfs st = {};
++	int i, err;
++
++	for (i = 0; i < TRIMAFS2_MAX_STATFS_SB; i++) {
++		if (sum->seen[i] == sb)
++			return 0;
++		if (!sum->seen[i])
++			break;
++	}
++	if (i == TRIMAFS2_MAX_STATFS_SB)
++		return -E2BIG;
++	sum->seen[i] = sb;
++
++	err = vfs_statfs(path, &st);
++	if (err)
++		return err;
++	sum->bytes_free += st.f_bfree * st.f_frsize;
++	sum->bytes_total += st.f_blocks * st.f_frsize;
++	sum->bytes_avail += st.f_bavail * st.f_frsize;
++	sum->files += st.f_files;
++	sum->ffree += st.f_ffree;
++	return 0;
++}
++
++static void trimafs2_free_fc(struct fs_context *fc)
++{
++	struct trimafs2_fs_info *fsi = fc->s_fs_info;
++
++	if (fsi)
++		kfree(fsi);
++}
++
++static void trimafs2_evict_inode(struct inode *inode)
++{
++	struct trimafs2_inode_info *ii = TRIMAFS2_I(inode);
++	struct inode *lower_inode = ii->lower_inode;
++
++	truncate_inode_pages_final(&inode->i_data);
++	clear_inode(inode);
++	if (lower_inode) {
++		ii->lower_inode = NULL;
++		iput(lower_inode);
++	}
++	ii->branch_id = 0;
++	ii->internal_id = 0;
++	ii->lower_dev = 0;
++	ii->lower_ino = 0;
++	ii->lower_generation = 0;
++	ii->lower_type = 0;
++}
++
++static void trimafs2_free_inode_rcu(struct rcu_head *rcu)
++{
++	struct trimafs2_inode_info *ii = container_of(rcu, struct trimafs2_inode_info, rcu);
++
++	atomic64_dec(&trimafs2_inode_count);
++	atomic64_inc(&trimafs2_inode_free_done);
++	kmem_cache_free(trimafs2_inode_cachep, ii);
++}
++
++static void trimafs2_destroy_inode(struct inode *inode)
++{
++	atomic64_inc(&trimafs2_inode_free_deferred);
++	call_rcu(&TRIMAFS2_I(inode)->rcu, trimafs2_free_inode_rcu);
++}
++
++static struct inode *trimafs2_alloc_inode(struct super_block *sb)
++{
++	struct trimafs2_inode_info *ii;
++
++	ii = alloc_inode_sb(sb, trimafs2_inode_cachep, GFP_KERNEL);
++	if (!ii)
++		return NULL;
++	ii->branch_id = 0;
++	ii->internal_id = 0;
++	ii->lower_dev = 0;
++	ii->lower_ino = 0;
++	ii->lower_generation = 0;
++	ii->lower_type = 0;
++	ii->lower_inode = NULL;
++	atomic64_inc(&trimafs2_inode_count);
++	return &ii->vfs_inode;
++}
++
++static const struct constant_table trimafs2_ino_mode_values[] = {
++	{ "32", TRIMAFS2_INO_MODE_32 },
++	{ "64", TRIMAFS2_INO_MODE_64 },
++	{}
++};
++
++const struct fs_parameter_spec trimafs2_fs_parameters[] = {
++	fsparam_u32oct("mode", Opt_mode),
++	fsparam_flag("trimacl", Opt_trimacl),
++	fsparam_enum("ino_mode", Opt_ino, trimafs2_ino_mode_values),
++	{}
++};
++
++static int trimafs2_parse_param(struct fs_context *fc, struct fs_parameter *param)
++{
++	struct trimafs2_fs_info *fsi = fc->s_fs_info;
++	struct fs_parse_result result;
++	int opt;
++
++	opt = fs_parse(fc, trimafs2_fs_parameters, param, &result);
++	if (opt == -ENOPARAM) {
++		opt = vfs_parse_fs_param_source(fc, param);
++		if (opt == -ENOPARAM)
++			return -EINVAL;
++		return opt;
++	}
++	if (opt < 0)
++		return opt;
++
++	switch (opt) {
++	case Opt_mode:
++		fsi->mount_opts.mode = result.uint_32 & S_IALLUGO;
++		break;
++	case Opt_trimacl:
++		fsi->mount_opts.trimacl = true;
++		break;
++	case Opt_ino:
++		fsi->mount_opts.ino_mode = result.uint_32;
++		break;
++	}
++	return 0;
++}
++
++static int trimafs2_stats_show(struct seq_file *m, void *v)
++{
++	u64 ino32_direct = 0, ino32_fallback = 0, ino64_direct = 0, ino64_fallback = 0;
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct trimafs2_ino_stats *st = per_cpu_ptr(&trimafs2_ino_stats, cpu);
++
++		ino32_direct += st->ino32_direct;
++		ino32_fallback += st->ino32_fallback;
++		ino64_direct += st->ino64_direct;
++		ino64_fallback += st->ino64_fallback;
++	}
++
++	seq_printf(m, "inode_count %lld\n", atomic64_read(&trimafs2_inode_count));
++	seq_printf(m, "dentry_path_release_queued %lld\n",
++		   atomic64_read(&trimafs2_dentry_path_release_queued));
++	seq_printf(m, "dentry_path_release_done %lld\n",
++		   atomic64_read(&trimafs2_dentry_path_release_done));
++	seq_printf(m, "inode_free_deferred %lld\n", atomic64_read(&trimafs2_inode_free_deferred));
++	seq_printf(m, "inode_free_done %lld\n", atomic64_read(&trimafs2_inode_free_done));
++	seq_printf(m, "ino32_direct %llu\n", ino32_direct);
++	seq_printf(m, "ino32_fallback %llu\n", ino32_fallback);
++	seq_printf(m, "ino64_direct %llu\n", ino64_direct);
++	seq_printf(m, "ino64_fallback %llu\n", ino64_fallback);
++	seq_printf(m, "release_pending %lld\n",
++		   atomic64_read(&trimafs2_dentry_path_release_queued) -
++		   atomic64_read(&trimafs2_dentry_path_release_done));
++	seq_printf(m, "inode_free_pending %lld\n",
++		   atomic64_read(&trimafs2_inode_free_deferred) -
++		   atomic64_read(&trimafs2_inode_free_done));
++	seq_printf(m, "release_max_active %u\n", trimafs2_release_max_active);
++	return 0;
++}
++
++static int trimafs2_stats_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, trimafs2_stats_show, inode->i_private);
++}
++
++static void trimafs2_init_once(void *ptr)
++{
++	struct trimafs2_inode_info *ii = ptr;
++
++	inode_init_once(&ii->vfs_inode);
++}
++
++/* 同步所有下层文件系统(同一个下层超级块只同步一次) */
++static int trimafs2_sync_fs(struct super_block *sb, int wait)
++{
++	struct trimafs2_fs_info *fsi = sb->s_fs_info;
++	struct vfsmount **mnts;
++	unsigned long index = 0;
++	unsigned int nr = 0, i;
++	int err = 0;
++
++	if (!wait)
++		return 0;
++
++	mnts = kcalloc(TRIMAFS2_MAX_SYNC_MNTS, sizeof(*mnts), GFP_KERNEL);
++	if (!mnts)
++		return -ENOMEM;
++
++	for (;;) {
++		struct trimafs2_branch *branch;
++		struct vfsmount *mnt;
++
++		xa_lock(&fsi->branches);
++		branch = xa_find(&fsi->branches, &index, ULONG_MAX, XA_PRESENT);
++		if (!branch) {
++			xa_unlock(&fsi->branches);
++			break;
++		}
++		index++;
++		if (!refcount_inc_not_zero(&branch->refs)) {
++			xa_unlock(&fsi->branches);
++			continue;
++		}
++		mnt = mntget(branch->lower_mnt);
++		xa_unlock(&fsi->branches);
++		trimafs2_branch_put(branch);
++
++		for (i = 0; i < nr; i++)
++			if (mnts[i]->mnt_sb == mnt->mnt_sb)
++				break;
++		if (i < nr) {
++			mntput(mnt);
++			continue;
++		}
++		if (nr == TRIMAFS2_MAX_SYNC_MNTS) {
++			mntput(mnt);
++			err = -E2BIG;
++			break;
++		}
++		mnts[nr++] = mnt;
++	}
++
++	for (i = 0; i < nr; i++) {
++		struct super_block *lower_sb = mnts[i]->mnt_sb;
++		int ret;
++
++		down_read(&lower_sb->s_umount);
++		ret = sync_filesystem(lower_sb);
++		up_read(&lower_sb->s_umount);
++		if (ret && !err)
++			err = ret;
++		mntput(mnts[i]);
++	}
++	kfree(mnts);
++	return err;
++}
++
++static const struct fs_context_operations trimafs2_context_ops = {
++	.free		= trimafs2_free_fc,
++	.parse_param	= trimafs2_parse_param,
++	.get_tree	= trimafs2_get_tree,
++};
++
++int trimafs2_init_fs_context(struct fs_context *fc)
++{
++	struct trimafs2_fs_info *fsi;
++
++	fsi = kzalloc(sizeof(*fsi), GFP_KERNEL);
++	if (!fsi)
++		return -ENOMEM;
++
++	fsi->mount_opts.mode = 0777;
++	fsi->mount_opts.trimacl = false;
++	fsi->mount_opts.ino_mode = TRIMAFS2_INO_MODE_32;
++	atomic64_set(&fsi->next_branch_id, 0);
++	atomic64_set(&fsi->next_internal_id, 0);
++	fsi->fh_gen = get_random_u32() ?: 1;
++	get_random_bytes(&fsi->ino_hash_key, sizeof(fsi->ino_hash_key));
++	fsi->ino_mix_seed = get_random_u64();
++	xa_init(&fsi->branches);
++	spin_lock_init(&fsi->stack_depth_lock);
++	spin_lock_init(&fsi->pinned_lock);
++	INIT_LIST_HEAD(&fsi->pinned_dentries);
++
++	fc->s_fs_info = fsi;
++	fc->ops = &trimafs2_context_ops;
++	return 0;
++}
++
++/*
++ * 桥: 直接返回下层的 statfs; 上层非目录: 返回内存文件系统的值;
++ * 上层目录: 遍历其下所有桥, 把各个下层文件系统的容量相加.
++ */
++static int trimafs2_statfs(struct dentry *dentry, struct kstatfs *buf)
++{
++	struct trimafs2_statfs_sum *sum;
++	struct trimafs2_statfs_frame *stack;
++	struct path lower_path;
++	unsigned int depth = 0, i;
++	int err;
++
++	if (trimafs2_has_lower(dentry)) {
++		lower_path = (struct path){};
++		trimafs2_get_lower_path(dentry, &lower_path);
++		err = vfs_statfs(&lower_path, buf);
++		path_put(&lower_path);
++		if (!err)
++			buf->f_type = TRIMAFS2_SUPER_MAGIC;
++		return err;
++	}
++
++	if (!d_is_dir(dentry)) {
++		buf->f_type = TRIMAFS2_SUPER_MAGIC;
++		buf->f_bsize = PAGE_SIZE;
++		buf->f_frsize = PAGE_SIZE;
++		buf->f_namelen = NAME_MAX;
++		buf->f_files = atomic64_read(&trimafs2_inode_count);
++		return 0;
++	}
++
++	sum = kzalloc(sizeof(*sum), GFP_KERNEL);
++	if (!sum)
++		return -ENOMEM;
++	stack = kcalloc(TRIMAFS2_MAX_STATFS_DEPTH, sizeof(*stack), GFP_KERNEL);
++	if (!stack) {
++		err = -ENOMEM;
++		goto out_sum;
++	}
++
++	stack[0].parent = dget(dentry);
++	for (;;) {
++		struct trimafs2_statfs_frame *frame = &stack[depth];
++		struct dentry *parent = frame->parent;
++		struct dentry *child;
++		bool found = !frame->cursor;
++
++		spin_lock(&parent->d_lock);
++		hlist_for_each_entry(child, &parent->d_children, d_sib) {
++			if (child == frame->cursor) {
++				found = true;
++				continue;
++			}
++			if (!found)
++				continue;
++			spin_lock(&child->d_lock);
++			if (d_really_is_negative(child)) {
++				spin_unlock(&child->d_lock);
++				continue;
++			}
++			dget_dlock(child);
++			spin_unlock(&child->d_lock);
++			spin_unlock(&parent->d_lock);
++			dput(frame->cursor);
++			frame->cursor = child;
++			goto visit;
++		}
++		spin_unlock(&parent->d_lock);
++
++		if (frame->cursor && !found) {
++			/* 游标已经离开父目录, 从头重扫这一层 */
++			dput(frame->cursor);
++			frame->cursor = NULL;
++			continue;
++		}
++
++		dput(frame->cursor);
++		dput(frame->parent);
++		frame->cursor = NULL;
++		frame->parent = NULL;
++		if (!depth)
++			break;
++		depth--;
++		continue;
++
++visit:
++		if (trimafs2_has_lower(child)) {
++			lower_path = (struct path){};
++			trimafs2_get_lower_path(child, &lower_path);
++			err = trimafs2_statfs_add_lower(sum, &lower_path);
++			path_put(&lower_path);
++			if (err)
++				goto out_unwind;
++		} else if (d_is_dir(child)) {
++			if (depth + 1 >= TRIMAFS2_MAX_STATFS_DEPTH) {
++				err = -ELOOP;
++				goto out_unwind;
++			}
++			depth++;
++			stack[depth].parent = dget(child);
++			stack[depth].cursor = NULL;
++		}
++	}
++	kfree(stack);
++
++	buf->f_type = TRIMAFS2_SUPER_MAGIC;
++	buf->f_bsize = PAGE_SIZE;
++	buf->f_blocks = sum->bytes_total >> PAGE_SHIFT;
++	buf->f_bfree = sum->bytes_free >> PAGE_SHIFT;
++	buf->f_bavail = sum->bytes_avail >> PAGE_SHIFT;
++	buf->f_files = sum->files ?: atomic64_read(&trimafs2_inode_count);
++	buf->f_ffree = sum->ffree;
++	buf->f_namelen = NAME_MAX;
++	buf->f_frsize = PAGE_SIZE;
++	kfree(sum);
++	return 0;
++
++out_unwind:
++	for (i = 0; i <= depth; i++) {
++		dput(stack[i].cursor);
++		dput(stack[i].parent);
++	}
++	kfree(stack);
++out_sum:
++	kfree(sum);
++	return err;
++}
++
++static const struct super_operations trimafs2_sops = {
++	.alloc_inode	= trimafs2_alloc_inode,
++	.destroy_inode	= trimafs2_destroy_inode,
++	.drop_inode	= inode_just_drop,
++	.evict_inode	= trimafs2_evict_inode,
++	.sync_fs	= trimafs2_sync_fs,
++	.statfs		= trimafs2_statfs,
++	.show_options	= trimafs2_show_options,
++};
++
++void trimafs2_note_dentry_path_release_queued(void)
++{
++	atomic64_inc(&trimafs2_dentry_path_release_queued);
++}
++
++void trimafs2_note_dentry_path_release_done(void)
++{
++	atomic64_inc(&trimafs2_dentry_path_release_done);
++}
++
++/* 上层内部对象的编号, 跳过 0 */
++u64 trimafs2_alloc_internal_id(struct super_block *sb)
++{
++	struct trimafs2_fs_info *fsi = sb->s_fs_info;
++	u64 id = atomic64_inc_return(&fsi->next_internal_id);
++
++	if (!id)
++		id = atomic64_inc_return(&fsi->next_internal_id);
++	return id;
++}
++
++/*
++ * 下层 (branch_id, ino) -> 上层 inode 号.
++ * ino_mode=64: 能直接拼就拼 (branch_id << 33 | ino), 否则 siphash 并置位 32;
++ * ino_mode=32: 32 位 ino 乘以按分支散列出的奇数, 否则 siphash 折叠成 32 位.
++ */
++u64 trimafs2_map_ino(struct super_block *sb, u64 branch_id, u64 lower_ino)
++{
++	struct trimafs2_fs_info *fsi = sb->s_fs_info;
++	u64 h;
++	u32 ino;
++
++	if (fsi->mount_opts.ino_mode == TRIMAFS2_INO_MODE_64) {
++		if (branch_id <= 0x7fffffff && !(lower_ino >> 32)) {
++			this_cpu_inc(trimafs2_ino_stats.ino64_direct);
++			return branch_id << 33 | lower_ino;
++		}
++		this_cpu_inc(trimafs2_ino_stats.ino64_fallback);
++		return siphash_2u64(branch_id, lower_ino, &fsi->ino_hash_key) | BIT_ULL(32);
++	}
++
++	if (lower_ino - 1 <= 0xfffffffeULL) {
++		this_cpu_inc(trimafs2_ino_stats.ino32_direct);
++		return (u32)lower_ino * (hash_64(branch_id ^ fsi->ino_mix_seed, 32) | 1);
++	}
++
++	this_cpu_inc(trimafs2_ino_stats.ino32_fallback);
++	h = siphash_2u64(branch_id, lower_ino, &fsi->ino_hash_key);
++	ino = (u32)h ^ (u32)(h >> 32);
++	if (!ino)
++		ino = (u32)h ?: 1;
++	return ino;
++}
++
++u64 trimafs2_dentry_ino(struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++	struct inode *inode = d_inode(dentry);
++
++	if (!inode)
++		return 0;
++	if (di && di->lower_dentry && di->branch && d_inode(di->lower_dentry))
++		return trimafs2_map_ino(dentry->d_sb, di->branch->branch_id,
++					d_inode(di->lower_dentry)->i_ino);
++	return inode->i_ino;
++}
++
++/* 上层目录和桥要一直留在 dcache 里, 额外持有一个引用 */
++void trimafs2_pin_dentry(struct dentry *dentry)
++{
++	struct trimafs2_fs_info *fsi = dentry->d_sb->s_fs_info;
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++
++	if (WARN_ON_ONCE(!di))
++		return;
++
++	dget(dentry);
++	spin_lock(&fsi->pinned_lock);
++	if (WARN_ON_ONCE(di->pinned)) {
++		spin_unlock(&fsi->pinned_lock);
++		dput(dentry);
++		return;
++	}
++	di->pinned = true;
++	list_add(&di->pinned_node, &fsi->pinned_dentries);
++	spin_unlock(&fsi->pinned_lock);
++}
++
++/* 摘掉 pin 标记(不放引用), 返回原来是否 pin 着 */
++bool trimafs2_forget_dentry_pin(struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++	struct trimafs2_fs_info *fsi;
++	bool pinned;
++
++	if (!di)
++		return false;
++
++	fsi = dentry->d_sb->s_fs_info;
++	spin_lock(&fsi->pinned_lock);
++	pinned = di->pinned;
++	if (pinned) {
++		list_del_init(&di->pinned_node);
++		di->pinned = false;
++	}
++	spin_unlock(&fsi->pinned_lock);
++	return pinned;
++}
++
++void trimafs2_repin_dentry(struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++	struct trimafs2_fs_info *fsi;
++
++	if (!di)
++		return;
++
++	fsi = dentry->d_sb->s_fs_info;
++	spin_lock(&fsi->pinned_lock);
++	if (!di->pinned) {
++		di->pinned = true;
++		list_add(&di->pinned_node, &fsi->pinned_dentries);
++	}
++	spin_unlock(&fsi->pinned_lock);
++}
++
++void trimafs2_drop_pinned_dentries(struct super_block *sb)
++{
++	struct trimafs2_fs_info *fsi = sb->s_fs_info;
++
++	spin_lock(&fsi->pinned_lock);
++	while (!list_empty(&fsi->pinned_dentries)) {
++		struct trimafs2_dentry_info *di;
++		struct dentry *dentry;
++
++		di = list_first_entry(&fsi->pinned_dentries, struct trimafs2_dentry_info,
++				      pinned_node);
++		dentry = di->dentry;
++		list_del_init(&di->pinned_node);
++		di->pinned = false;
++		spin_unlock(&fsi->pinned_lock);
++		dput(dentry);
++		spin_lock(&fsi->pinned_lock);
++	}
++	spin_unlock(&fsi->pinned_lock);
++}
++
++void trimafs2_kill_sb(struct super_block *sb)
++{
++	trimafs2_destroy_branches(sb);
++	trimafs2_drop_pinned_dentries(sb);
++	kill_anon_super(sb);
++	if (sb->s_fs_info)
++		kfree(sb->s_fs_info);
++}
++
++static struct file_system_type trimafs2_fs_type = {
++	.owner			= THIS_MODULE,
++	.name			= "trimafs",
++	.init_fs_context	= trimafs2_init_fs_context,
++	.parameters		= trimafs2_fs_parameters,
++	.kill_sb		= trimafs2_kill_sb,
++	.fs_flags		= FS_USERNS_MOUNT,
++};
++MODULE_ALIAS_FS("trimafs");
++
++static const struct file_operations trimafs2_stats_fops = {
++	.owner		= THIS_MODULE,
++	.open		= trimafs2_stats_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++static int __init init_trimafs2_fs(void)
++{
++	int err;
++
++	trimafs2_inode_cachep = kmem_cache_create("trimafs2_inode",
++						  sizeof(struct trimafs2_inode_info), 0,
++						  SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT,
++						  trimafs2_init_once);
++	if (!trimafs2_inode_cachep)
++		return -ENOMEM;
++
++	atomic64_set(&trimafs2_inode_count, 0);
++	atomic64_set(&trimafs2_inode_free_deferred, 0);
++	atomic64_set(&trimafs2_inode_free_done, 0);
++	atomic64_set(&trimafs2_dentry_path_release_queued, 0);
++	atomic64_set(&trimafs2_dentry_path_release_done, 0);
++
++	debugfs_create_u32("trimafs2_debug_print_level", 0644, NULL, &trimafs2_debug_level);
++	debugfs_create_file("trimafs2_stats", 0444, NULL, NULL, &trimafs2_stats_fops);
++
++	err = register_filesystem(&trimafs2_fs_type);
++	if (err) {
++		debugfs_lookup_and_remove("trimafs2_debug_print_level", NULL);
++		debugfs_lookup_and_remove("trimafs2_stats", NULL);
++		rcu_barrier();
++		kmem_cache_destroy(trimafs2_inode_cachep);
++	}
++	return err;
++}
++
++static void __exit exit_trimafs2_fs(void)
++{
++	unregister_filesystem(&trimafs2_fs_type);
++	debugfs_lookup_and_remove("trimafs2_debug_print_level", NULL);
++	debugfs_lookup_and_remove("trimafs2_stats", NULL);
++	rcu_barrier();
++	kmem_cache_destroy(trimafs2_inode_cachep);
++}
++
++MODULE_DESCRIPTION("TRIM aggregate stacking filesystem");
++MODULE_AUTHOR("TRIM");
++MODULE_LICENSE("GPL");
++
++module_init(init_trimafs2_fs);
++module_exit(exit_trimafs2_fs);

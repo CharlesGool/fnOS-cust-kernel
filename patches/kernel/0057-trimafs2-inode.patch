@@ -1,0 +1,1511 @@
+From 1a636e848416948e3279ccbfe3ace4da35d62d4b Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:37 +0000
+Subject: [PATCH 057/110] =?UTF-8?q?trimafs2:=20inode=20=E6=93=8D=E4=BD=9C?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上层(内存)对象按 ramfs 处理; 桥下对象的 lookup/create/mkdir/rename/
+unlink/rmdir/link/symlink/mknod/tmpfile/getattr/setattr/xattr/ACL 转发
+到下层. root 在上层用绝对路径 symlink 建桥, rmdir/rename 拆桥.
+删除走 trim_do_trashbin 回收站; TRIM ACL 的 trim_permission 等钩子
+一并转发.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/trimafs2/inode.c | 1485 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 1485 insertions(+)
+ create mode 100644 fs/trimafs2/inode.c
+
+diff --git a/fs/trimafs2/inode.c b/fs/trimafs2/inode.c
+new file mode 100644
+index 000000000..9ce17e68d
+--- /dev/null
++++ b/fs/trimafs2/inode.c
+@@ -0,0 +1,1485 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TRIM aggregate stacking filesystem: inode 操作
++ *
++ * 上层(没有下层的)对象按 ramfs 处理; 桥及其下的对象全部转发到下层.
++ */
++#include <linux/slab.h>
++#include <linux/xattr.h>
++#include <linux/posix_acl.h>
++#include <linux/fileattr.h>
++#include <linux/backing-file.h>
++#include <linux/cred.h>
++#include <linux/pagemap.h>
++#include <linux/fiemap.h>
++#include "internal.h"
++
++static int trimafs2_internal_inode_test(struct inode *inode, void *opaque)
++{
++	struct trimafs2_inode_info *ii = TRIMAFS2_I(inode);
++
++	return !ii->branch_id && ii->internal_id == *(u64 *)opaque;
++}
++
++static int trimafs2_inode_test(struct inode *inode, void *opaque)
++{
++	struct trimafs2_inode_info *ii = TRIMAFS2_I(inode);
++	struct trimafs2_inode_key *key = opaque;
++
++	return ii->branch_id == key->branch_id &&
++	       ii->lower_dev == key->lower_dev &&
++	       ii->lower_ino == key->lower_ino &&
++	       ii->lower_generation == key->lower_generation &&
++	       ii->lower_type == key->lower_type;
++}
++
++static int trimafs2_inode_set(struct inode *inode, void *opaque)
++{
++	struct trimafs2_inode_info *ii = TRIMAFS2_I(inode);
++	struct trimafs2_inode_key *key = opaque;
++
++	ii->internal_id = 0;
++	ii->branch_id = key->branch_id;
++	ii->lower_dev = key->lower_dev;
++	ii->lower_ino = key->lower_ino;
++	ii->lower_generation = key->lower_generation;
++	ii->lower_type = key->lower_type;
++	ii->lower_inode = key->lower_inode;
++	inode->i_ino = key->upper_ino;
++	inode->i_generation = key->lower_generation;
++	return 0;
++}
++
++static int trimafs2_tmpfile_open(struct inode *inode, struct file *file)
++{
++	return 0;
++}
++
++static int trimafs2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
++			   u64 start, u64 len)
++{
++	struct inode *lower_inode = TRIMAFS2_I(inode)->lower_inode;
++
++	if (!lower_inode || !lower_inode->i_op->fiemap)
++		return -EOPNOTSUPP;
++	return lower_inode->i_op->fiemap(lower_inode, fieinfo, start, len);
++}
++
++/* 下层对象已删除: 同步属性(含链接数) */
++static void trimafs2_copy_removed_lower_inode_attrs(struct inode *inode, struct inode *lower_inode)
++{
++	trimafs2_copy_lower_attrs(inode, lower_inode);
++	set_nlink(inode, lower_inode->i_nlink);
++}
++
++static void trimafs2_copy_lower_dir_attrs(struct inode *dir, struct dentry *lower_dir)
++{
++	if (!TRIMAFS2_I(dir)->branch_id)
++		return;
++	fsstack_copy_attr_all(dir, d_inode(lower_dir));
++	fsstack_copy_inode_size(dir, d_inode(lower_dir));
++}
++
++static const struct address_space_operations trimafs2_aops = {
++	.direct_IO	= noop_direct_IO,
++};
++
++static void trimafs2_init_inode_ops(struct inode *inode)
++{
++	switch (inode->i_mode & S_IFMT) {
++	case S_IFREG:
++		inode->i_op = &trimafs2_file_iops;
++		inode->i_fop = &trimafs2_file_fops;
++		inode->i_mapping->a_ops = &ram_aops;
++		break;
++	case S_IFDIR:
++		inode->i_op = &trimafs2_dir_iops;
++		inode->i_fop = &trimafs2_dir_fops;
++		inode->i_mapping->a_ops = &ram_aops;
++		break;
++	case S_IFLNK:
++		inode->i_op = &trimafs2_symlink_iops;
++		inode_nohighmem(inode);
++		break;
++	default:
++		inode->i_op = &trimafs2_special_iops;
++		init_special_inode(inode, inode->i_mode, inode->i_rdev);
++		break;
++	}
++}
++
++/*
++ * 路径第二级目录名为 "nfs"(且至少三级)视为 NFS 共享路径, 这类路径
++ * getattr 时权限放开到 0777, 也不返回 ACL.
++ */
++bool trimafs2_is_nfs_path(const struct dentry *dentry)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++	const struct dentry *d, *l1, *l2, *l3;
++	unsigned int seq;
++	bool ret;
++
++	if ((dentry->d_flags & DCACHE_DISCONNECTED) && di)
++		return di->disconnected_nfs_path;
++
++retry:
++	rcu_read_lock();
++	seq = read_seqbegin(&rename_lock);
++	ret = false;
++	if (dentry) {
++		l1 = l2 = l3 = NULL;
++		d = dentry;
++		while (!IS_ROOT(d)) {
++			l3 = l2;
++			l2 = l1;
++			l1 = d;
++			d = d->d_parent;
++			if (!d)
++				break;
++		}
++		ret = l1 && l2 && l3 && l2->d_name.len == 3 && !memcmp(l2->d_name.name, "nfs", 3);
++	}
++	if (read_seqretry(&rename_lock, seq)) {
++		rcu_read_unlock();
++		goto retry;
++	}
++	rcu_read_unlock();
++	return ret;
++}
++
++/* dentry 是否仍然代表 lower 这个下层对象 */
++static bool trimafs2_dentry_matches_lower(struct dentry *dentry, struct dentry *lower)
++{
++	struct trimafs2_dentry_info *di = TRIMAFS2_D(dentry);
++	struct inode *inode = d_inode(dentry);
++	struct inode *lower_inode = d_inode(lower);
++
++	if (!di || !di->lower_dentry || !di->branch)
++		return !lower_inode;
++	if (d_unlinked(lower) || di->lower_dentry != lower)
++		return false;
++	if (!inode)
++		return !lower_inode;
++	if (!lower_inode)
++		return false;
++	return trimafs2_inode_matches_lower(inode, di->branch->branch_id, lower_inode);
++}
++
++struct posix_acl *trimafs2_get_inode_acl(struct inode *inode, int type, bool rcu)
++{
++	struct trimafs2_dentry_info *di;
++	struct inode *lower_inode;
++	struct posix_acl *acl;
++	struct dentry *alias;
++
++	if (rcu)
++		return ERR_PTR(-ECHILD);
++
++	alias = d_find_any_alias(inode);
++	if (!alias)
++		return NULL;
++	di = TRIMAFS2_D(alias);
++	if (!di || !di->lower_dentry || !di->branch || !d_inode(di->lower_dentry)) {
++		dput(alias);
++		return NULL;
++	}
++	lower_inode = d_inode(di->lower_dentry);
++	if (!trimafs2_inode_matches_lower(inode, di->branch->branch_id, lower_inode)) {
++		dput(alias);
++		return ERR_PTR(-ESTALE);
++	}
++	if (trimafs2_is_nfs_path(alias)) {
++		dput(alias);
++		forget_cached_acl(inode, type);
++		return NULL;
++	}
++	acl = get_inode_acl(lower_inode, type);
++	dput(alias);
++	forget_cached_acl(inode, type);
++	return acl;
++}
++
++static int trimafs2_fileattr_get(struct dentry *dentry, struct file_kattr *fa)
++{
++	struct path lower_path = {};
++	int err = -ENOIOCTLCMD;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		err = vfs_fileattr_get(lower_path.dentry, fa);
++		path_put(&lower_path);
++	}
++	return err;
++}
++
++static int trimafs2_readlink(struct dentry *dentry, char __user *buffer, int buflen)
++{
++	struct path lower_path = {};
++	int err = -EOPNOTSUPP;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		err = vfs_readlink(lower_path.dentry, buffer, buflen);
++		path_put(&lower_path);
++	}
++	return err;
++}
++
++int trimafs2_get_trimacl_xattr_all(struct mnt_idmap *idmap, struct dentry *dentry, unsigned int flags,
++				   void __user *buffer, size_t buffer_size)
++{
++	struct path lower_path = {};
++	int err = -EPERM;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		err = trimacl_get_trimacl_xattr_all(mnt_idmap(lower_path.mnt), lower_path.dentry,
++						    flags, buffer, buffer_size);
++		path_put(&lower_path);
++	}
++	return err;
++}
++
++static int trimafs2_xattr_get(const struct xattr_handler *handler, struct dentry *dentry,
++			      struct inode *inode, const char *name, void *value, size_t size)
++{
++	struct path lower_path = {};
++	int err = -EOPNOTSUPP;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		err = vfs_getxattr(mnt_idmap(lower_path.mnt), lower_path.dentry, name, value, size);
++		path_put(&lower_path);
++	}
++	return err;
++}
++
++int trimafs2_set_acl(struct mnt_idmap *idmap, struct dentry *dentry, struct posix_acl *acl, int type)
++{
++	struct path lower_path = {};
++	int err = -EOPNOTSUPP;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		err = mnt_want_write(lower_path.mnt);
++		if (!err) {
++			err = set_posix_acl(mnt_idmap(lower_path.mnt), lower_path.dentry, type, acl);
++			mnt_drop_write(lower_path.mnt);
++		}
++		path_put(&lower_path);
++	}
++	return err;
++}
++
++static int trimafs2_fileattr_set(struct mnt_idmap *idmap, struct dentry *dentry,
++				 struct file_kattr *fa)
++{
++	struct path lower_path = {};
++	int err = -ENOIOCTLCMD;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		err = mnt_want_write(lower_path.mnt);
++		if (!err) {
++			err = vfs_fileattr_set(mnt_idmap(lower_path.mnt), lower_path.dentry, fa);
++			mnt_drop_write(lower_path.mnt);
++			if (!err)
++				fsstack_copy_attr_all(d_inode(dentry), d_inode(lower_path.dentry));
++		}
++		path_put(&lower_path);
++	}
++	return err;
++}
++
++int trimafs2_trim_access_delete(struct mnt_idmap *idmap, struct dentry *dentry,
++				struct trim_access_t *ta)
++{
++	struct path lower_path = {};
++	int err;
++
++	if (!trimafs2_has_lower(dentry))
++		return trim_access_delete(idmap, dentry, ta);
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	err = trim_access_delete(mnt_idmap(lower_path.mnt), lower_path.dentry, ta);
++	path_put(&lower_path);
++	return err;
++}
++
++int trimafs2_get_permission(struct mnt_idmap *idmap, struct dentry *dentry,
++			    struct trim_access_t *ta)
++{
++	struct path lower_path = {};
++	int err;
++
++	if (!trimafs2_has_lower(dentry))
++		return get_permission(idmap, dentry, ta);
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	err = get_permission(mnt_idmap(lower_path.mnt), lower_path.dentry, ta);
++	path_put(&lower_path);
++	return err;
++}
++
++int trimafs2_trim_access(struct mnt_idmap *idmap, struct dentry *dentry, int mode,
++			 struct trim_access_t *ta)
++{
++	struct path lower_path = {};
++	int err;
++
++	if (!trimafs2_has_lower(dentry))
++		return trim_access(idmap, dentry, mode, ta);
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	err = trim_access(mnt_idmap(lower_path.mnt), lower_path.dentry, mode, ta);
++	path_put(&lower_path);
++	return err;
++}
++
++int trimafs2_is_trimacl(struct dentry *dentry)
++{
++	struct path lower_path = {};
++	int ret = 1;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		ret = is_trimacl(lower_path.dentry);
++		path_put(&lower_path);
++	}
++	return ret;
++}
++
++static int trimafs2_xattr_set(const struct xattr_handler *handler, struct mnt_idmap *idmap,
++			      struct dentry *dentry, struct inode *inode, const char *name,
++			      const void *value, size_t size, int flags)
++{
++	struct path lower_path = {};
++	int err = -EOPNOTSUPP;
++
++	if (!trimafs2_has_lower(dentry))
++		return err;
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	err = mnt_want_write(lower_path.mnt);
++	if (err)
++		goto out;
++	if (value)
++		err = vfs_setxattr(mnt_idmap(lower_path.mnt), lower_path.dentry, name, value,
++				   size, flags);
++	else
++		err = vfs_removexattr(mnt_idmap(lower_path.mnt), lower_path.dentry, name);
++	mnt_drop_write(lower_path.mnt);
++	if (!err && inode)
++		fsstack_copy_attr_all(inode, d_inode(lower_path.dentry));
++out:
++	path_put(&lower_path);
++	return err;
++}
++
++ssize_t trimafs2_listxattr(struct dentry *dentry, char *buffer, size_t size)
++{
++	struct path lower_path = {};
++	ssize_t ret = 0;
++
++	if (trimafs2_has_lower(dentry)) {
++		trimafs2_get_lower_path(dentry, &lower_path);
++		ret = vfs_listxattr(lower_path.dentry, buffer, size);
++		path_put(&lower_path);
++	}
++	return ret;
++}
++
++int trimafs2_trimacl_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask)
++{
++	struct path lower_path = {};
++	int err;
++
++	if (!trimafs2_has_lower(dentry))
++		return generic_permission(idmap, d_inode(dentry), mask);
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	err = trimafs2_validate_lower_runtime_path(&lower_path);
++	if (!err) {
++		if (IS_SB_TRIMACL(d_inode(lower_path.dentry)))
++			err = trim_permission(mnt_idmap(lower_path.mnt), lower_path.dentry, mask);
++		else
++			err = inode_permission(mnt_idmap(lower_path.mnt),
++					       d_inode(lower_path.dentry), mask);
++	}
++	path_put(&lower_path);
++	return err;
++}
++
++int trimafs2_permission(struct mnt_idmap *idmap, struct inode *inode, int mask)
++{
++	struct path lower_path = {};
++	struct inode *lower_inode;
++	struct dentry *alias;
++	u64 branch_id;
++	int err;
++
++	if (!TRIMAFS2_I(inode)->branch_id)
++		return generic_permission(idmap, inode, mask);
++	if (mask & MAY_NOT_BLOCK)
++		return -ECHILD;
++
++	alias = d_find_any_alias(inode);
++	if (!alias)
++		return -ESTALE;
++	if (!trimafs2_has_lower(alias)) {
++		dput(alias);
++		return -ESTALE;
++	}
++	branch_id = TRIMAFS2_D(alias)->branch->branch_id;
++	trimafs2_get_lower_path(alias, &lower_path);
++	dput(alias);
++
++	err = trimafs2_validate_lower_runtime_path(&lower_path);
++	if (err)
++		goto out;
++	lower_inode = d_inode(lower_path.dentry);
++	if (!lower_inode || !trimafs2_inode_matches_lower(inode, branch_id, lower_inode)) {
++		path_put(&lower_path);
++		return -ESTALE;
++	}
++	err = inode_permission(mnt_idmap(lower_path.mnt), lower_inode, mask);
++out:
++	path_put(&lower_path);
++	return err;
++}
++
++int trimafs2_trim_acl_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *stat)
++{
++	struct path lower_path = {};
++	int err = 0;
++
++	if (!trimafs2_has_lower(dentry)) {
++		stat->mode = d_inode(dentry)->i_mode;
++		return 0;
++	}
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	if (trimafs2_is_nfs_path(dentry))
++		stat->mode |= 0777;
++	else if (IS_SB_TRIMACL(d_inode(lower_path.dentry)))
++		err = trim_to_mode(mnt_idmap(lower_path.mnt), lower_path.dentry, stat);
++	path_put(&lower_path);
++	return err;
++}
++
++static const char *trimafs2_get_link(struct dentry *dentry, struct inode *inode,
++				     struct delayed_call *done)
++{
++	struct path lower_path;
++	const char *link;
++
++	if (!dentry)
++		return ERR_PTR(-ECHILD);
++	if (!trimafs2_has_lower(dentry))
++		return page_get_link(dentry, inode, done);
++
++	lower_path = (struct path){};
++	trimafs2_get_lower_path(dentry, &lower_path);
++	if (trimafs2_validate_lower_runtime_path(&lower_path))
++		link = ERR_PTR(-EOPNOTSUPP);
++	else
++		link = vfs_get_link(lower_path.dentry, done);
++	path_put(&lower_path);
++	return link;
++}
++
++int trimafs2_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat,
++		     u32 request_mask, unsigned int query_flags)
++{
++	struct dentry *dentry = path->dentry;
++	struct inode *inode = d_inode(dentry);
++	struct kstat lower_stat;
++	struct path lower_path;
++	int err;
++
++	if (!trimafs2_has_lower(dentry)) {
++		generic_fillattr(idmap, request_mask, inode, stat);
++		stat->blocks = inode->i_mapping->nrpages << (PAGE_SHIFT - 9);
++		return 0;
++	}
++
++	lower_stat = (struct kstat){};
++	lower_path = (struct path){};
++	trimafs2_get_lower_path(dentry, &lower_path);
++	err = vfs_getattr_nosec(&lower_path, &lower_stat, request_mask, query_flags);
++	if (!err) {
++		*stat = lower_stat;
++		trimafs2_copy_lower_attrs(inode, d_inode(lower_path.dentry));
++		generic_fillattr(idmap, request_mask, inode, stat);
++		stat->blocks = lower_stat.blocks;
++		if (trimafs2_is_nfs_path(path->dentry))
++			stat->mode |= 0777;
++	}
++	path_put(&lower_path);
++	return err;
++}
++
++int trimafs2_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *ia)
++{
++	struct inode *inode = d_inode(dentry);
++	struct inode *lower_inode;
++	int err;
++
++	if (!trimafs2_has_lower(dentry))
++		return simple_setattr(idmap, dentry, ia);
++
++	struct path lower_path = {};
++	struct iattr lower_ia = *ia;
++
++	trimafs2_get_lower_path(dentry, &lower_path);
++	lower_inode = d_inode(lower_path.dentry);
++
++	if (lower_ia.ia_valid & ATTR_FILE) {
++		struct file *lower_file = lower_ia.ia_file ?
++					  trimafs2_lower_file(lower_ia.ia_file) : NULL;
++
++		if (lower_file)
++			lower_ia.ia_file = lower_file;
++		else
++			lower_ia.ia_valid &= ~ATTR_FILE;
++	}
++	/* 去 suid/sgid 由下层自己根据 ATTR_KILL_* 处理 */
++	if (lower_ia.ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID))
++		lower_ia.ia_valid &= ~ATTR_MODE;
++
++	err = mnt_want_write(lower_path.mnt);
++	if (err)
++		goto out;
++	inode_lock(lower_inode);
++	err = notify_change(mnt_idmap(lower_path.mnt), lower_path.dentry, &lower_ia, NULL);
++	inode_unlock(lower_inode);
++	mnt_drop_write(lower_path.mnt);
++	if (!err)
++		trimafs2_copy_lower_attrs(inode, lower_inode);
++out:
++	path_put(&lower_path);
++	return err;
++}
++
++static int trimafs2_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
++			   struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
++{
++	struct path old_parent_path = {}, new_parent_path = {};
++	struct renamedata rd = {};
++	struct dentry *lower_old_dir, *lower_new_dir, *lower_old, *lower_new, *trap;
++	struct inode *victim = NULL;
++	bool is_dir;
++	int err;
++
++	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
++		return -EINVAL;
++
++	if (trimafs2_has_lower(old_dentry->d_parent) || trimafs2_has_lower(new_dentry->d_parent)) {
++		/* 下层改名: 只能在同一个分支内 */
++		if (!trimafs2_has_lower(old_dentry->d_parent) ||
++		    !trimafs2_has_lower(new_dentry->d_parent))
++			return -EXDEV;
++
++		trimafs2_get_lower_path(old_dentry->d_parent, &old_parent_path);
++		trimafs2_get_lower_path(new_dentry->d_parent, &new_parent_path);
++		lower_old_dir = old_parent_path.dentry;
++		lower_new_dir = new_parent_path.dentry;
++		err = -EXDEV;
++		if (old_parent_path.mnt != new_parent_path.mnt ||
++		    trimafs2_dentry_branch_id(old_dentry->d_parent) !=
++		    trimafs2_dentry_branch_id(new_dentry->d_parent))
++			goto out_put;
++
++		err = mnt_want_write(old_parent_path.mnt);
++		if (err)
++			goto out_put;
++
++		trap = lock_rename(lower_new_dir, lower_old_dir);
++		if (IS_ERR(trap)) {
++			err = PTR_ERR(trap);
++			goto out_drop_write;
++		}
++
++		err = -ENOENT;
++		if (!trimafs2_has_lower(old_dentry))
++			goto out_unlock;
++		lower_old = dget(TRIMAFS2_D(old_dentry)->lower_dentry);
++		if (d_is_negative(lower_old))
++			goto out_dput_old;
++		err = -ESTALE;
++		if (d_unlinked(lower_old) || lower_old->d_parent != lower_old_dir ||
++		    !d_same_name(lower_old, lower_old_dir, &old_dentry->d_name))
++			goto out_dput_old;
++		err = -EINVAL;
++		if (lower_old == trap)
++			goto out_dput_old;
++
++		if (trimafs2_has_lower(new_dentry)) {
++			lower_new = dget(TRIMAFS2_D(new_dentry)->lower_dentry);
++		} else {
++			struct qstr name = new_dentry->d_name;
++
++			name.hash = full_name_hash(lower_new_dir, name.name, name.len);
++			lower_new = lookup_one_qstr_excl(&name, lower_new_dir,
++							 LOOKUP_CREATE | LOOKUP_RENAME_TARGET);
++			if (IS_ERR(lower_new)) {
++				err = PTR_ERR(lower_new);
++				goto out_dput_old;
++			}
++		}
++
++		err = -ESTALE;
++		if (!trimafs2_dentry_matches_lower(new_dentry, lower_new) ||
++		    lower_new->d_parent != lower_new_dir ||
++		    !d_same_name(lower_new, lower_new_dir, &new_dentry->d_name))
++			goto out_dput_new;
++		if (lower_new == trap) {
++			err = (flags & RENAME_EXCHANGE) ? -EINVAL : -ENOTEMPTY;
++			goto out_dput_new;
++		}
++
++		if (!(flags & RENAME_EXCHANGE) && d_inode(new_dentry)) {
++			victim = igrab(d_inode(lower_new));
++			if (!victim)
++				goto out_dput_new;
++		}
++
++		rd.mnt_idmap = mnt_idmap(old_parent_path.mnt);
++		rd.old_parent = lower_old_dir;
++		rd.old_dentry = lower_old;
++		rd.new_parent = lower_new_dir;
++		rd.new_dentry = lower_new;
++		rd.flags = flags;
++		err = vfs_rename(&rd);
++		if (err)
++			goto out_iput;
++
++		if (flags & RENAME_EXCHANGE) {
++			trimafs2_copy_lower_attrs(d_inode(old_dentry), d_inode(lower_old));
++			if (d_inode(new_dentry))
++				trimafs2_copy_lower_attrs(d_inode(new_dentry), d_inode(lower_new));
++		} else if (d_inode(new_dentry)) {
++			if (d_is_dir(new_dentry))
++				clear_nlink(d_inode(new_dentry));
++			else
++				trimafs2_copy_removed_lower_inode_attrs(d_inode(new_dentry), victim);
++		}
++		trimafs2_copy_lower_dir_attrs(old_dir, lower_old_dir);
++		if (new_dir != old_dir)
++			trimafs2_copy_lower_dir_attrs(new_dir, lower_new_dir);
++out_iput:
++		iput(victim);
++out_dput_new:
++		dput(lower_new);
++out_dput_old:
++		dput(lower_old);
++out_unlock:
++		unlock_rename(lower_new_dir, lower_old_dir);
++out_drop_write:
++		mnt_drop_write(old_parent_path.mnt);
++out_put:
++		path_put(&new_parent_path);
++		path_put(&old_parent_path);
++		return err;
++	}
++
++	/* 上层改名: 只有 root */
++	if (!uid_eq(current_fsuid(), GLOBAL_ROOT_UID))
++		return -EACCES;
++	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
++		return -EINVAL;
++	if (flags & RENAME_EXCHANGE)
++		return -EXDEV;
++
++	is_dir = d_is_dir(old_dentry);
++	if (d_really_is_positive(new_dentry)) {
++		if (trimafs2_has_lower(new_dentry)) {
++			/* 覆盖一个桥: 拆掉它 */
++			u64 branch_id = TRIMAFS2_D(new_dentry)->branch->branch_id;
++			bool pinned = trimafs2_forget_dentry_pin(new_dentry);
++
++			shrink_dcache_parent(new_dentry);
++			d_invalidate(new_dentry);
++			clear_nlink(d_inode(new_dentry));
++			if (is_dir)
++				drop_nlink(old_dir);
++			trimafs2_unregister_branch(new_dentry->d_sb, branch_id);
++			if (pinned)
++				dput(new_dentry);
++		} else {
++			if (!simple_empty(new_dentry))
++				return -ENOTEMPTY;
++			trimafs2_forget_dentry_pin(new_dentry);
++			simple_unlink(new_dir, new_dentry);
++			if (is_dir) {
++				drop_nlink(d_inode(new_dentry));
++				drop_nlink(old_dir);
++			}
++		}
++	} else if (is_dir) {
++		drop_nlink(old_dir);
++		inc_nlink(new_dir);
++	}
++	simple_rename_timestamp(old_dir, old_dentry, new_dir, new_dentry);
++	return 0;
++}
++
++static int trimafs2_unlink(struct inode *dir, struct dentry *dentry)
++{
++	struct path lower_dir_path = {};
++	struct dentry *lower_dir, *lower;
++	struct inode *lower_inode = NULL;
++	int trashed, err;
++
++	if (!trimafs2_has_lower(dentry->d_parent)) {
++		trimafs2_forget_dentry_pin(dentry);
++		return simple_unlink(dir, dentry);
++	}
++
++	trimafs2_get_lower_path(dentry->d_parent, &lower_dir_path);
++	lower_dir = lower_dir_path.dentry;
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err)
++		goto out_put;
++
++	err = -ENOENT;
++	if (!trimafs2_has_lower(dentry))
++		goto out_drop_write;
++	lower = dget(TRIMAFS2_D(dentry)->lower_dentry);
++	if (d_is_negative(lower))
++		goto out_dput;
++	err = -ESTALE;
++	if (d_unlinked(lower))
++		goto out_dput;
++	lower_inode = igrab(d_inode(lower));
++	if (!lower_inode)
++		goto out_dput;
++
++	if (lower->d_parent == lower_dir && d_same_name(lower, lower_dir, &dentry->d_name) &&
++	    trimafs2_dentry_matches_lower(dentry, lower)) {
++		/* 回收站: 由 trim_do_trashbin 把对象挪进回收站 */
++		trashed = 0;
++		err = 0;
++		if (trim_is_on_trashbin_whitelist())
++			err = trim_do_trashbin(lower_dir_path.mnt, d_inode(lower_dir), lower, 0, 1,
++					       &trashed);
++		if (trashed) {
++			if (err)
++				goto out_dput;
++			trimafs2_copy_removed_lower_inode_attrs(d_inode(dentry), lower_inode);
++			trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++			d_drop(dentry);
++			goto out_dput;
++		}
++	}
++
++	inode_lock_nested(d_inode(lower_dir), I_MUTEX_PARENT);
++	if (lower->d_parent != lower_dir || !d_same_name(lower, lower_dir, &dentry->d_name) ||
++	    !trimafs2_dentry_matches_lower(dentry, lower)) {
++		inode_unlock(d_inode(lower_dir));
++		err = -ESTALE;
++		goto out_dput;
++	}
++	err = vfs_unlink(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, NULL);
++	inode_unlock(d_inode(lower_dir));
++	if (err)
++		goto out_dput;
++	trimafs2_copy_removed_lower_inode_attrs(d_inode(dentry), lower_inode);
++	trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++	d_drop(dentry);
++out_dput:
++	iput(lower_inode);
++	dput(lower);
++out_drop_write:
++	mnt_drop_write(lower_dir_path.mnt);
++out_put:
++	path_put(&lower_dir_path);
++	return err;
++}
++
++struct inode *trimafs2_find_internal_inode(struct super_block *sb, u64 object_id)
++{
++	return ilookup5(sb, trimafs2_hash(object_id), trimafs2_internal_inode_test, &object_id);
++}
++
++/* 按下层对象身份查找/建立上层 inode */
++struct inode *trimafs2_get_lower_inode(struct super_block *sb, const struct path *lower_path,
++				       u64 branch_id)
++{
++	struct inode *lower_inode = d_inode(lower_path->dentry);
++	struct trimafs2_inode_key key = {
++		.branch_id = branch_id,
++		.lower_dev = lower_inode->i_sb->s_dev,
++		.lower_ino = lower_inode->i_ino,
++		.lower_generation = lower_inode->i_generation,
++		.lower_type = lower_inode->i_mode & S_IFMT,
++		.lower_inode = lower_inode,
++	};
++	struct inode *inode;
++
++	if (!igrab(lower_inode))
++		return ERR_PTR(-ESTALE);
++
++	key.upper_ino = trimafs2_map_ino(sb, branch_id, key.lower_ino);
++	inode = iget5_locked(sb, trimafs2_hash(key.branch_id ^ key.lower_ino ^ key.lower_dev ^
++					       key.lower_generation ^ key.lower_type),
++			     trimafs2_inode_test, trimafs2_inode_set, &key);
++	if (!inode) {
++		iput(lower_inode);
++		return ERR_PTR(-ENOMEM);
++	}
++
++	if (inode->i_state & I_NEW) {
++		/* 新 inode 接管 igrab 的引用, evict 时释放 */
++		trimafs2_copy_lower_attrs(inode, lower_inode);
++		trimafs2_init_inode_ops(inode);
++		if (S_ISREG(inode->i_mode))
++			inode->i_mapping->a_ops = &trimafs2_aops;
++		unlock_new_inode(inode);
++		return inode;
++	}
++
++	if (!lower_inode || !trimafs2_inode_matches_lower(inode, branch_id, lower_inode)) {
++		iput(lower_inode);
++		iput(inode);
++		return ERR_PTR(-ESTALE);
++	}
++	iput(lower_inode);
++	trimafs2_copy_lower_attrs(inode, lower_inode);
++	trimafs2_init_inode_ops(inode);
++	if (S_ISREG(inode->i_mode))
++		inode->i_mapping->a_ops = &trimafs2_aops;
++	return inode;
++}
++
++static int trimafs2_tmpfile(struct mnt_idmap *idmap, struct inode *dir, struct file *file,
++			    umode_t mode)
++{
++	struct dentry *dentry = file->f_path.dentry;
++	struct path lower_dir_path = {};
++	struct trimafs2_file_info *fi;
++	struct file *lower_file;
++	struct dentry *parent;
++	struct inode *inode;
++	u64 branch_id;
++	int err;
++
++	if (!trimafs2_has_lower(dentry->d_parent))
++		return -EOPNOTSUPP;
++
++	parent = dget_parent(dentry);
++	trimafs2_get_lower_path(parent, &lower_dir_path);
++	branch_id = trimafs2_dentry_branch_id(parent);
++	dput(parent);
++
++	err = trimafs2_validate_lower_runtime_path(&lower_dir_path);
++	if (err)
++		goto out_put;
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err)
++		goto out_put;
++
++	lower_file = backing_tmpfile_open(&file->f_path, file->f_flags, &lower_dir_path, mode,
++					  current_cred());
++	err = PTR_ERR(lower_file);
++	if (IS_ERR(lower_file))
++		goto out_drop_write;
++
++	inode = trimafs2_get_lower_inode(dentry->d_sb, &lower_file->f_path, branch_id);
++	if (IS_ERR(inode)) {
++		err = PTR_ERR(inode);
++		fput(lower_file);
++		goto out_drop_write;
++	}
++
++	fi = kzalloc(sizeof(*fi), GFP_KERNEL);
++	if (!fi) {
++		iput(inode);
++		fput(lower_file);
++		err = -ENOMEM;
++		goto out_drop_write;
++	}
++	file->private_data = fi;
++	fi->lower_file = lower_file;
++
++	err = trimafs2_set_lower(dentry, &lower_file->f_path, branch_id);
++	if (err) {
++		file->private_data = NULL;
++		kfree(fi);
++		iput(inode);
++		fput(lower_file);
++		goto out_drop_write;
++	}
++
++	set_nlink(inode, 1);
++	d_tmpfile(file, inode);
++	err = finish_open(file, dentry, trimafs2_tmpfile_open);
++	if (err) {
++		trimafs2_clear_lower(dentry);
++		fput(lower_file);
++		kfree(fi);
++		file->private_data = NULL;
++	}
++out_drop_write:
++	mnt_drop_write(lower_dir_path.mnt);
++out_put:
++	path_put(&lower_dir_path);
++	return err;
++}
++
++static struct dentry *trimafs2_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
++{
++	struct path lower_dir_path, lower_path;
++	struct qstr name;
++	struct dentry *lower, *ret;
++	struct inode *inode;
++	u64 branch_id;
++
++	if (!trimafs2_has_lower(dentry->d_parent))
++		return simple_lookup(dir, dentry, flags);
++
++	lower_dir_path = (struct path){};
++	name = dentry->d_name;
++	lower_path = (struct path){};
++	trimafs2_get_lower_path(dentry->d_parent, &lower_dir_path);
++	lower = lookup_noperm_unlocked(&name, lower_dir_path.dentry);
++	if (IS_ERR(lower)) {
++		path_put(&lower_dir_path);
++		return lower;
++	}
++	lower_path.mnt = lower_dir_path.mnt;
++	lower_path.dentry = lower;
++	branch_id = trimafs2_dentry_branch_id(dentry->d_parent);
++
++	if (d_really_is_negative(lower)) {
++		d_add(dentry, NULL);
++		ret = NULL;
++		goto out;
++	}
++
++	inode = trimafs2_get_lower_inode(dentry->d_sb, &lower_path, branch_id);
++	if (IS_ERR(inode)) {
++		ret = ERR_CAST(inode);
++		goto out;
++	}
++	if (trimafs2_set_lower(dentry, &lower_path, branch_id)) {
++		iput(inode);
++		ret = ERR_PTR(-ESTALE);
++		goto out;
++	}
++
++	ret = d_splice_alias(inode, dentry);
++	if (IS_ERR(ret)) {
++		trimafs2_clear_lower(dentry);
++	} else if (ret) {
++		/* 用已有的别名, 本 dentry 不再挂下层 */
++		if (!trimafs2_dentry_matches_lower(ret, lower)) {
++			trimafs2_clear_lower(dentry);
++			dput(ret);
++			ret = ERR_PTR(-ESTALE);
++		} else {
++			trimafs2_clear_lower(dentry);
++		}
++	}
++out:
++	dput(lower);
++	path_put(&lower_dir_path);
++	return ret;
++}
++
++/* 上层(内存)inode */
++struct inode *trimafs2_get_inode(struct super_block *sb, struct inode *dir, umode_t mode, dev_t dev)
++{
++	struct inode *inode = new_inode(sb);
++	struct timespec64 ts;
++	u64 id;
++
++	if (!inode)
++		return NULL;
++
++	id = trimafs2_alloc_internal_id(sb);
++	TRIMAFS2_I(inode)->internal_id = id;
++	inode->i_ino = trimafs2_map_ino(sb, 0, id);
++	inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
++	inode->i_mapping->a_ops = &ram_aops;
++	inode->i_rdev = dev;
++	mapping_set_gfp_mask(inode->i_mapping, GFP_HIGHUSER);
++	mapping_set_unevictable(inode->i_mapping);
++	ts = inode_set_ctime_current(inode);
++	inode_set_atime_to_ts(inode, ts);
++	inode_set_mtime_to_ts(inode, ts);
++	trimafs2_init_inode_ops(inode);
++	if (S_ISDIR(mode))
++		inc_nlink(inode);
++	__insert_inode_hash(inode, trimafs2_hash(id));
++	return inode;
++}
++
++int trimafs2_interpose(struct dentry *dentry, const struct path *lower_path, u64 branch_id)
++{
++	struct inode *inode;
++	int err;
++
++	if (d_is_negative(lower_path->dentry))
++		return -ENOENT;
++
++	inode = trimafs2_get_lower_inode(dentry->d_sb, lower_path, branch_id);
++	if (IS_ERR(inode))
++		return PTR_ERR(inode);
++
++	err = trimafs2_set_lower(dentry, lower_path, branch_id);
++	if (err) {
++		iput(inode);
++		return err;
++	}
++	d_instantiate(dentry, inode);
++	return 0;
++}
++
++static int trimafs2_mknod(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
++			  umode_t mode, dev_t dev)
++{
++	struct path lower_dir_path = {}, lower_path;
++	struct qstr name = dentry->d_name;
++	struct dentry *lower_dir, *lower;
++	int err;
++
++	if (!trimafs2_has_lower(dentry->d_parent))
++		return -EOPNOTSUPP;
++
++	trimafs2_get_lower_path(dentry->d_parent, &lower_dir_path);
++	lower_dir = lower_dir_path.dentry;
++	name.hash = full_name_hash(lower_dir, name.name, name.len);
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err)
++		goto out_put;
++
++	inode_lock_nested(d_inode(lower_dir), I_MUTEX_PARENT);
++	lower = lookup_one_qstr_excl(&name, lower_dir, LOOKUP_CREATE | LOOKUP_EXCL);
++	err = PTR_ERR(lower);
++	if (IS_ERR(lower))
++		goto out_unlock;
++	err = vfs_mknod(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, mode, dev);
++	if (err)
++		goto out_dput;
++	lower_path.mnt = lower_dir_path.mnt;
++	lower_path.dentry = lower;
++	err = trimafs2_interpose(dentry, &lower_path, trimafs2_dentry_branch_id(dentry->d_parent));
++	if (err) {
++		vfs_unlink(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, NULL);
++		goto out_dput;
++	}
++	trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++out_dput:
++	dput(lower);
++out_unlock:
++	inode_unlock(d_inode(lower_dir));
++	mnt_drop_write(lower_dir_path.mnt);
++out_put:
++	path_put(&lower_dir_path);
++	return err;
++}
++
++static struct dentry *trimafs2_mkdir(struct mnt_idmap *idmap, struct inode *dir,
++				     struct dentry *dentry, umode_t mode)
++{
++	struct path lower_dir_path = {}, lower_path;
++	struct qstr name = dentry->d_name;
++	struct dentry *lower_dir, *lower;
++	struct inode *inode;
++	int err;
++
++	if (!trimafs2_has_lower(dentry->d_parent)) {
++		/* 上层目录: 只有 root 能建, 权限固定 0111 */
++		if (!uid_eq(current_fsuid(), GLOBAL_ROOT_UID))
++			return ERR_PTR(-EACCES);
++		inode = trimafs2_get_inode(dir->i_sb, dir, S_IFDIR | 0111, 0);
++		if (!inode)
++			return ERR_PTR(-ENOSPC);
++		d_instantiate(dentry, inode);
++		trimafs2_pin_dentry(dentry);
++		inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
++		inc_nlink(dir);
++		return NULL;
++	}
++
++	trimafs2_get_lower_path(dentry->d_parent, &lower_dir_path);
++	lower_dir = lower_dir_path.dentry;
++	name.hash = full_name_hash(lower_dir, name.name, name.len);
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err) {
++		path_put(&lower_dir_path);
++		return ERR_PTR(err);
++	}
++
++	inode_lock_nested(d_inode(lower_dir), I_MUTEX_PARENT);
++	lower = lookup_one_qstr_excl(&name, lower_dir, LOOKUP_CREATE | LOOKUP_EXCL);
++	err = PTR_ERR(lower);
++	if (IS_ERR(lower))
++		goto out_unlock;
++	lower = vfs_mkdir(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, mode);
++	err = PTR_ERR(lower);
++	if (IS_ERR(lower))
++		goto out_unlock;
++	err = -ENOENT;
++	if (d_unhashed(lower))
++		goto out_dput;
++	lower_path.mnt = lower_dir_path.mnt;
++	lower_path.dentry = lower;
++	err = trimafs2_interpose(dentry, &lower_path, trimafs2_dentry_branch_id(dentry->d_parent));
++	if (err) {
++		vfs_rmdir(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower);
++		goto out_dput;
++	}
++	trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++out_dput:
++	dput(lower);
++out_unlock:
++	inode_unlock(d_inode(lower_dir));
++	mnt_drop_write(lower_dir_path.mnt);
++	path_put(&lower_dir_path);
++	return err ? ERR_PTR(err) : NULL;
++}
++
++static int trimafs2_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
++			    const char *symname)
++{
++	struct path lower_dir_path = {}, lower_path;
++	struct qstr name = dentry->d_name;
++	struct dentry *lower_dir, *lower;
++	u64 branch_id;
++	int err;
++
++	if (!trimafs2_has_lower(dentry->d_parent)) {
++		/*
++		 * 在上层建立桥: symname 必须是绝对路径, 指向非 trimafs 的目录.
++		 * 只有 root 能做.
++		 */
++		struct path target;
++
++		if (!uid_eq(current_fsuid(), GLOBAL_ROOT_UID))
++			return -EACCES;
++		target = (struct path){};
++		if (symname[0] != '/')
++			return -ENOENT;
++		err = kern_path(symname, LOOKUP_FOLLOW, &target);
++		if (err)
++			return err;
++		if (target.dentry->d_sb->s_magic == TRIMAFS2_SUPER_MAGIC ||
++		    !d_is_dir(target.dentry)) {
++			path_put(&target);
++			return -EOPNOTSUPP;
++		}
++		err = trimafs2_check_stack_depth(dentry->d_sb, &target);
++		if (err)
++			goto out_target;
++		branch_id = atomic64_inc_return(&TRIMAFS2_SB(dentry->d_sb)->next_branch_id);
++		err = trimafs2_register_branch(dentry, &target, branch_id);
++		if (err)
++			goto out_target;
++		err = trimafs2_interpose(dentry, &target, branch_id);
++		if (err) {
++			trimafs2_unregister_branch(dentry->d_sb, branch_id);
++			goto out_target;
++		}
++		trimafs2_pin_dentry(dentry);
++		inc_nlink(dir);
++		inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
++out_target:
++		path_put(&target);
++		return err;
++	}
++
++	trimafs2_get_lower_path(dentry->d_parent, &lower_dir_path);
++	lower_dir = lower_dir_path.dentry;
++	name.hash = full_name_hash(lower_dir, name.name, name.len);
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err)
++		goto out_put;
++
++	inode_lock_nested(d_inode(lower_dir), I_MUTEX_PARENT);
++	lower = lookup_one_qstr_excl(&name, lower_dir, LOOKUP_CREATE | LOOKUP_EXCL);
++	err = PTR_ERR(lower);
++	if (IS_ERR(lower))
++		goto out_unlock;
++	err = vfs_symlink(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, symname);
++	if (err)
++		goto out_dput;
++	lower_path.mnt = lower_dir_path.mnt;
++	lower_path.dentry = lower;
++	err = trimafs2_interpose(dentry, &lower_path, trimafs2_dentry_branch_id(dentry->d_parent));
++	if (err) {
++		vfs_unlink(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, NULL);
++		goto out_dput;
++	}
++	trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++out_dput:
++	dput(lower);
++out_unlock:
++	inode_unlock(d_inode(lower_dir));
++	mnt_drop_write(lower_dir_path.mnt);
++out_put:
++	path_put(&lower_dir_path);
++	return err;
++}
++
++static int trimafs2_link(struct dentry *old_dentry, struct inode *dir, struct dentry *new_dentry)
++{
++	struct path lower_old_path = {}, lower_dir_path = {}, lower_path;
++	struct qstr name = new_dentry->d_name;
++	struct dentry *lower_dir, *lower;
++	int err = -EXDEV;
++
++	if (!trimafs2_has_lower(old_dentry) || !trimafs2_has_lower(new_dentry->d_parent))
++		return err;
++
++	trimafs2_get_lower_path(old_dentry, &lower_old_path);
++	trimafs2_get_lower_path(new_dentry->d_parent, &lower_dir_path);
++	lower_dir = lower_dir_path.dentry;
++	err = -EXDEV;
++	if (lower_old_path.mnt != lower_dir_path.mnt ||
++	    trimafs2_dentry_branch_id(old_dentry) != trimafs2_dentry_branch_id(new_dentry->d_parent))
++		goto out_put;
++
++	name.hash = full_name_hash(lower_dir, name.name, name.len);
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err)
++		goto out_put;
++
++	inode_lock_nested(d_inode(lower_dir), I_MUTEX_PARENT);
++	lower = lookup_one_qstr_excl(&name, lower_dir, LOOKUP_CREATE | LOOKUP_EXCL);
++	err = PTR_ERR(lower);
++	if (IS_ERR(lower))
++		goto out_unlock;
++	err = vfs_link(lower_old_path.dentry, mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir),
++		       lower, NULL);
++	if (err)
++		goto out_dput;
++	lower_path.mnt = lower_dir_path.mnt;
++	lower_path.dentry = lower;
++	err = trimafs2_interpose(new_dentry, &lower_path,
++				 trimafs2_dentry_branch_id(new_dentry->d_parent));
++	if (err) {
++		vfs_unlink(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, NULL);
++		goto out_dput;
++	}
++	fsstack_copy_attr_all(d_inode(old_dentry), d_inode(lower_old_path.dentry));
++	trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++out_dput:
++	dput(lower);
++out_unlock:
++	inode_unlock(d_inode(lower_dir));
++	mnt_drop_write(lower_dir_path.mnt);
++out_put:
++	path_put(&lower_dir_path);
++	path_put(&lower_old_path);
++	return err;
++}
++
++static int trimafs2_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
++			   umode_t mode, bool excl)
++{
++	struct path lower_dir_path = {}, lower_path = {};
++	struct qstr name = dentry->d_name;
++	struct dentry *lower_dir, *lower;
++	int err;
++
++	if (!trimafs2_has_lower(dentry->d_parent))
++		return -EOPNOTSUPP;
++
++	trimafs2_get_lower_path(dentry->d_parent, &lower_dir_path);
++	lower_dir = lower_dir_path.dentry;
++	name.hash = full_name_hash(lower_dir, name.name, name.len);
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err)
++		goto out_put;
++
++	inode_lock_nested(d_inode(lower_dir), I_MUTEX_PARENT);
++	lower = lookup_one_qstr_excl(&name, lower_dir, LOOKUP_CREATE | LOOKUP_EXCL);
++	err = PTR_ERR(lower);
++	if (IS_ERR(lower))
++		goto out_unlock;
++	err = vfs_create(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, mode, excl);
++	if (err)
++		goto out_dput;
++	lower_path.mnt = lower_dir_path.mnt;
++	lower_path.dentry = lower;
++	err = trimafs2_interpose(dentry, &lower_path, trimafs2_dentry_branch_id(dentry->d_parent));
++	if (err) {
++		vfs_unlink(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower, NULL);
++		goto out_dput;
++	}
++	trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++out_dput:
++	dput(lower);
++out_unlock:
++	inode_unlock(d_inode(lower_dir));
++	mnt_drop_write(lower_dir_path.mnt);
++out_put:
++	path_put(&lower_dir_path);
++	return err;
++}
++
++/* 拆掉一个顶层桥 */
++bool trimafs2_drop_top_branch(struct dentry *dentry)
++{
++	struct inode *inode = d_inode(dentry);
++	u64 branch_id;
++
++	if (!trimafs2_forget_dentry_pin(dentry))
++		return false;
++
++	branch_id = trimafs2_dentry_branch_id(dentry);
++	shrink_dcache_parent(dentry);
++	d_invalidate(dentry);
++	clear_nlink(inode);
++	trimafs2_unregister_branch(dentry->d_sb, branch_id);
++	dput(dentry);
++	return true;
++}
++
++static int trimafs2_rmdir(struct inode *dir, struct dentry *dentry)
++{
++	struct path lower_dir_path = {};
++	struct dentry *lower_dir, *lower;
++	struct inode *lower_inode = NULL;
++	int trashed, err;
++
++	if (!trimafs2_has_lower(dentry->d_parent)) {
++		bool pinned;
++
++		if (!uid_eq(current_fsuid(), GLOBAL_ROOT_UID))
++			return -EACCES;
++		if (trimafs2_has_lower(dentry)) {
++			if (trimafs2_drop_top_branch(dentry)) {
++				if (dir->i_nlink)
++					drop_nlink(dir);
++				inode_set_mtime_to_ts(dir, inode_set_ctime_current(dir));
++			}
++			return 0;
++		}
++		if (!simple_empty(dentry))
++			return -ENOTEMPTY;
++		pinned = trimafs2_forget_dentry_pin(dentry);
++		err = simple_rmdir(dir, dentry);
++		if (err && pinned)
++			trimafs2_repin_dentry(dentry);
++		return err;
++	}
++
++	trimafs2_get_lower_path(dentry->d_parent, &lower_dir_path);
++	lower_dir = lower_dir_path.dentry;
++	err = mnt_want_write(lower_dir_path.mnt);
++	if (err)
++		goto out_put;
++
++	err = -ENOENT;
++	if (!trimafs2_has_lower(dentry))
++		goto out_drop_write;
++	lower = dget(TRIMAFS2_D(dentry)->lower_dentry);
++	if (d_is_negative(lower))
++		goto out_dput;
++	err = -ESTALE;
++	if (d_unlinked(lower))
++		goto out_dput;
++	lower_inode = igrab(d_inode(lower));
++	if (!lower_inode)
++		goto out_dput;
++
++	if (lower->d_parent == lower_dir && d_same_name(lower, lower_dir, &dentry->d_name) &&
++	    trimafs2_dentry_matches_lower(dentry, lower)) {
++		trashed = 0;
++		err = 0;
++		if (trim_is_on_trashbin_whitelist())
++			err = trim_do_trashbin(lower_dir_path.mnt, d_inode(lower_dir), lower, 1, 1,
++					       &trashed);
++		if (trashed) {
++			if (err)
++				goto out_dput;
++			clear_nlink(d_inode(dentry));
++			trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++			d_drop(dentry);
++			goto out_dput;
++		}
++	}
++
++	inode_lock_nested(d_inode(lower_dir), I_MUTEX_PARENT);
++	if (lower->d_parent != lower_dir || !d_same_name(lower, lower_dir, &dentry->d_name) ||
++	    !trimafs2_dentry_matches_lower(dentry, lower)) {
++		inode_unlock(d_inode(lower_dir));
++		err = -ESTALE;
++		goto out_dput;
++	}
++	err = vfs_rmdir(mnt_idmap(lower_dir_path.mnt), d_inode(lower_dir), lower);
++	inode_unlock(d_inode(lower_dir));
++	if (err)
++		goto out_dput;
++	clear_nlink(d_inode(dentry));
++	trimafs2_copy_lower_dir_attrs(dir, lower_dir);
++	d_drop(dentry);
++out_dput:
++	iput(lower_inode);
++	dput(lower);
++out_drop_write:
++	mnt_drop_write(lower_dir_path.mnt);
++out_put:
++	path_put(&lower_dir_path);
++	return err;
++}
++
++#define TRIMAFS2_COMMON_IOPS						\
++	.permission		= trimafs2_permission,			\
++	.get_inode_acl		= trimafs2_get_inode_acl,		\
++	.setattr		= trimafs2_setattr,			\
++	.getattr		= trimafs2_getattr,			\
++	.listxattr		= trimafs2_listxattr,			\
++	.set_acl		= trimafs2_set_acl,			\
++	.fileattr_set		= trimafs2_fileattr_set,		\
++	.fileattr_get		= trimafs2_fileattr_get,		\
++	.is_trimacl		= trimafs2_is_trimacl,			\
++	.trim_permission	= trimafs2_trimacl_permission,		\
++	.trim_acl_to_mode	= trimafs2_trim_acl_to_mode,		\
++	.get_trimacl_xattr_all	= trimafs2_get_trimacl_xattr_all,	\
++	.trim_access		= trimafs2_trim_access,			\
++	.trim_access_delete	= trimafs2_trim_access_delete,		\
++	.get_permission		= trimafs2_get_permission
++
++const struct inode_operations trimafs2_special_iops = {
++	TRIMAFS2_COMMON_IOPS,
++};
++
++const struct inode_operations trimafs2_symlink_iops = {
++	.get_link	= trimafs2_get_link,
++	.readlink	= trimafs2_readlink,
++	TRIMAFS2_COMMON_IOPS,
++};
++
++const struct inode_operations trimafs2_dir_iops = {
++	.lookup		= trimafs2_lookup,
++	.create		= trimafs2_create,
++	.link		= trimafs2_link,
++	.unlink		= trimafs2_unlink,
++	.symlink	= trimafs2_symlink,
++	.mkdir		= trimafs2_mkdir,
++	.rmdir		= trimafs2_rmdir,
++	.mknod		= trimafs2_mknod,
++	.rename		= trimafs2_rename,
++	.tmpfile	= trimafs2_tmpfile,
++	TRIMAFS2_COMMON_IOPS,
++};
++
++const struct inode_operations trimafs2_file_iops = {
++	.fiemap		= trimafs2_fiemap,
++	TRIMAFS2_COMMON_IOPS,
++};
++
++static const struct xattr_handler trimafs2_xattr_handler = {
++	.prefix	= "",
++	.get	= trimafs2_xattr_get,
++	.set	= trimafs2_xattr_set,
++};
++
++const struct xattr_handler * const trimafs2_xattr_handlers[] = {
++	&trimafs2_xattr_handler,
++	NULL
++};

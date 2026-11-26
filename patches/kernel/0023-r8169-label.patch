@@ -1,0 +1,53 @@
+From 0a67c8a508952c074d07f8fe15d55778cfbc618a Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:29:04 +0700
+Subject: [PATCH 023/110] =?UTF-8?q?r8169:=20=E8=BF=98=E5=8E=9F=E4=BB=8E?=
+ =?UTF-8?q?=E8=AE=BE=E5=A4=87=E6=A0=91=20label=20=E5=B1=9E=E6=80=A7?=
+ =?UTF-8?q?=E8=AE=BE=E7=BD=AE=E7=BD=91=E5=8D=A1=E5=90=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 rtl_init_one 开头多了 of_get_property(pdev->dev.of_node, "label")
+和 strscpy(dev->name, devname, IFNAMSIZ), 与 ImmortalWrt
+target/linux/rockchip/patches-6.18/601-net-ethernet-r8169-add-devname-configuration-from-OF.patch
+完全相同, 按该补丁原样打上。
+
+来源: ImmortalWrt rockchip 补丁 601(非主线)。
+对比: rtl_init_one 中这一段指令与飞牛一致(整函数其余差异属 RSS/私有改动, 后续提交处理)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/realtek/r8169_main.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index f30ce7bf9..3f65f9398 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -21,6 +21,7 @@
+ #include <linux/in.h>
+ #include <linux/io.h>
+ #include <linux/ip.h>
++#include <linux/of.h>
+ #include <linux/tcp.h>
+ #include <linux/interrupt.h>
+ #include <linux/dma-mapping.h>
+@@ -6493,6 +6494,7 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	struct rtl8169_private *tp;
+ 	int jumbo_max, region, rc;
+ 	struct net_device *dev;
++	const char *devname = of_get_property(pdev->dev.of_node, "label", NULL);
+ 	u32 txconfig;
+ 	u16 xid;
+ 
+@@ -6503,6 +6505,9 @@ static int rtl_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
++	if (devname)
++		strscpy(dev->name, devname, IFNAMSIZ);
++
+ 	SET_NETDEV_DEV(dev, &pdev->dev);
+ 	dev->netdev_ops = &rtl_netdev_ops;
+ 	tp = netdev_priv(dev);

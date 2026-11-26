@@ -1,0 +1,100 @@
+From 169a7c65ce87dd20a9c3f77a26b02181d9177e54 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 15:58:01 +0000
+Subject: [PATCH 102/110] =?UTF-8?q?md:=20=E9=80=82=E9=85=8D=206.18.65=20?=
+ =?UTF-8?q?=E7=BC=96=E8=AF=91=E9=94=99=E8=AF=AF(bitmap=5Ftype=5Fstore=20?=
+ =?UTF-8?q?=E7=9A=84=20sysfs=20group=E3=80=81md=5Fcloned=5Fbio)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+rebase 到 6.18.65 后 vmlinux 编译失败, 修复:
+- 6.18.65 把 bitmap_operations.group 改成 groups, 去掉 mddev_set_bitmap_ops(), 拆成 *_nosysfs + md_bitmap_sysfs_add/del。
+  bitmap_type_store(飞牛在线转 llbitmap)改用 md_bitmap_sysfs_del / 新增 md_set_bitmap_ops_sysfs()(= nosysfs + sysfs_add)。
+- md.h 恢复 md_cloned_bio(): 6.18.65 的 md_handle_request 仍用它(飞牛 raid1/raid10 不再用, 保留 stable 的 md.c 部分)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.c | 29 +++++++++++++++++++++--------
+ drivers/md/md.h |  5 +++++
+ 2 files changed, 26 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 8c2e23e90..b2b5669bd 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -1152,6 +1152,19 @@ bool mddev_set_bitmap_ops_nosysfs(struct mddev *mddev)
+ 	return false;
+ }
+ 
++/* fnnas: set bitmap_ops and create its sysfs attributes (old mddev_set_bitmap_ops) */
++static bool md_set_bitmap_ops_sysfs(struct mddev *mddev)
++{
++	bool had_ops = mddev->bitmap_ops &&
++		       mddev->bitmap_ops->head.id == mddev->bitmap_id;
++
++	if (!mddev_set_bitmap_ops_nosysfs(mddev))
++		return false;
++	if (!had_ops && !mddev_is_dm(mddev))
++		md_bitmap_sysfs_add(mddev);
++	return true;
++}
++
+ int mddev_init(struct mddev *mddev)
+ {
+ 	int err = 0;
+@@ -4919,11 +4932,12 @@ bitmap_type_store(struct mddev *mddev, const char *buf, size_t len)
+ 		goto rollback;
+ 	}
+ 
+-	if (mddev->gendisk && mddev->bitmap_ops && mddev->bitmap_ops->group)
+-		sysfs_remove_group(&mddev->kobj, mddev->bitmap_ops->group);
++	if (!mddev_is_dm(mddev) && mddev->bitmap_ops &&
++	    mddev->bitmap_ops->groups)
++		md_bitmap_sysfs_del(mddev);
+ 	mddev->bitmap_ops = NULL;
+ 	mddev->bitmap_id = ID_LLBITMAP;
+-	if (!mddev_set_bitmap_ops(mddev)) {
++	if (!md_set_bitmap_ops_sysfs(mddev)) {
+ 		err = -ENOENT;
+ 		goto rollback;
+ 	}
+@@ -4935,10 +4949,9 @@ bitmap_type_store(struct mddev *mddev, const char *buf, size_t len)
+ 	clear_bit(MD_ARRAY_FIRST_USE, &mddev->flags);
+ 	if (err) {
+ 		clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+-		if (mddev->gendisk && mddev->bitmap_ops &&
+-		    mddev->bitmap_ops->group)
+-			sysfs_remove_group(&mddev->kobj,
+-					   mddev->bitmap_ops->group);
++		if (!mddev_is_dm(mddev) && mddev->bitmap_ops &&
++		    mddev->bitmap_ops->groups)
++			md_bitmap_sysfs_del(mddev);
+ 		mddev->bitmap_ops = NULL;
+ 		goto rollback;
+ 	}
+@@ -4963,7 +4976,7 @@ bitmap_type_store(struct mddev *mddev, const char *buf, size_t len)
+ 	mddev->bitmap_id = old_id;
+ 	mddev->bitmap_info.offset = old_offset;
+ 	mddev->bitmap_info.space = old_space;
+-	mddev_set_bitmap_ops(mddev);
++	md_set_bitmap_ops_sysfs(mddev);
+ 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
+ 	md_update_sb(mddev, 1);
+ 	mddev_unlock(mddev);
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 50af5642b..381f51a39 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -1163,6 +1163,11 @@ void mddev_update_io_opt(struct mddev *mddev, unsigned int nr_stripes);
+ 
+ extern const struct block_device_operations md_fops;
+ 
++static inline bool md_cloned_bio(struct mddev *mddev, struct bio *bio)
++{
++	return bio->bi_pool == &mddev->io_clone_set;
++}
++
+ /*
+  * fnnas: remember which member disk an accounted (md_account_bio) bio was
+  * mapped to, md_end_clone_io uses it for degradation free recover.

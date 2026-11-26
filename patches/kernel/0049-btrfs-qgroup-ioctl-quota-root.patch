@@ -1,0 +1,159 @@
+From 27570c628b38140155e7076e3a4e1a16e00d0b16 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:01:50 +0700
+Subject: [PATCH 049/110] =?UTF-8?q?btrfs:=20qgroup=20ioctl=20=E7=9A=84?=
+ =?UTF-8?q?=E4=BA=8B=E5=8A=A1=E5=BC=80=E5=9C=A8=20quota=20root=20=E4=B8=8A?=
+ =?UTF-8?q?=20(=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+btrfs_ioctl_qgroup_assign / qgroup_create / qgroup_limit 原来在发 ioctl 的子卷
+root 上 btrfs_start_transaction; 飞牛改为在 qgroup_ioctl_lock 下
+btrfs_grab_root(fs_info->quota_root), 拿不到 (配额已关) 返回 -ENOTCONN,
+事务开在 quota root 上, 结束后 btrfs_put_root。qgroup_limit 的默认 qgroupid
+仍取当前子卷。按飞牛 btrfs_ioctl 里内联的这三段反汇编还原 (mutex_lock/unlock、
+refcount 自增、btrfs_put_root 的调用位置和次数一致)。
+
+比对: btrfs_ioctl 调用/立即数集合与飞牛完全相同 (之前差 3 处 put_root/6 处 mutex),
+btrfs_ioctl_rm_dev_v2 的内联方式也随之和飞牛一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/ioctl.c | 55 ++++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 51 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index c622af49b..62f023e37 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -3715,7 +3715,7 @@ static long btrfs_ioctl_qgroup_assign(struct file *file, void __user *arg)
+ {
+ 	struct inode *inode = file_inode(file);
+ 	struct btrfs_fs_info *fs_info = inode_to_fs_info(inode);
+-	struct btrfs_root *root = BTRFS_I(inode)->root;
++	struct btrfs_root *quota_root;
+ 	struct btrfs_ioctl_qgroup_assign_args *sa;
+ 	struct btrfs_qgroup_list *prealloc = NULL;
+ 	struct btrfs_trans_handle *trans;
+@@ -3746,10 +3746,24 @@ static long btrfs_ioctl_qgroup_assign(struct file *file, void __user *arg)
+ 		}
+ 	}
+ 
++	/*
++	 * fnOS: run the transaction on the quota root, not on the subvolume the
++	 * ioctl was issued on.
++	 */
++	mutex_lock(&fs_info->qgroup_ioctl_lock);
++	quota_root = btrfs_grab_root(fs_info->quota_root);
++	if (!quota_root) {
++		mutex_unlock(&fs_info->qgroup_ioctl_lock);
++		ret = -ENOTCONN;
++		goto out;
++	}
++	mutex_unlock(&fs_info->qgroup_ioctl_lock);
++
+ 	/* 2 BTRFS_QGROUP_RELATION_KEY items. */
+-	trans = btrfs_start_transaction(root, 2);
++	trans = btrfs_start_transaction(quota_root, 2);
+ 	if (IS_ERR(trans)) {
+ 		ret = PTR_ERR(trans);
++		btrfs_put_root(quota_root);
+ 		goto out;
+ 	}
+ 
+@@ -3773,6 +3787,7 @@ static long btrfs_ioctl_qgroup_assign(struct file *file, void __user *arg)
+ 			   "qgroup status update failed after %s relation, marked as inconsistent",
+ 			   sa->assign ? "adding" : "deleting");
+ 	err = btrfs_end_transaction(trans);
++	btrfs_put_root(quota_root);
+ 	if (err && !ret)
+ 		ret = err;
+ 
+@@ -3790,6 +3805,7 @@ static long btrfs_ioctl_qgroup_create(struct file *file, void __user *arg)
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+ 	struct btrfs_ioctl_qgroup_create_args *sa;
+ 	struct btrfs_trans_handle *trans;
++	struct btrfs_root *quota_root;
+ 	int ret;
+ 	int err;
+ 
+@@ -3819,13 +3835,27 @@ static long btrfs_ioctl_qgroup_create(struct file *file, void __user *arg)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * fnOS: run the transaction on the quota root, not on the subvolume the
++	 * ioctl was issued on.
++	 */
++	mutex_lock(&root->fs_info->qgroup_ioctl_lock);
++	quota_root = btrfs_grab_root(root->fs_info->quota_root);
++	if (!quota_root) {
++		mutex_unlock(&root->fs_info->qgroup_ioctl_lock);
++		ret = -ENOTCONN;
++		goto out;
++	}
++	mutex_unlock(&root->fs_info->qgroup_ioctl_lock);
++
+ 	/*
+ 	 * 1 BTRFS_QGROUP_INFO_KEY item.
+ 	 * 1 BTRFS_QGROUP_LIMIT_KEY item.
+ 	 */
+-	trans = btrfs_start_transaction(root, 2);
++	trans = btrfs_start_transaction(quota_root, 2);
+ 	if (IS_ERR(trans)) {
+ 		ret = PTR_ERR(trans);
++		btrfs_put_root(quota_root);
+ 		goto out;
+ 	}
+ 
+@@ -3836,6 +3866,7 @@ static long btrfs_ioctl_qgroup_create(struct file *file, void __user *arg)
+ 	}
+ 
+ 	err = btrfs_end_transaction(trans);
++	btrfs_put_root(quota_root);
+ 	if (err && !ret)
+ 		ret = err;
+ 
+@@ -3852,6 +3883,7 @@ static long btrfs_ioctl_qgroup_limit(struct file *file, void __user *arg)
+ 	struct btrfs_root *root = BTRFS_I(inode)->root;
+ 	struct btrfs_ioctl_qgroup_limit_args *sa;
+ 	struct btrfs_trans_handle *trans;
++	struct btrfs_root *quota_root;
+ 	int ret;
+ 	int err;
+ 	u64 qgroupid;
+@@ -3872,10 +3904,24 @@ static long btrfs_ioctl_qgroup_limit(struct file *file, void __user *arg)
+ 		goto drop_write;
+ 	}
+ 
++	/*
++	 * fnOS: run the transaction on the quota root, not on the subvolume the
++	 * ioctl was issued on.
++	 */
++	mutex_lock(&root->fs_info->qgroup_ioctl_lock);
++	quota_root = btrfs_grab_root(root->fs_info->quota_root);
++	if (!quota_root) {
++		mutex_unlock(&root->fs_info->qgroup_ioctl_lock);
++		ret = -ENOTCONN;
++		goto out;
++	}
++	mutex_unlock(&root->fs_info->qgroup_ioctl_lock);
++
+ 	/* 1 BTRFS_QGROUP_LIMIT_KEY item. */
+-	trans = btrfs_start_transaction(root, 1);
++	trans = btrfs_start_transaction(quota_root, 1);
+ 	if (IS_ERR(trans)) {
+ 		ret = PTR_ERR(trans);
++		btrfs_put_root(quota_root);
+ 		goto out;
+ 	}
+ 
+@@ -3888,6 +3934,7 @@ static long btrfs_ioctl_qgroup_limit(struct file *file, void __user *arg)
+ 	ret = btrfs_limit_qgroup(trans, qgroupid, &sa->lim);
+ 
+ 	err = btrfs_end_transaction(trans);
++	btrfs_put_root(quota_root);
+ 	if (err && !ret)
+ 		ret = err;
+ 

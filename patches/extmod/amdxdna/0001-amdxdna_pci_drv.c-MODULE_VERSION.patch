@@ -1,0 +1,28 @@
+From e2ea66ef8a6d182ba1ddda2de602c672e8c175c5 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 00:42:26 +0000
+Subject: [PATCH] =?UTF-8?q?amdxdna=5Fpci=5Fdrv.c:=20MODULE=5FVERSION=20?=
+ =?UTF-8?q?=E6=94=B9=E4=B8=BA=E5=8F=91=E5=B8=83=E7=89=88=E6=9C=AC=E4=B8=B2?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+和 CMake/pkg_driver_source.cmake 打 DKMS 源码包时对 amdxdna_pci_drv.c 做的替换一致,
+飞牛的 amdxdna.ko 的 version 就是这个串, 其余代码与 88dda53e 相同。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/accel/amdxdna/amdxdna_pci_drv.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/accel/amdxdna/amdxdna_pci_drv.c b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+index ea2c287a..e5f5d9c6 100644
+--- a/drivers/accel/amdxdna/amdxdna_pci_drv.c
++++ b/drivers/accel/amdxdna/amdxdna_pci_drv.c
+@@ -577,5 +577,5 @@ module_pci_driver(amdxdna_pci_driver);
+ MODULE_LICENSE("GPL");
+ MODULE_IMPORT_NS("AMD_PMF");
+ MODULE_AUTHOR("XRT Team <runtimeca39d@amd.com>");
+-MODULE_VERSION("0.1");
++MODULE_VERSION("2.25.260102.56.release_20260630,88dda53eee336c998abca38c71d5bc79fb3633b8");
+ MODULE_DESCRIPTION("amdxdna driver");

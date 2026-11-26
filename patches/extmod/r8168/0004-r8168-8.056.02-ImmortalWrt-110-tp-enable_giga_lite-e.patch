@@ -1,0 +1,51 @@
+From 5ffaebeec066e21ec45b4f8c7b6ee33250340f62 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:26:07 +0000
+Subject: [PATCH 4/4] =?UTF-8?q?r8168=208.056.02=20=E9=80=82=E9=85=8D=20Imm?=
+ =?UTF-8?q?ortalWrt=20110=20=E8=A1=A5=E4=B8=81:=20=E8=AF=A5=E7=89=88?=
+ =?UTF-8?q?=E6=9C=AC=E6=B2=A1=E6=9C=89=20tp->enable=5Fgiga=5Flite,=20?=
+ =?UTF-8?q?=E6=94=B9=E7=94=A8=E5=85=A8=E5=B1=80=E6=A8=A1=E5=9D=97=E5=8F=82?=
+ =?UTF-8?q?=E6=95=B0=20eee=5Fgiga=5Flite?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ImmortalWrt 的 110 补丁基于带 tp->enable_giga_lite 成员的版本, 8.056.02 里
+Giga Lite 开关是全局变量 eee_giga_lite, rtl8168_phy_speed 不再需要 tp 参数。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/r8168_n.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/r8168_n.c b/src/r8168_n.c
+index 0010004..c452b01 100755
+--- a/src/r8168_n.c
++++ b/src/r8168_n.c
+@@ -5543,7 +5543,7 @@ static unsigned int rtl8168_phy_duplex(u8 status)
+         return duplex;
+ }
+ 
+-static int rtl8168_phy_speed(struct rtl8168_private *tp, u8 status)
++static int rtl8168_phy_speed(u8 status)
+ {
+         int speed = SPEED_UNKNOWN;
+ 
+@@ -5554,7 +5554,7 @@ static int rtl8168_phy_speed(struct rtl8168_private *tp, u8 status)
+                         speed = SPEED_100;
+                 else if (status & _10bps)
+                         speed = SPEED_10;
+-                else if (tp->enable_giga_lite)
++                else if (eee_giga_lite)
+                         speed = SPEED_1000;
+         }
+ 
+@@ -5583,7 +5583,7 @@ rtl8168_check_link_status(struct net_device *dev)
+                         if (netif_msg_ifup(tp)) {
+                                 const u8 phy_status = RTL_R8(tp, PHYstatus);
+                                 const unsigned int phy_duplex = rtl8168_phy_duplex(phy_status);
+-                                const int phy_speed = rtl8168_phy_speed(tp, phy_status);
++                                const int phy_speed = rtl8168_phy_speed(phy_status);
+                                 printk(KERN_INFO PFX "%s: Link is Up - %s/%s\n",
+                                        dev->name,
+                                        phy_speed_to_str(phy_speed),

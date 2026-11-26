@@ -1,0 +1,182 @@
+From 0a843c9a0ab6301850733accc9cc981d354b09db Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:46:52 +0700
+Subject: [PATCH 064/110] =?UTF-8?q?md/raid1,raid10,raid5:=20=E7=BB=93?=
+ =?UTF-8?q?=E6=9E=84=E5=92=8C=E6=9E=9A=E4=B8=BE=E6=94=B9=E6=88=90=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E5=B8=83=E5=B1=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+只改定义, 逻辑留给各 raid 子任务。pahole 核对与飞牛模块 BTF 一致。
+  - raid1.h: enum r1bio_state +R1BIO_DFR(私有)。
+  - raid10.h: enum r10bio_state +R10BIO_DFR(私有); r10conf.r10bio_pool 改为 mempool_t *
+    (同上游 8e9171decb5e "md/raid10: resize r10bio_pool for reshape" 的结构改动; 飞牛仍保留
+    r10bio_pool_alloc, 没有上游的 create_r10bio_pool/alloc_r10bio)。raid10.c 只做了指针化
+    的机械改动: mempool_init/exit 改 mempool_create/destroy, & 去掉。
+  - raid5.h: STRIPE_STABLE_STATE、STRIPE_DFR(私有, STRIPE_DFR=27 与飞牛 md.c 反汇编一致);
+    r5pending_data +count; 新增 struct r5defer; r5conf +raid5_discard_unsupported(上游
+    90573092673c 的字段, 飞牛没有 raid5_discard_limits, 逻辑不同)、stable_list、defer_*、
+    active_stripe_workers、defer_skip_sort(私有), 位于 ctx_pool/ctx_size 之前。
+  - raid5.c: raid5_plug_cb +pending_cnt(私有)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid1.h  |  1 +
+ drivers/md/raid10.c | 15 ++++++++-------
+ drivers/md/raid10.h |  3 ++-
+ drivers/md/raid5.c  |  1 +
+ drivers/md/raid5.h  | 28 ++++++++++++++++++++++++++++
+ 5 files changed, 40 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/md/raid1.h b/drivers/md/raid1.h
+index 2ebe35aaa..4a6d83014 100644
+--- a/drivers/md/raid1.h
++++ b/drivers/md/raid1.h
+@@ -189,6 +189,7 @@ enum r1bio_state {
+ 	R1BIO_MadeGood,
+ 	R1BIO_WriteError,
+ 	R1BIO_FailFast,
++	R1BIO_DFR,	/* fnnas: io holds a degradation free recover reference */
+ };
+ 
+ static inline int sector_to_idx(sector_t sector)
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 18b569534..b8de4552e 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -277,7 +277,7 @@ static void free_r10bio(struct r10bio *r10_bio)
+ 	struct r10conf *conf = r10_bio->mddev->private;
+ 
+ 	put_all_bios(conf, r10_bio);
+-	mempool_free(r10_bio, &conf->r10bio_pool);
++	mempool_free(r10_bio, conf->r10bio_pool);
+ }
+ 
+ static void put_buf(struct r10bio *r10_bio)
+@@ -1495,7 +1495,7 @@ static bool __make_request(struct mddev *mddev, struct bio *bio, int sectors)
+ 	struct r10conf *conf = mddev->private;
+ 	struct r10bio *r10_bio;
+ 
+-	r10_bio = mempool_alloc(&conf->r10bio_pool, GFP_NOIO);
++	r10_bio = mempool_alloc(conf->r10bio_pool, GFP_NOIO);
+ 
+ 	r10_bio->master_bio = bio;
+ 	r10_bio->sectors = sectors;
+@@ -1691,7 +1691,7 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
+ 				(last_stripe_index << geo->chunk_shift);
+ 
+ retry_discard:
+-	r10_bio = mempool_alloc(&conf->r10bio_pool, GFP_NOIO);
++	r10_bio = mempool_alloc(conf->r10bio_pool, GFP_NOIO);
+ 	r10_bio->mddev = mddev;
+ 	r10_bio->state = 0;
+ 	r10_bio->sectors = 0;
+@@ -3858,7 +3858,7 @@ static void raid10_free_conf(struct r10conf *conf)
+ 	if (!conf)
+ 		return;
+ 
+-	mempool_exit(&conf->r10bio_pool);
++	mempool_destroy(conf->r10bio_pool);
+ 	kfree(conf->mirrors);
+ 	kfree(conf->mirrors_old);
+ 	kfree(conf->mirrors_new);
+@@ -3906,9 +3906,10 @@ static struct r10conf *setup_conf(struct mddev *mddev)
+ 
+ 	conf->geo = geo;
+ 	conf->copies = copies;
+-	err = mempool_init(&conf->r10bio_pool, NR_RAID_BIOS, r10bio_pool_alloc,
+-			   rbio_pool_free, conf);
+-	if (err)
++	err = -ENOMEM;
++	conf->r10bio_pool = mempool_create(NR_RAID_BIOS, r10bio_pool_alloc,
++					   rbio_pool_free, conf);
++	if (!conf->r10bio_pool)
+ 		goto out;
+ 
+ 	err = bioset_init(&conf->bio_split, BIO_POOL_SIZE, 0, 0);
+diff --git a/drivers/md/raid10.h b/drivers/md/raid10.h
+index da00a55f7..5e579ff57 100644
+--- a/drivers/md/raid10.h
++++ b/drivers/md/raid10.h
+@@ -92,7 +92,7 @@ struct r10conf {
+ 						   */
+ 	wait_queue_head_t	wait_barrier;
+ 
+-	mempool_t		r10bio_pool;
++	mempool_t		*r10bio_pool;
+ 	mempool_t		r10buf_pool;
+ 	struct page		*tmppage;
+ 	struct bio_set		bio_split;
+@@ -180,5 +180,6 @@ enum r10bio_state {
+ /* failfast devices did receive failfast requests. */
+ 	R10BIO_FailFast,
+ 	R10BIO_Discard,
++	R10BIO_DFR,	/* fnnas: io holds a degradation free recover reference */
+ };
+ #endif
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index dc3fea0f5..0bf8227ec 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5659,6 +5659,7 @@ struct raid5_plug_cb {
+ 	struct blk_plug_cb	cb;
+ 	struct list_head	list;
+ 	struct list_head	temp_inactive_list[NR_STRIPE_HASH_LOCKS];
++	int			pending_cnt;	/* fnnas */
+ };
+ 
+ static void raid5_unplug(struct blk_plug_cb *blk_cb, bool from_schedule)
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index fc158bd9c..53eb0c606 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -395,6 +395,9 @@ enum {
+ 				 * in conf->r5c_full_stripe_list)
+ 				 */
+ 	STRIPE_R5C_PREFLUSH,	/* need to flush journal device */
++	STRIPE_STABLE_STATE,	/* fnnas: stripe is on conf->stable_list */
++	STRIPE_DFR,		/* fnnas: stripe holds a degradation free
++				 * recover reference */
+ };
+ 
+ #define STRIPE_EXPAND_SYNC_FLAGS \
+@@ -555,6 +558,19 @@ struct r5pending_data {
+ 	struct list_head sibling;
+ 	sector_t sector; /* stripe sector */
+ 	struct bio_list bios;
++	int count;	/* fnnas: number of bios */
++};
++
++/* fnnas: deferred io dispatch group, see r5conf->defer_groups */
++struct r5defer {
++	struct list_head	free_list;
++	struct list_head	pending_list;
++	spinlock_t		pending_bios_lock;
++	unsigned long		state;
++	int			pending_data_cnt;
++	struct bio_list		pending_bios;
++	struct r5pending_data	*pending_data;
++	struct md_thread	*defer_thread;
+ };
+ 
+ struct raid5_percpu {
+@@ -691,6 +707,18 @@ struct r5conf {
+ 	struct list_head	pending_list;
+ 	int			pending_data_cnt;
+ 	struct r5pending_data	*next_pending_data;
++	bool			raid5_discard_unsupported;
++
++	/* fnnas private */
++	struct list_head	stable_list;
++	int			defer_flush_threshold;
++	int			defer_mode;
++	int			defer_group_cnt;
++	struct r5defer		*defer_groups;
++	int			defer_group_disk_cnt_max;
++	int			defer_flush_batch_size;
++	atomic_t		active_stripe_workers;
++	bool			defer_skip_sort;
+ 
+ 	mempool_t		*ctx_pool;
+ 	int			ctx_size;

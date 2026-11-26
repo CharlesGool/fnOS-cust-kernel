@@ -1,0 +1,64 @@
+From 148d50f64064ca3f363c73f4c4cd55f03dd5be26 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:48:07 +0700
+Subject: [PATCH 026/110] =?UTF-8?q?r8169:=20=E8=BF=98=E5=8E=9F=E4=BB=8E?=
+ =?UTF-8?q?=E8=AE=BE=E5=A4=87=E6=A0=91=20realtek,led-data=20=E9=85=8D?=
+ =?UTF-8?q?=E7=BD=AE=20RTL8125=20=E7=B3=BB=E5=88=97=20LED?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 rtl_hw_start_8125 在 rtl_hw_config() 之后读取设备树属性
+"realtek,led-data"(4 个 u32), 读到就写入 LEDSEL0/1/2/3
+(0x18/0x86/0x84/0x96)。每次 rtl_hw_start(打开、复位、恢复)都会重写。
+
+来源: 写法与 iStoreOS target/linux/generic/hack-6.12/795-r8169-LED-from-OF.patch
+中的 rtl8125_led_configuration 相同(LEDSEL0~3), 但飞牛没有
+"realtek,led-feature"(模块里无此字符串), 调用点也从 rtl_init_one
+挪到了 rtl_hw_start_8125, 按飞牛私有改写处理。
+对比: rtl_reset_work(内联 rtl_hw_start)与飞牛一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/realtek/r8169_main.c | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index 6d35271dc..a817002e8 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -4424,6 +4424,25 @@ static void rtl_hw_config(struct rtl8169_private *tp)
+ 		hw_configs[tp->mac_version](tp);
+ }
+ 
++/*
++ * Customizable LED configuration from DT (RTL8125 datasheet chapter 5):
++ * "realtek,led-data" = <LEDSEL0 LEDSEL1 LEDSEL2 LEDSEL3>
++ */
++static void rtl8125_led_configuration(struct rtl8169_private *tp)
++{
++	static const int led_regs[] = { LEDSEL0, LEDSEL1, LEDSEL2, LEDSEL3 };
++	u32 led_data[4] = {};
++	int i;
++
++	if (of_property_read_u32_array(tp->pci_dev->dev.of_node,
++				       "realtek,led-data", led_data,
++				       ARRAY_SIZE(led_data)))
++		return;
++
++	for (i = 0; i < ARRAY_SIZE(led_regs); i++)
++		RTL_W16(tp, led_regs[i], led_data[i]);
++}
++
+ static void rtl_hw_start_8125(struct rtl8169_private *tp)
+ {
+ 	int i;
+@@ -4455,6 +4474,8 @@ static void rtl_hw_start_8125(struct rtl8169_private *tp)
+ 	r8168_mac_ocp_modify(tp, 0xea84, 0, BIT(1) | BIT(0));
+ 
+ 	rtl_hw_config(tp);
++
++	rtl8125_led_configuration(tp);
+ }
+ 
+ static void rtl_hw_start_8168(struct rtl8169_private *tp)

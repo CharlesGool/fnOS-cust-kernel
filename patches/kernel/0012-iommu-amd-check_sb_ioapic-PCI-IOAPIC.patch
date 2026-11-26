@@ -1,0 +1,61 @@
+From 4d369d183a666be6e8e3c57bd4e2d658dc6cf719 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 10:21:45 +0700
+Subject: [PATCH 012/110] =?UTF-8?q?iommu/amd:=20=E7=A7=BB=E6=A4=8D?=
+ =?UTF-8?q?=E4=B8=8A=E6=B8=B8=20check=5Fsb=5Fioapic(),=20=E6=8C=89=20PCI?=
+ =?UTF-8?q?=20=E7=B1=BB=E5=88=AB=E8=AF=86=E5=88=AB=E5=8D=97=E6=A1=A5=20IOA?=
+ =?UTF-8?q?PIC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+取自上游 7.x (src-7.3.6): get_sb_ioapic_id() 部分已在 6.18 stable,
+check_sb_ioapic() 按 SMBus / ISA 桥类别判断, 不再只认固定 devid 00:14.0。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/iommu/amd/init.c | 24 ++++++++++++++++--------
+ 1 file changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/iommu/amd/init.c b/drivers/iommu/amd/init.c
+index c4694ff36..a78adace6 100644
+--- a/drivers/iommu/amd/init.c
++++ b/drivers/iommu/amd/init.c
+@@ -3157,8 +3157,21 @@ static void __init free_iommu_resources(void)
+ /* SB IOAPIC is always on this device in AMD systems */
+ #define IOAPIC_SB_DEVID		((0x00 << 8) | PCI_DEVFN(0x14, 0))
+ 
+-/* SB IOAPIC for Hygon family 18h model 4h is on the device 0xb */
+-#define IOAPIC_SB_DEVID_FAM18H_M4H	((0x00 << 8) | PCI_DEVFN(0xb, 0))
++static bool __init check_sb_ioapic(int devid)
++{
++	u8 bus = PCI_BUS_NUM(devid);
++	u8 devfn = devid & 0xff;
++	u16 val;
++
++	val = read_pci_config_16(bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
++				 PCI_CLASS_DEVICE);
++
++	/*
++	 * The SB IOAPIC is integrated into the FCH (Southbridge), which is
++	 * exposed as an SMBus or ISA bridge in PCI config space.
++	 */
++	return val == PCI_CLASS_SERIAL_SMBUS || val == PCI_CLASS_BRIDGE_ISA;
++}
+ 
+ /*
+  * The Southbridge IOAPIC is assigned a GSI Base of 0 (handling interrupts
+@@ -3209,12 +3222,7 @@ static bool __init check_ioapic_information(void)
+ 			pr_err("%s: IOAPIC[%d] not in IVRS table\n",
+ 				fw_bug, id);
+ 			ret = false;
+-		} else if (id == sb_apicid && (devid == IOAPIC_SB_DEVID ||
+-			   (boot_cpu_data.x86_vendor == X86_VENDOR_HYGON &&
+-			    boot_cpu_data.x86 == 0x18 &&
+-			    boot_cpu_data.x86_model >= 0x4 &&
+-			    boot_cpu_data.x86_model <= 0xf &&
+-			    devid == IOAPIC_SB_DEVID_FAM18H_M4H))) {
++		} else if (id == sb_apicid && check_sb_ioapic(devid)) {
+ 			has_sb_ioapic = true;
+ 		}
+ 	}

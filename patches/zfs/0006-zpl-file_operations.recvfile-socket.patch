@@ -1,0 +1,187 @@
+From 3b5211a05458f0c8d569c76ef34811cc17f5d1ec Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:08:00 +0700
+Subject: [PATCH 6/8] =?UTF-8?q?zpl:=20=E5=AE=9E=E7=8E=B0=E9=A3=9E=E7=89=9B?=
+ =?UTF-8?q?=E7=9A=84=20file=5Foperations.recvfile(socket=20=E7=9B=B4?=
+ =?UTF-8?q?=E6=8E=A5=E5=86=99=E6=96=87=E4=BB=B6)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛内核给 file_operations 加了 recvfile(file, socket, ppos, count,
+struct recvfile_io_stats *)(通用实现是 mm/filemap.c generic_recvfile),
+给 Samba 等用来把 socket 数据直接写进文件。ZFS 版 zpl_recvfile():
+
+- 缓冲区: 4 倍记录大小, 夹在 256K..1M 之间, 不超过 count;
+  vmem_alloc(KM_NOSLEEP) 失败退到 256K + KM_SLEEP;
+- 循环 kernel_recvmsg(MSG_WAITALL), 期间临时把 sk_rcvtimeo 改成
+  64*HZ; 收到的数据经 iov_iter_kvec 交给 zfs_write(), 所以配额、
+  范围锁、O_APPEND/O_SYNC 等都按普通写处理;
+- 致命信号返回 -EINTR; 统计写进 stats->received/written; 有写入
+  就更新 *ppos 并返回写入字节数, 否则返回错误。
+
+函数体按飞牛二进制重写, 调用序列、常量和行号一致, 剩下的差别
+是寄存器/栈分配(栈帧 0x168 对 0x160)。
+来源: 飞牛私有改动。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ module/os/linux/zfs/zpl_file.c | 131 +++++++++++++++++++++++++++++++++
+ 1 file changed, 131 insertions(+)
+
+diff --git a/module/os/linux/zfs/zpl_file.c b/module/os/linux/zfs/zpl_file.c
+index f7691c0..5b173aa 100644
+--- a/module/os/linux/zfs/zpl_file.c
++++ b/module/os/linux/zfs/zpl_file.c
+@@ -42,6 +42,8 @@
+ #include <linux/fadvise.h>
+ #ifdef HAVE_VFS_FILEMAP_DIRTY_FOLIO
+ #include <linux/writeback.h>
++#include <linux/net.h>
++#include <net/sock.h>
+ #endif
+ 
+ /*
+@@ -287,6 +289,134 @@ zpl_iter_write(struct kiocb *kiocb, struct iov_iter *from)
+ 	return (wrote);
+ }
+ 
++/*
++ * fnOS: file_operations.recvfile - receive data from a socket straight
++ * into a file (the recvfile(2) system call, used by fnOS for uploads).
++ *
++ * Data is read from the socket into a kernel bounce buffer with
++ * kernel_recvmsg() and then written with zfs_write(), so it goes through
++ * the normal ZFS write path (range locks, quotas, ZIL, O_SYNC handling).
++ * The caller holds the inode lock and has done the write checks.
++ *
++ * Returns the number of bytes written to the file if any data was written,
++ * otherwise 0 or a negative errno.  *ppos is advanced by the bytes written;
++ * stats (optional) returns the bytes received from the socket and the
++ * bytes written.
++ */
++#define	ZPL_RECVFILE_BUF_MIN	(256 * 1024)
++#define	ZPL_RECVFILE_BUF_MAX	(1024 * 1024)
++#define	ZPL_RECVFILE_RCVTIMEO	(64 * HZ)
++
++static ssize_t
++zpl_recvfile(struct file *filp, struct socket *sock, loff_t *ppos,
++    size_t count, struct recvfile_io_stats *stats)
++{
++	struct inode *ip = filp->f_mapping->host;
++	znode_t *zp = ITOZ(ip);
++	zfsvfs_t *zfsvfs = ITOZSB(ip);
++	cred_t *cr = CRED();
++	struct recvfile_io_stats local_stats = { 0 };
++	fstrans_cookie_t cookie;
++	struct kiocb kiocb;
++	size_t blksz, bufsize;
++	ssize_t ret = 0;
++	void *buf;
++
++	if (stats == NULL)
++		stats = &local_stats;
++
++	/* bounce buffer: 4 blocks, 256K..1M, a whole number of blocks */
++	blksz = zp->z_blksz;
++	if (blksz >= zp->z_size)
++		blksz = MAX(blksz, zfsvfs->z_max_blksz);
++	blksz = MAX(blksz, PAGE_SIZE);
++	bufsize = MIN(blksz * 4, ZPL_RECVFILE_BUF_MAX);
++	bufsize = MAX(bufsize, ZPL_RECVFILE_BUF_MIN);
++	if (blksz < bufsize)
++		bufsize = P2ALIGN_TYPED(bufsize, blksz, size_t);
++	bufsize = MIN(bufsize, count);
++
++	buf = vmem_alloc(bufsize, KM_NOSLEEP);
++	if (buf == NULL && bufsize > ZPL_RECVFILE_BUF_MIN) {
++		bufsize = ZPL_RECVFILE_BUF_MIN;
++		buf = vmem_alloc(bufsize, KM_SLEEP);
++	}
++	if (buf == NULL)
++		return (-ENOMEM);
++
++	init_sync_kiocb(&kiocb, filp);
++	kiocb.ki_pos = *ppos;
++
++	crhold(cr);
++
++	while (count > 0) {
++		struct msghdr msg = {};
++		struct kvec iov;
++		struct iov_iter iter = {};
++		zfs_uio_t uio = {};
++		ssize_t received, written;
++		long rcvtimeo;
++
++		/* a killed task must not wait for the peer */
++		if (fatal_signal_pending(current)) {
++			ret = -EINTR;
++			break;
++		}
++
++		iov.iov_base = buf;
++		iov.iov_len = MIN(bufsize, count);
++
++		rcvtimeo = sock->sk->sk_rcvtimeo;
++		sock->sk->sk_rcvtimeo = ZPL_RECVFILE_RCVTIMEO;
++		received = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len,
++		    MSG_WAITALL);
++		sock->sk->sk_rcvtimeo = rcvtimeo;
++		if (received <= 0) {
++			ret = received;
++			break;
++		}
++		stats->received += received;
++
++		/*
++		 * write what was received through the regular write path
++		 */
++		iov_iter_kvec(&iter, ITER_SOURCE, &iov, 1, received);
++		zfs_uio_iov_iter_init(&uio, &iter, kiocb.ki_pos, received);
++
++		cookie = spl_fstrans_mark();
++		ret = -zfs_write(zp, &uio, filp->f_flags | zfs_io_flags(&kiocb),
++		    cr);
++		spl_fstrans_unmark(cookie);
++		if (ret < 0)
++			break;
++
++		written = received - zfs_uio_resid(&uio);
++		stats->written += written;
++		kiocb.ki_pos += written;
++		count -= written;
++
++		if (written != received) {
++			ret = written ? written : -EIO;
++			break;
++		}
++		if (written < iov.iov_len) {
++			ret = written;
++			break;
++		}
++
++		cond_resched();
++	}
++
++	crfree(cr);
++
++	if (stats->written)
++		*ppos = kiocb.ki_pos;
++
++	vmem_free(buf, bufsize);
++
++	return (stats->written ? stats->written : ret);
++}
++
+ static ssize_t
+ zpl_direct_IO(struct kiocb *kiocb, struct iov_iter *iter)
+ {
+@@ -1253,6 +1383,7 @@ const struct file_operations zpl_file_operations = {
+ 	.dedupe_file_range	= zpl_dedupe_file_range,
+ #endif
+ 	.fadvise	= zpl_fadvise,
++	.recvfile	= zpl_recvfile,
+ 	.unlocked_ioctl	= zpl_ioctl,
+ #ifdef CONFIG_COMPAT
+ 	.compat_ioctl	= zpl_compat_ioctl,

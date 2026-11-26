@@ -1,0 +1,215 @@
+From dae7d2026e5d1e863bf7c403f6dc199eda9a9fa4 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:25 +0000
+Subject: [PATCH 067/110] =?UTF-8?q?block:=20=E5=AE=9E=E7=8E=B0=20REQ=5FOP?=
+ =?UTF-8?q?=5FUNUSED=5FHINT(blkdev=5Fhint=5Funused)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛私有。文件系统(ext4/btrfs 的 FIHINTUNUSED ioctl / discard 路径)把空闲空间以
+REQ_OP_UNUSED_HINT bio 发给块设备, md raid 据此跳过未用区域的同步/重建。
+
+- blk-lib.c: 新增 blkdev_hint_unused(bdev, sector, nr_sects, gfp), EXPORT_SYMBOL(与飞牛一致, 非 GPL)。
+  队列没有 QUEUE_FLAG_UNUSED_HINT 返回 -EOPNOTSUPP, 无队列 -ENXIO; 起点按逻辑块对齐(向上),
+  按 round_down(UINT_MAX, lbs) 切成多个 bio, 用 blk_next_bio 串起来同步等待; 底层返回 -EOPNOTSUPP 视为成功。
+  不加分区偏移(和 discard 不同, bio 下发时 blk_partition_remap 会做)。
+- blk-merge.c: 新增 blk_bio_unused_hint_split(), blk.h 的 __bio_split_to_limits 加对应 case。
+  照飞牛: 直接 bio_split 返回前半段, 不 bio_chain、不重提交剩余部分(沿用旧内核
+  blk_bio_discard_split 的写法)。blkdev_hint_unused 发出的 bio 不会超过这个上限, 所以平时走不到。
+  blk_recalc_rq_segments: UNUSED_HINT 和 DISCARD/SECURE_ERASE 一样算段数。
+- blk-core.c: submit_bio_noacct 里队列不支持(没有 QUEUE_FLAG_UNUSED_HINT)就 BLK_STS_NOTSUPP;
+  blk_op_name 加 "UNUSED_HINT"(blk_op_str 上界随之变 128)。
+- blk-mq-debugfs.c: queue 标志名加 "UNUSED_HINT"(debugfs state 文件)。
+- blktrace.c: blk_fill_rwbs 里 UNUSED_HINT 显示为 'H'。
+
+比对: blkdev_hint_unused ≈(只差寄存器), 其余 blk_bio_unused_hint_split、bio_split_to_limits、
+submit_bio_noacct、blk_op_str、queue_state_show、blk_fill_rwbs、blk_recalc_rq_segments、
+blk_mq_submit_bio 等 OK。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ block/blk-core.c        |  5 +++
+ block/blk-lib.c         | 71 +++++++++++++++++++++++++++++++++++++++++
+ block/blk-merge.c       | 21 ++++++++++++
+ block/blk.h             |  4 +++
+ kernel/trace/blktrace.c |  3 ++
+ 5 files changed, 104 insertions(+)
+
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 5208bdb1e..37403845f 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -110,6 +110,7 @@ static const char *const blk_op_name[] = {
+ 	REQ_OP_NAME(WRITE_ZEROES),
+ 	REQ_OP_NAME(DRV_IN),
+ 	REQ_OP_NAME(DRV_OUT),
++	REQ_OP_NAME(UNUSED_HINT),
+ };
+ #undef REQ_OP_NAME
+ 
+@@ -853,6 +854,10 @@ void submit_bio_noacct(struct bio *bio)
+ 		if (!q->limits.max_write_zeroes_sectors)
+ 			goto not_supported;
+ 		break;
++	case REQ_OP_UNUSED_HINT:
++		if (!blk_queue_unused_hint(q))
++			goto not_supported;
++		break;
+ 	case REQ_OP_ZONE_RESET:
+ 	case REQ_OP_ZONE_OPEN:
+ 	case REQ_OP_ZONE_CLOSE:
+diff --git a/block/blk-lib.c b/block/blk-lib.c
+index 352e3c0f8..ad978fa80 100644
+--- a/block/blk-lib.c
++++ b/block/blk-lib.c
+@@ -369,3 +369,74 @@ int blkdev_issue_secure_erase(struct block_device *bdev, sector_t sector,
+ 	return ret;
+ }
+ EXPORT_SYMBOL(blkdev_issue_secure_erase);
++
++/**
++ * blkdev_hint_unused - tell the device that a range of sectors is unused
++ * @bdev:	blockdev to issue the hint to
++ * @sector:	start sector
++ * @nr_sects:	number of sectors
++ * @gfp_mask:	memory allocation flags (for bio_alloc)
++ *
++ * Description:
++ *    Send REQ_OP_UNUSED_HINT bios for the range, so that a raid driver can
++ *    skip resync/recovery of space that the filesystem does not use.
++ *    Devices that do not support it are silently ignored.
++ */
++int blkdev_hint_unused(struct block_device *bdev, sector_t sector,
++		       sector_t nr_sects, gfp_t gfp_mask)
++{
++	struct request_queue *q;
++	unsigned int granularity, max_sectors;
++	struct bio *bio = NULL;
++	struct blk_plug plug;
++	sector_t start;
++	int ret = 0;
++
++	blk_start_plug(&plug);
++	q = bdev_get_queue(bdev);
++	if (!q) {
++		ret = -ENXIO;
++		goto out;
++	}
++	if (!blk_queue_unused_hint(q)) {
++		ret = -EOPNOTSUPP;
++		goto out;
++	}
++
++	granularity = queue_logical_block_size(q) >> SECTOR_SHIFT;
++	start = __ALIGN_MASK(sector, (sector_t)(granularity - 1));
++	if (start != sector) {
++		if (start - sector < nr_sects)
++			nr_sects = sector + nr_sects - start;
++		else
++			nr_sects = 0;
++	}
++
++	max_sectors = round_down(round_down(UINT_MAX,
++			queue_logical_block_size(q)) >> SECTOR_SHIFT, granularity);
++
++	while (nr_sects) {
++		bio = blk_next_bio(bio, bdev, 0, REQ_OP_UNUSED_HINT, gfp_mask);
++		bio->bi_iter.bi_sector = start;
++		if (nr_sects > max_sectors) {
++			bio->bi_iter.bi_size = max_sectors << SECTOR_SHIFT;
++			nr_sects -= max_sectors;
++			start += max_sectors;
++		} else {
++			bio->bi_iter.bi_size = nr_sects << SECTOR_SHIFT;
++			nr_sects = 0;
++		}
++		cond_resched();
++	}
++
++	if (bio) {
++		ret = submit_bio_wait(bio);
++		if (ret == -EOPNOTSUPP)
++			ret = 0;
++		bio_put(bio);
++	}
++out:
++	blk_finish_plug(&plug);
++	return ret;
++}
++EXPORT_SYMBOL(blkdev_hint_unused);
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 5d895c789..61feab8f4 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -205,6 +205,26 @@ struct bio *bio_split_discard(struct bio *bio, const struct queue_limits *lim,
+ 	return __bio_split_discard(bio, lim, nsegs, max_sectors);
+ }
+ 
++/*
++ * Unused hints carry no data, only a sector range, so they only have to be
++ * split at the max bio size, aligned to the logical block size.
++ */
++struct bio *blk_bio_unused_hint_split(struct bio *bio,
++		const struct queue_limits *lim, unsigned *nsegs)
++{
++	unsigned int granularity = lim->logical_block_size >> SECTOR_SHIFT;
++	unsigned int max_sectors;
++
++	*nsegs = 1;
++
++	max_sectors = round_down(bio_allowed_max_sectors(lim), granularity);
++	if (bio_sectors(bio) <= max_sectors)
++		return bio;
++
++	return bio_split(bio, max_sectors, GFP_NOIO,
++			 &bio->bi_bdev->bd_disk->bio_split);
++}
++
+ static inline unsigned int blk_boundary_sectors(const struct queue_limits *lim,
+ 						bool is_atomic)
+ {
+@@ -490,6 +510,7 @@ unsigned int blk_recalc_rq_segments(struct request *rq)
+ 	switch (bio_op(rq->bio)) {
+ 	case REQ_OP_DISCARD:
+ 	case REQ_OP_SECURE_ERASE:
++	case REQ_OP_UNUSED_HINT:
+ 		if (queue_max_discard_segments(rq->q) > 1) {
+ 			struct bio *bio = rq->bio;
+ 
+diff --git a/block/blk.h b/block/blk.h
+index d2017c787..595308c65 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -392,6 +392,8 @@ ssize_t part_timeout_store(struct device *, struct device_attribute *,
+ 
+ struct bio *bio_split_discard(struct bio *bio, const struct queue_limits *lim,
+ 		unsigned *nsegs);
++struct bio *blk_bio_unused_hint_split(struct bio *bio,
++		const struct queue_limits *lim, unsigned *nsegs);
+ struct bio *bio_split_write_zeroes(struct bio *bio,
+ 		const struct queue_limits *lim, unsigned *nsegs);
+ struct bio *bio_split_rw(struct bio *bio, const struct queue_limits *lim,
+@@ -448,6 +450,8 @@ static inline struct bio *__bio_split_to_limits(struct bio *bio,
+ 		return bio_split_discard(bio, lim, nr_segs);
+ 	case REQ_OP_WRITE_ZEROES:
+ 		return bio_split_write_zeroes(bio, lim, nr_segs);
++	case REQ_OP_UNUSED_HINT:
++		return blk_bio_unused_hint_split(bio, lim, nr_segs);
+ 	default:
+ 		/* other operations can't be split */
+ 		*nr_segs = 0;
+diff --git a/kernel/trace/blktrace.c b/kernel/trace/blktrace.c
+index da7303a5a..091d543e8 100644
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@ -1880,6 +1880,9 @@ void blk_fill_rwbs(char *rwbs, blk_opf_t opf)
+ 		rwbs[i++] = 'Z';
+ 		rwbs[i++] = 'C';
+ 		break;
++	case REQ_OP_UNUSED_HINT:
++		rwbs[i++] = 'H';
++		break;
+ 	default:
+ 		rwbs[i++] = 'N';
+ 	}

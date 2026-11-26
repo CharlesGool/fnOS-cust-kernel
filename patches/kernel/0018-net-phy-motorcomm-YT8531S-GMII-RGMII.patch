@@ -1,0 +1,38 @@
+From f5a94a8516b81bfbd5dd01b44141818aa1b79568 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:13:54 +0700
+Subject: [PATCH 018/110] =?UTF-8?q?net:=20phy:=20motorcomm:=20=E7=A7=BB?=
+ =?UTF-8?q?=E6=A4=8D=E4=B8=8A=E6=B8=B8=20YT8531S=20=E5=9C=A8=20GMII=20?=
+ =?UTF-8?q?=E6=A8=A1=E5=BC=8F=E4=B8=8B=E8=B7=B3=E8=BF=87=20RGMII=20?=
+ =?UTF-8?q?=E5=BB=B6=E6=97=B6=E9=85=8D=E7=BD=AE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+YT6801 内置的 YT8531S PHY 以 GMII 接到 MAC, ytphy_rgmii_clk_delay_config()
+对 GMII 直接返回 0 (其他 PHY 仍返回 -EOPNOTSUPP)。
+
+来源: 上游 YT6801 系列补丁 (Yao Zi, net-next 2026-01 v6, 7.0 合并) 里
+  phy/motorcomm 的 GMII 分支, 原样取自 src-7.3.6; 6.18.65 没有。
+比对: motorcomm.ko 唯一不同的函数 ytphy_rgmii_clk_delay_config 一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/phy/motorcomm.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/net/phy/motorcomm.c b/drivers/net/phy/motorcomm.c
+index b76011b22..5904511cb 100644
+--- a/drivers/net/phy/motorcomm.c
++++ b/drivers/net/phy/motorcomm.c
+@@ -910,6 +910,10 @@ static int ytphy_rgmii_clk_delay_config(struct phy_device *phydev)
+ 		val |= FIELD_PREP(YT8521_RC1R_RX_DELAY_MASK, rx_reg) |
+ 		       FIELD_PREP(YT8521_RC1R_GE_TX_DELAY_MASK, tx_reg);
+ 		break;
++	case PHY_INTERFACE_MODE_GMII:
++		if (phydev->drv->phy_id != PHY_ID_YT8531S)
++			return -EOPNOTSUPP;
++		return 0;
+ 	default: /* do not support other modes */
+ 		return -EOPNOTSUPP;
+ 	}

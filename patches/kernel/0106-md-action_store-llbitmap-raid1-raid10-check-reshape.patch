@@ -1,0 +1,79 @@
+From f247e3f2f337352c872e24f057e53386b9dd379d Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:04:47 +0700
+Subject: [PATCH 106/110] =?UTF-8?q?md:=20action=5Fstore=20=E6=8C=89?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=E8=BF=98=E5=8E=9F(llbitmap=20=E7=9A=84=20rai?=
+ =?UTF-8?q?d1/raid10=20=E6=8B=92=E7=BB=9D=20check;=20reshape=20=E5=89=8D?=
+ =?UTF-8?q?=E6=8C=82=E8=B5=B7=E9=98=B5=E5=88=97)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛原版 action_store 和官方的差别:
+- ACTION_CHECK: mddev->bitmap 非空、bitmap_id == ID_LLBITMAP 且 level 为 1 或 10 时返回 -EINVAL;
+- 动作名在加锁前解析, reshape 时先 mddev_suspend(mddev, true), 结束(含出错路径)再 mddev_resume。
+之前 fcmp 按名字只比了第一个 action_store(DAMON 的同名静态函数), 漏掉了; dupcmp.py 全量重比后只有这一处真差异。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.c | 21 ++++++++++++++++++---
+ 1 file changed, 18 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index b2b5669bd..54bc826c1 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -5927,21 +5927,27 @@ action_store(struct mddev *mddev, const char *page, size_t len)
+ 	if (!mddev->pers || !mddev->pers->sync_request)
+ 		return -EINVAL;
+ 
++	action = md_sync_action_by_name(page);
++	/* fnnas: reshape 在加锁前先挂起阵列, 结束(含出错)后恢复 */
++	if (action == ACTION_RESHAPE) {
++		ret = mddev_suspend(mddev, true);
++		if (ret)
++			return ret;
++	}
++
+ retry:
+ 	if (work_busy(&mddev->sync_work))
+ 		flush_work(&mddev->sync_work);
+ 
+ 	ret = mddev_lock(mddev);
+ 	if (ret)
+-		return ret;
++		goto out_resume;
+ 
+ 	if (work_busy(&mddev->sync_work)) {
+ 		mddev_unlock(mddev);
+ 		goto retry;
+ 	}
+ 
+-	action = md_sync_action_by_name(page);
+-
+ 	/* TODO: mdadm rely on "idle" to start sync_thread. */
+ 	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery)) {
+ 		switch (action) {
+@@ -5980,6 +5986,12 @@ action_store(struct mddev *mddev, const char *page, size_t len)
+ 			set_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
+ 			break;
+ 		case ACTION_CHECK:
++			/* fnnas: llbitmap 的 raid1/raid10 不支持 check(只读校验), 只能 repair */
++			if (mddev->bitmap && mddev->bitmap_id == ID_LLBITMAP &&
++			    (mddev->level == 1 || mddev->level == 10)) {
++				ret = -EINVAL;
++				goto out;
++			}
+ 			set_bit(MD_RECOVERY_CHECK, &mddev->recovery);
+ 			fallthrough;
+ 		case ACTION_REPAIR:
+@@ -6011,6 +6023,9 @@ action_store(struct mddev *mddev, const char *page, size_t len)
+ 
+ out:
+ 	mddev_unlock(mddev);
++out_resume:
++	if (action == ACTION_RESHAPE)
++		mddev_resume(mddev);
+ 	return ret;
+ }
+ 

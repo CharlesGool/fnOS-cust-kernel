@@ -1,0 +1,40 @@
+From 880f43d7b9a7905e04f7f15a153397f8c4d890fd Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:21:34 +0000
+Subject: [PATCH 3/5] =?UTF-8?q?=E5=BA=94=E7=94=A8=20ImmortalWrt=20?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=81=20130-add-devname-configuration-from-OF.patc?=
+ =?UTF-8?q?h?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来源: immortalwrt/immortalwrt package/kernel/r8126/patches/130-add-devname-configuration-from-OF.patch
+(飞牛的 r8126.ko 带有该补丁的行为, 见笔记 step14-extmod-net.md)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/r8126_n.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/r8126_n.c b/src/r8126_n.c
+index 45d6d52..3b06438 100755
+--- a/src/r8126_n.c
++++ b/src/r8126_n.c
+@@ -12937,6 +12937,7 @@ rtl8126_init_board(struct pci_dev *pdev,
+         void __iomem *ioaddr;
+         struct net_device *dev;
+         struct rtl8126_private *tp;
++        const char *devname = of_get_property(pdev->dev.of_node, "label", NULL);
+         int rc = -ENOMEM, i, pm_cap;
+ 
+         assert(ioaddr_out != NULL);
+@@ -12951,6 +12952,9 @@ rtl8126_init_board(struct pci_dev *pdev,
+                 goto err_out;
+         }
+ 
++        if (devname)
++                strscpy(dev->name, devname, IFNAMSIZ);
++
+         SET_MODULE_OWNER(dev);
+         SET_NETDEV_DEV(dev, &pdev->dev);
+         tp = netdev_priv(dev);

@@ -1,0 +1,112 @@
+From bb7a3521bcc3ffd292218700afb842c3182c7f6b Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:23:56 +0000
+Subject: [PATCH 080/110] =?UTF-8?q?md/raid10:=20reshape=20=E6=97=B6?=
+ =?UTF-8?q?=E6=8C=89=E6=96=B0=E7=9B=98=E6=95=B0=E9=87=8D=E5=BB=BA=20r10bio?=
+ =?UTF-8?q?=5Fpool(=E4=B8=8A=E6=B8=B8=20123)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 8e9171decb5e "md/raid10: resize r10bio_pool for reshape" 原样移植(只取 raid10.c,
+raid10.h 的指针化 hdr 子任务已做): r10bio_pool 改为 mempool_create_kmalloc_pool,
+r10bio_pool_alloc/rbio_pool_free 删除, raid10_start_reshape 增盘时换新池。
+飞牛 raid10.ko 没有 r10bio_pool_alloc/rbio_pool_free, setup_conf 现在与飞牛一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid10.c | 37 ++++++++++++++++++++++++++++---------
+ 1 file changed, 28 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index b8de4552e..b55c93b0d 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -103,13 +103,23 @@ static inline struct r10bio *get_resync_r10bio(struct bio *bio)
+ 	return get_resync_pages(bio)->raid_bio;
+ }
+ 
+-static void * r10bio_pool_alloc(gfp_t gfp_flags, void *data)
++static inline int calc_r10bio_size(unsigned int raid_disks)
+ {
+-	struct r10conf *conf = data;
+-	int size = offsetof(struct r10bio, devs[conf->geo.raid_disks]);
++	return offsetof(struct r10bio, devs[raid_disks]);
++}
++
++static mempool_t *create_r10bio_pool(unsigned int raid_disks)
++{
++	int size = calc_r10bio_size(raid_disks);
+ 
+-	/* allocate a r10bio with room for raid_disks entries in the
+-	 * bios array */
++	return mempool_create_kmalloc_pool(NR_RAID_BIOS, size);
++}
++
++static struct r10bio *alloc_r10bio(unsigned int raid_disks, gfp_t gfp_flags)
++{
++	int size = calc_r10bio_size(raid_disks);
++
++	/* allocate a r10bio sized for current geometry */
+ 	return kzalloc(size, gfp_flags);
+ }
+ 
+@@ -137,7 +147,7 @@ static void * r10buf_pool_alloc(gfp_t gfp_flags, void *data)
+ 	int nalloc, nalloc_rp;
+ 	struct resync_pages *rps;
+ 
+-	r10_bio = r10bio_pool_alloc(gfp_flags, conf);
++	r10_bio = alloc_r10bio(conf->geo.raid_disks, gfp_flags);
+ 	if (!r10_bio)
+ 		return NULL;
+ 
+@@ -3906,9 +3916,7 @@ static struct r10conf *setup_conf(struct mddev *mddev)
+ 
+ 	conf->geo = geo;
+ 	conf->copies = copies;
+-	err = -ENOMEM;
+-	conf->r10bio_pool = mempool_create(NR_RAID_BIOS, r10bio_pool_alloc,
+-					   rbio_pool_free, conf);
++	conf->r10bio_pool = create_r10bio_pool(conf->geo.raid_disks);
+ 	if (!conf->r10bio_pool)
+ 		goto out;
+ 
+@@ -4404,6 +4412,7 @@ static int raid10_start_reshape(struct mddev *mddev)
+ 	struct md_rdev *rdev;
+ 	int spares = 0;
+ 	int ret;
++	mempool_t *new_pool = NULL;
+ 
+ 	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
+ 		return -EBUSY;
+@@ -4440,6 +4449,11 @@ static int raid10_start_reshape(struct mddev *mddev)
+ 		return -EINVAL;
+ 
+ 	conf->offset_diff = min_offset_diff;
++	if (mddev->delta_disks > 0) {
++		new_pool = create_r10bio_pool(new.raid_disks);
++		if (!new_pool)
++			return -ENOMEM;
++	}
+ 	spin_lock_irq(&conf->device_lock);
+ 	if (conf->mirrors_new) {
+ 		memcpy(conf->mirrors_new, conf->mirrors,
+@@ -4540,6 +4554,10 @@ static int raid10_start_reshape(struct mddev *mddev)
+ 	mddev->raid_disks = conf->geo.raid_disks;
+ 	mddev->reshape_position = conf->reshape_progress;
+ 	set_bit(MD_SB_CHANGE_DEVS, &mddev->sb_flags);
++	if (new_pool) {
++		mempool_destroy(conf->r10bio_pool);
++		conf->r10bio_pool = new_pool;
++	}
+ 
+ 	clear_bit(MD_RECOVERY_SYNC, &mddev->recovery);
+ 	clear_bit(MD_RECOVERY_CHECK, &mddev->recovery);
+@@ -4562,6 +4580,7 @@ static int raid10_start_reshape(struct mddev *mddev)
+ 	conf->reshape_safe = MaxSector;
+ 	mddev->reshape_position = MaxSector;
+ 	spin_unlock_irq(&conf->device_lock);
++	mempool_destroy(new_pool);
+ 	return ret;
+ }
+ 

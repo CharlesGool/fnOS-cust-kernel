@@ -1,0 +1,142 @@
+From 6c490033cd810e85c84939f8a556ae1a58bc4dd9 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:03:08 +0700
+Subject: [PATCH 034/110] =?UTF-8?q?trimacl:=20=E5=88=A0=E9=99=A4=E7=AC=AC?=
+ =?UTF-8?q?=206=20=E6=AD=A5=E5=B9=B6=E8=A1=8C=E8=BF=98=E5=8E=9F=E7=94=A8?=
+ =?UTF-8?q?=E7=9A=84=E4=B8=B4=E6=97=B6=E6=A1=A9?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+trim_stub.c、trimvfs_stub.c 里的 __weak 桩都已有真实实现;
+trimvfs.c 改为包含 trim_trashbin/trim_trashbin.h。
+合并后 fs/ 全量比对: 一致 2569、≈ 4、不一致 45
+(本步 8 个为编译排布差异, 其余为 stable 修复或头文件布局连带)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/Makefile       |  3 +--
+ fs/trim_stub.c    | 69 -----------------------------------------------
+ fs/trimvfs.c      |  2 +-
+ fs/trimvfs_stub.c |  9 -------
+ 4 files changed, 2 insertions(+), 81 deletions(-)
+ delete mode 100755 fs/trim_stub.c
+ delete mode 100755 fs/trimvfs_stub.c
+
+diff --git a/fs/Makefile b/fs/Makefile
+index 05338d7fa..49f8aea1b 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -17,8 +17,7 @@ obj-y :=	open.o read_write.o file_table.o super.o \
+ 		fs_types.o fs_context.o fs_parser.o fsopen.o init.o \
+ 		kernel_read_file.o mnt_idmapping.o remap_range.o pidfs.o \
+ 		file_attr.o
+-obj-$(CONFIG_FS_TRIM_ACL)	+= trimvfs.o trimvfs_stub.o	# trimvfs_stub: trim_trashbin 临时桩
+-obj-$(CONFIG_FS_TRIM_ACL)	+= trim_stub.o	# 临时桩, 第 6 步完成后删除
++obj-$(CONFIG_FS_TRIM_ACL)	+= trimvfs.o
+ 
+ obj-$(CONFIG_BUFFER_HEAD)	+= buffer.o mpage.o
+ obj-$(CONFIG_PROC_FS)		+= proc_namespace.o
+diff --git a/fs/trim_stub.c b/fs/trim_stub.c
+deleted file mode 100755
+index d3db0d660..000000000
+--- a/fs/trim_stub.c
++++ /dev/null
+@@ -1,69 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * 临时桩: 并行还原第 6 步时让 vmlinux 能链接。全部是 __weak,
+- * 真实实现写进 trim_acl.c / trimvfs.c / namespace.c 后自动覆盖。
+- * 第 6 步合并完成后删除本文件。
+- */
+-#include <linux/fs.h>
+-#include <linux/xattr.h>
+-#include <linux/trim_acl.h>
+-#include <linux/trim_flags.h>
+-#include <linux/trimvfs.h>
+-
+-/* trimvfs.h */
+-unsigned int g_external_disk_access __weak;
+-bool __weak is_str_num(const char *str) { return false; }
+-int __weak aclv2_mode_to_posix_mode(int mask) { return mask; }
+-int __weak is_vol(struct inode *inode) { return 0; }
+-unsigned int __weak d_is_vol_path(struct dentry *d) { return 0; }
+-int __weak is_vol_d(struct dentry *dentry) { return 0; }
+-int __weak is_user_dir_d(struct dentry *dentry, unsigned int uid, int vol_type) { return 0; }
+-int __weak trim_is_in_group(gid_t gid, unsigned int gidlist_count, gid_t *gidlist) { return 0; }
+-int __weak posixacl_access_permission(struct mnt_idmap *idmap, struct inode *inode, const struct posix_acl *acl, int want, struct trim_access_t *ta) { return 0; }
+-int __weak posixacl_access_permission_check_vol(struct mnt_idmap *idmap, struct inode *inode, int mask, int vol_type, struct trim_access_t *ta) { return 0; }
+-int __weak posixacl_access_permission_check(struct mnt_idmap *idmap, struct inode *inode, int mask, struct trim_access_t *ta) { return 0; }
+-int __weak vol_is_admin_or_homeowner(struct mnt_idmap *idmap, struct dentry *dentry) { return 0; }
+-unsigned int __weak is_mount_on_vol(struct inode *inode, char *vol_id) { return 0; }
+-unsigned int __weak is_mount_on_vol_d(struct dentry *d, char *vol_id) { return 0; }
+-unsigned int __weak trim_mounts_query_by_sb(struct super_block *sb, char *vol_id) { return 0; }
+-unsigned int __weak posixacl_get_permission(struct mnt_idmap *idmap, struct inode *inode, struct trim_access_t *ta) { return 0; }
+-int __weak origin_may_delete(struct mnt_idmap *idmap, struct inode *dir, struct dentry *victim, bool isdir) { return 0; }
+-int __weak trim_access(struct mnt_idmap *idmap, struct dentry *dentry, int mode, struct trim_access_t *ta) { return 0; }
+-int __weak trim_access_delete(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
+-int __weak get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
+-int __weak is_trimacl(struct dentry *dentry) { return 0; }
+-int __weak trim_do_trashbin(struct vfsmount *mnt, struct inode *dir, struct dentry *dentry, int is_dir, int trim_trashbin_flag, int *processed) { return 0; }
+-bool __weak trim_is_on_trashbin_whitelist(void) { return false; }
+-int __weak get_team_trashbin_access(struct dentry *dentry) { return 0; }
+-int __weak is_team_trashbin_dir_and_check_acl_d(struct dentry *dentry, int mask, struct mnt_idmap *idmap, struct trim_access_t *ta, int *access) { return 0; }
+-int __weak is_team_trashbin_dir_and_get_permission_d(struct dentry *dentry, struct mnt_idmap *idmap, struct trim_access_t *ta, unsigned int *perm) { return 0; }
+-long __weak trim_syscall_set_ro_stat(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_is_mountpoint(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_is_trimacl(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_realpath(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_faccessat(int dfd, const char __user *filename, int mode, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_set_external_disk_access(int mode) { return -ENOSYS; }
+-long __weak trim_syscall_get_external_disk_access(void) { return -ENOSYS; }
+-long __weak trim_syscall_get_perm(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_may_delete(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_get_trimacl_xattr(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-long __weak trim_syscall_get_posix_mode(int dfd, const char __user *filename, int flags) { return -ENOSYS; }
+-
+-/* trim_acl.h / trim_flags.h (trim_acl.c 还没写完的部分) */
+-int __weak trim_permission(struct mnt_idmap *idmap, struct dentry *dentry, int perm) { return 0; }
+-int __weak trim_may_delete(struct mnt_idmap *idmap, struct dentry *victim, struct inode *dir) { return 0; }
+-int __weak trim_to_mode(struct mnt_idmap *idmap, struct dentry *dentry, struct kstat *stat) { return 0; }
+-int __weak trim_xattr_permission(struct mnt_idmap *idmap, const char *name, struct dentry *dentry, unsigned int perm) { return 0; }
+-int __weak trim_acl_chmod(struct mnt_idmap *idmap, struct dentry *dentry, umode_t mode) { return 0; }
+-int __weak trimacl_check_acl(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta) { return 0; }
+-unsigned int __weak trimacl_calc_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
+-int __weak trim_generic_permission_ta(struct mnt_idmap *idmap, struct dentry *dentry, int mask, struct trim_access_t *ta) { return 0; }
+-int __weak trim_generic_permission(struct mnt_idmap *idmap, struct dentry *dentry, int mask) { return 0; }
+-int __weak trimacl_get_permission(struct mnt_idmap *idmap, struct dentry *dentry, struct trim_access_t *ta) { return 0; }
+-unsigned int __weak trimacl_to_mode(struct mnt_idmap *idmap, struct dentry *dentry) { return 0; }
+-int __weak trimacl_get_trimacl_xattr_all(struct mnt_idmap *idmap, struct dentry *dentry, unsigned flags, void __user *buffer, size_t buffer_size) { return 0; }
+-int __weak trim_inode_flags_load(struct inode *inode, u64 *flags) { return -EOPNOTSUPP; }
+-void __weak trim_inode_flags_forget(struct inode *inode) { }
+-void __weak trim_inode_flags_init_new(struct inode *inode) { }
+-int __weak trimacl_resolve_policy(struct dentry *dentry, unsigned int flags, enum trimacl_policy *policy) { *policy = TRIMACL_POLICY_POSIX; return 0; }
+-const struct xattr_handler trim_inode_flags_xattr_handler __weak = { .name = TRIM_INODE_FLAGS_XATTR };
+diff --git a/fs/trimvfs.c b/fs/trimvfs.c
+index 83fbb6488..644d34f16 100644
+--- a/fs/trimvfs.c
++++ b/fs/trimvfs.c
+@@ -52,7 +52,7 @@
+ #define TRIM_TRASHBIN_XATTR	"user.trim-trashbin"
+ #define TRIM_TEAM_TRASHBIN_XATTR "user.trim-team-trashbin-access"
+ 
+-int trim_trashbin(const char *path);
++#include "trim_trashbin/trim_trashbin.h"
+ 
+ unsigned int g_external_disk_access;
+ 
+diff --git a/fs/trimvfs_stub.c b/fs/trimvfs_stub.c
+deleted file mode 100755
+index d184662e5..000000000
+--- a/fs/trimvfs_stub.c
++++ /dev/null
+@@ -1,9 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * 临时桩: trim_trashbin() 在回收站字符设备 (trim_trashbin.c) 里实现,
+- * 那部分合并后删除本文件和 fs/Makefile 里的 trimvfs_stub.o。
+- */
+-#include <linux/compiler.h>
+-#include <linux/errno.h>
+-
+-int __weak trim_trashbin(const char *path) { return -ENODEV; }

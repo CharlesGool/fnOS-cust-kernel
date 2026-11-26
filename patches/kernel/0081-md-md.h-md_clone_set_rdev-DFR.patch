@@ -1,0 +1,43 @@
+From b197eff68bb951d2a75846e291bda1d2e2e52e7b Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:24:50 +0000
+Subject: [PATCH 081/110] =?UTF-8?q?md:=20md.h=20=E5=A2=9E=E5=8A=A0=20md=5F?=
+ =?UTF-8?q?clone=5Fset=5Frdev()(=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89,=20DF?=
+ =?UTF-8?q?R=20=E7=94=A8)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 md_io_clone 多了 rdev 字段(hdr 子任务已加), raid0/linear 在 md_account_bio 之后
+把 bio 实际落到的成员盘记进 md_io_clone->rdev(反汇编: raid0_make_request/linear_make_request
+里 `mov bi_private,%rax; mov rdev,0x8(%rax)`), 供 md.c 的 md_end_clone_io 做
+degradation free recover。飞牛 md_account_bio 总是克隆, 所以 bi_private 一定是 md_io_clone。
+函数名是还原时起的(飞牛里是内联, 名字不可考), 合并时若 md.c 子任务有同义函数可以统一。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.h | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index fcd265e58..6e30bb290 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -1151,6 +1151,17 @@ static inline bool md_cloned_bio(struct mddev *mddev, struct bio *bio)
+ 	return bio->bi_pool == &mddev->io_clone_set;
+ }
+ 
++/*
++ * fnnas: remember which member disk an accounted (md_account_bio) bio was
++ * mapped to, md_end_clone_io uses it for degradation free recover.
++ */
++static inline void md_clone_set_rdev(struct bio *bio, struct md_rdev *rdev)
++{
++	struct md_io_clone *md_io_clone = bio->bi_private;
++
++	md_io_clone->rdev = rdev;
++}
++
+ /*
+  * MD devices can be used undeneath by DM, in which case ->gendisk is NULL.
+  */

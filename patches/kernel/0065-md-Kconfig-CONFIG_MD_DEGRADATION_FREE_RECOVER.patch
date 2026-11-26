@@ -1,0 +1,41 @@
+From 5b8275a10d158789726f4e242ab2f6168894ad5c Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:46:52 +0700
+Subject: [PATCH 065/110] =?UTF-8?q?md:=20Kconfig=20=E5=A2=9E=E5=8A=A0=20CO?=
+ =?UTF-8?q?NFIG=5FMD=5FDEGRADATION=5FFREE=5FRECOVER?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛配置 CONFIG_MD_DEGRADATION_FREE_RECOVER=y(位于 MD_BITMAP_FILE 与 MD_LINEAR 之间)。
+bool, 依赖 BLK_DEV_MD, 默认 y。目前代码里还没有 #ifdef 使用, 由 md.c 子任务决定哪些
+代码受它控制。加上后 kbuild.sh 的配置差异里不再出现此项。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/Kconfig | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/drivers/md/Kconfig b/drivers/md/Kconfig
+index 104aa5355..ba7cf637f 100644
+--- a/drivers/md/Kconfig
++++ b/drivers/md/Kconfig
+@@ -88,6 +88,18 @@ config MD_BITMAP_FILE
+ 	  various kernel APIs and can only work with files on a file system not
+ 	  actually sitting on the MD device.
+ 
++config MD_DEGRADATION_FREE_RECOVER
++	bool "MD degradation free recover"
++	depends on BLK_DEV_MD
++	default y
++	help
++	  If a member disk goes offline for a short time (cable glitch, disk
++	  reset), keep its slot in the array and recover only the changed
++	  data when it comes back, instead of failing the disk and degrading
++	  the array.
++
++	  If unsure, say Y.
++
+ config MD_LINEAR
+ 	tristate "Linear (append) mode"
+ 	depends on BLK_DEV_MD

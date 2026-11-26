@@ -1,0 +1,29 @@
+From db4e4d40168707b02302a5194dcd0d3243950a0a Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:31:54 +0000
+Subject: [PATCH 27/28] =?UTF-8?q?btsdio.c:=20=E6=96=B0=E5=86=85=E6=A0=B8?=
+ =?UTF-8?q?=20hci=5Fdev=20=E5=B7=B2=E6=B2=A1=E6=9C=89=20dev=5Ftype/HCI=5FP?=
+ =?UTF-8?q?RIMARY,=20=E5=8A=A0=E7=89=88=E6=9C=AC=E4=BF=9D=E6=8A=A4?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/btsdio.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/btsdio.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/btsdio.c
+index 81c5c1a..2cf5e65 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/btsdio.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/btsdio.c
+@@ -254,7 +254,9 @@ int btsdio_init(void)
+ 	hdev->bus = HCI_SDIO;
+ 	hci_set_drvdata(hdev, data);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+ 	hdev->dev_type = HCI_PRIMARY;
++#endif
+ 
+ 	data->hdev = hdev;
+ 

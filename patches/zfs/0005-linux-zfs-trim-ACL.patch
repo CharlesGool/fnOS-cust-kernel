@@ -1,0 +1,78 @@
+From de08d8260749aff811e33923c1217611dc8aa8f6 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:08:00 +0700
+Subject: [PATCH 5/8] =?UTF-8?q?linux=20zfs:=20=E6=89=80=E6=9C=89=E6=95=B0?=
+ =?UTF-8?q?=E6=8D=AE=E9=9B=86=E5=BC=BA=E5=88=B6=E4=BD=BF=E7=94=A8=20trim?=
+ =?UTF-8?q?=20ACL(=E9=A3=9E=E7=89=9B)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 zfs.ko 的 acltype_changed_cb() 在原有 switch 之后无条件把
+z_acl_type 设成 ZFS_ACLTYPE_TRIMACL 并给超级块加 SB_TRIMACL:
+acltype=off/nfsv4/posixacl 的分支执行完都会跳到这两句(反汇编里
+OFF/POSIX 分支末尾 jmp 回 trimacl 赋值处)。因此:
+
+- 任何 ZFS 挂载都是 trimacl, acltype 属性只影响 SB_POSIXACL;
+- zpl_super.c: 挂载选项显示 ",trimacl";
+- zfs_acl.c: zfs_acl_chown_setattr() 对 trimacl 和 posix 一样直接
+  返回, chown 不再按 ZFS ACL 重算 mode。
+
+来源: 飞牛私有改动。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ module/os/linux/zfs/zfs_acl.c    | 4 ++++
+ module/os/linux/zfs/zfs_vfsops.c | 7 +++++++
+ module/os/linux/zfs/zpl_super.c  | 5 +++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/module/os/linux/zfs/zfs_acl.c b/module/os/linux/zfs/zfs_acl.c
+index 4c929a4..3ac43ff 100644
+--- a/module/os/linux/zfs/zfs_acl.c
++++ b/module/os/linux/zfs/zfs_acl.c
+@@ -1176,6 +1176,10 @@ zfs_acl_chown_setattr(znode_t *zp)
+ 	if (ZTOZSB(zp)->z_acl_type == ZFS_ACLTYPE_POSIX)
+ 		return (0);
+ 
++	/* fnOS: like POSIX ACLs, trim ACLs keep the mode bits as they are */
++	if (ZTOZSB(zp)->z_acl_type == ZFS_ACLTYPE_TRIMACL)
++		return (0);
++
+ 	ASSERT(MUTEX_HELD(&zp->z_lock));
+ 	ASSERT(MUTEX_HELD(&zp->z_acl_lock));
+ 
+diff --git a/module/os/linux/zfs/zfs_vfsops.c b/module/os/linux/zfs/zfs_vfsops.c
+index 8a7d14a..be76afc 100644
+--- a/module/os/linux/zfs/zfs_vfsops.c
++++ b/module/os/linux/zfs/zfs_vfsops.c
+@@ -355,6 +355,13 @@ acltype_changed_cb(void *arg, uint64_t newval)
+ 	default:
+ 		break;
+ 	}
++
++	/*
++	 * fnOS: every dataset uses trim ACLs, whatever acltype says;
++	 * permissions are checked by the kernel trim ACL code (SB_TRIMACL).
++	 */
++	zfsvfs->z_acl_type = ZFS_ACLTYPE_TRIMACL;
++	zfsvfs->z_sb->s_flags |= SB_TRIMACL;
+ }
+ 
+ static void
+diff --git a/module/os/linux/zfs/zpl_super.c b/module/os/linux/zfs/zpl_super.c
+index 347b352..09f7e06 100644
+--- a/module/os/linux/zfs/zpl_super.c
++++ b/module/os/linux/zfs/zpl_super.c
+@@ -326,6 +326,11 @@ __zpl_show_options(struct seq_file *seq, zfsvfs_t *zfsvfs)
+ 	case ZFS_ACLTYPE_POSIX:
+ 		seq_puts(seq, ",posixacl");
+ 		break;
++
++	/* fnOS: the superblock carries SB_TRIMACL, see acltype_changed_cb() */
++	case ZFS_ACLTYPE_TRIMACL:
++		seq_puts(seq, ",trimacl");
++		break;
+ 	default:
+ 		seq_puts(seq, ",noacl");
+ 		break;

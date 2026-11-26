@@ -1,0 +1,1067 @@
+From 2036fd63afe09c62f1c56c6715fb13945314df04 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:47:15 +0700
+Subject: [PATCH 024/110] =?UTF-8?q?r8169:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E7=A7=81=E6=9C=89=E7=9A=84=E5=A4=9A=E8=8A=AF=E7=89=87?=
+ =?UTF-8?q?=20RSS/MSI-X=20=E6=89=A9=E5=B1=95=20(RTL8125B/D/BP,=20RTL8126A)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+在 RFC v1 RSS 系列(只支持 RTL8127A)之上, 飞牛把 Realtek 厂商驱动
+r8125/r8126 的多队列参数移植进来, 让 VER_63/64/66/70/80 都走 RSS:
+
+- rtl_software_parameter_initialize 按芯片设置 MSI-X 向量数、队列数、
+  ISR 版本(8125B=2, 8126A=3, 8125BP=4, 8125D=5, 8127A=6),
+  最小向量数取厂商驱动的 22/20/32/22/30; 8127A TX 队列改为 2
+  (R8169_MAX_TX_QUEUES=2, 与飞牛 BTF 中 tx_ring[2] 一致)
+- 新增 RX 描述符 v3 (struct RxDescV3, RX_DESC_RING_TYPE_RSS_V3=2),
+  RTL8125B 开 RSS 时使用: 描述符取址/置位/清理/校验和/VLAN/hash/
+  错误位/分片位都按 v3 格式处理, RxConfig 置 BIT(24), 且在打开接收前写入
+- rtl_set_irq_mask / interrupt_msix / init_napi / poll_msix_tx 按 ISR 版本
+  2~6 区分链路变化向量和收发向量, 新增 poll_msix_ring (ISR v3/v4 收发共用向量)
+- rtl8125_hw_set_interrupt_type 按 ISR 版本设置 INT_CFG0
+  (v4/v5 清 MSIX_ENTRY_NUM_MODE); TX 队列数无条件写入 0xe63e,
+  0xd8 BIT1 只在 v4 描述符(RSS 类型)时置位
+- double_check_rss_support: RX 队列数向下取 2 的幂, 开 RSS 时
+  TX 队列数取硬件上限, 关 RSS 时回到 1
+- ethtool: get_channels 按是否 MSI-X 报上限; set_channels 增加 2 的幂
+  校验、rx=1 时 tx 必须为 1, 失败时回滚到旧配置(rtl8169_update_channels);
+  新增 get_rxnfc / get_rxfh / get_rxfh_key_size / get_rxfh_indir_size
+- 多 TX 队列: 启停/唤醒改用 netif_tx_*_all_queues, 完成和停队列用
+  ring->index / queue_mapping, BQL 按队列复位, 实队列数用
+  netif_set_real_num_queues
+
+来源: 飞牛私有(参数和寄存器语义来自 Realtek r8125/r8126 厂商驱动,
+上游和 RSS 系列 v1~v16 都没有这些内容)。
+对比(r8169.ko 与飞牛): 新增/修改的函数中 rx_clear、mark_to_asic、
+poll_msix_ring/tx/rx、rtl_tx、start_xmit、close、rtl_task、hw_start_8125_common、
+get_rxfh* 等一致; rtl_rx、rtl_open、get_channels ≈(只差寄存器/块排列);
+仍 NG: interrupt_msix(71/67)、update_channels(71/60)、set_channels(148/162)
+只差分支布局, 语义相同; rtl_init_one(1448/1450)、rtl_reset_work 剩余差异
+属于后续单独还原的 EEE 默认关闭和 LED 设备树配置。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/ethernet/realtek/r8169_main.c | 553 +++++++++++++++++++---
+ 1 file changed, 477 insertions(+), 76 deletions(-)
+
+diff --git a/drivers/net/ethernet/realtek/r8169_main.c b/drivers/net/ethernet/realtek/r8169_main.c
+index 3f65f9398..96378c1ce 100644
+--- a/drivers/net/ethernet/realtek/r8169_main.c
++++ b/drivers/net/ethernet/realtek/r8169_main.c
+@@ -74,9 +74,16 @@
+ #define R8169_TX_STOP_THRS	(MAX_SKB_FRAGS + 1)
+ #define R8169_TX_START_THRS	(2 * R8169_TX_STOP_THRS)
+ #define R8169_MAX_RX_QUEUES	8
+-#define R8169_MAX_TX_QUEUES	1
++#define R8169_MAX_TX_QUEUES	2
+ #define R8169_MAX_MSIX_VEC	32
+-#define R8127_MAX_TX_QUEUES	1
++#define R8125_MAX_TX_QUEUES	2
++#define R8125_MAX_RX_QUEUES	4
++#define R8125_MAX_IRQ		32
++#define R8125B_MIN_IRQ		22
++#define R8125D_MIN_IRQ		20
++#define R8125BP_MIN_IRQ		32
++#define R8126_MIN_IRQ		22
++#define R8127_MAX_TX_QUEUES	2
+ #define R8127_MAX_RX_QUEUES	8
+ #define R8127_MAX_IRQ		32
+ #define R8127_MIN_IRQ		30
+@@ -84,6 +91,12 @@
+ #define RSS_CPU_NUM_OFFSET	16
+ #define RSS_MASK_BITS_OFFSET	8
+ #define RTL8127_MAX_INDIRECTION_TABLE_ENTRIES 128
++#define RXS_8125B_RSS_UDP BIT(9)
++#define RXS_8125_RSS_IPV4 BIT(10)
++#define RXS_8125_RSS_IPV6 BIT(12)
++#define RXS_8125_RSS_TCP BIT(13)
++#define RTL8125_RXS_RSS_L3_TYPE_MASK (RXS_8125_RSS_IPV4 | RXS_8125_RSS_IPV6)
++#define RTL8125_RXS_RSS_L4_TYPE_MASK (RXS_8125_RSS_TCP | RXS_8125B_RSS_UDP)
+ #define RXS_8125B_RSS_UDP_V4 BIT(27)
+ #define RXS_8125_RSS_IPV4_V4 BIT(28)
+ #define RXS_8125_RSS_IPV6_V4 BIT(29)
+@@ -279,6 +292,7 @@ enum rtl_registers {
+ #define	RX_FIFO_THRESH			(7 << RXCFG_FIFO_SHIFT)
+ #define	RX_EARLY_OFF			(1 << 11)
+ #define	RX_PAUSE_SLOT_ON		(1 << 11)	/* 8125b and later */
++#define	RX_DESC_V3_EN			(1 << 24)	/* 8125b rx desc v3 */
+ #define	RXCFG_DMA_SHIFT			8
+ 					/* Unlimited maximum PCI burst. */
+ #define	RX_DMA_BURST			(7 << RXCFG_DMA_SHIFT)
+@@ -417,6 +431,7 @@ enum rtl8125_registers {
+ 	INT_CFG0_8125		= 0x34,
+ #define INT_CFG0_ENABLE_8125		BIT(0)
+ #define INT_CFG0_CLKREQEN		BIT(3)
++#define INT_CFG0_MSIX_ENTRY_NUM_MODE	BIT(5)
+ 	IntrMask_8125		= 0x38,
+ 	IntrStatus_8125		= 0x3c,
+ 	IntrMask1_8125		= 0x800,
+@@ -440,7 +455,10 @@ enum rtl8125_registers {
+ };
+ 
+ enum rtl8127_msix_id {
++	MSIX_ID_V2_LINKCHG	= 21,
+ 	MSIX_ID_V4_LINKCHG	= 29,
++	MSIX_ID_V5_LINKCHG	= 18,
++	MSIX_ID_V6_LINKCHG	= 29,
+ };
+ 
+ enum rtl8127_rss_register_content {
+@@ -494,6 +512,11 @@ enum rtl_register_content {
+ 	RxRUNT_RSS	= (1 << 21),
+ 	RxCRC_RSS	= (1 << 20),
+ 
++	RxRWT_V3	= (1 << 18),
++	RxRES_V3	= (1 << 20),
++	RxRUNT_V3	= (1 << 19),
++	RxCRC_V3	= (1 << 17),
++
+ 	/* ChipCmdBits */
+ 	StopReq		= 0x80,
+ 	CmdReset	= 0x10,
+@@ -596,6 +619,14 @@ enum rtl_register_content {
+ 
+ 	/* magic enable v2 */
+ 	MagicPacket_v2	= (1 << 16),	/* Wake up when receives a Magic Packet */
++	ISRIMR_V2_ROK_Q0	= (1 << 0),
++	ISRIMR_TOK_Q0		= (1 << 16),
++	ISRIMR_V2_LINKCHG	= (1 << 21),
++	ISRIMR_V4_ROK_Q0	= (1 << 0),
++	ISRIMR_V4_LINKCHG	= (1 << 29),
++	ISRIMR_V5_ROK_Q0	= (1 << 0),
++	ISRIMR_V5_TOK_Q0	= (1 << 16),
++	ISRIMR_V5_LINKCHG	= (1 << 18),
+ 	ISRIMR_V6_LINKCHG	= (1 << 29),
+ 	ISRIMR_V6_TOK_Q0	= (1 << 8),
+ 	ISRIMR_V6_ROK_Q0	= (1 << 0),
+@@ -607,6 +638,8 @@ enum rtl_desc_bit {
+ 	RingEnd		= (1 << 30), /* End of descriptor ring */
+ 	FirstFrag	= (1 << 29), /* First segment of a packet */
+ 	LastFrag	= (1 << 28), /* Final segment of a packet */
++	FirstFrag_V3	= (1 << 25), /* First segment of a packet (desc v3) */
++	LastFrag_V3	= (1 << 24), /* Final segment of a packet (desc v3) */
+ };
+ 
+ /* Generic case. */
+@@ -656,6 +689,11 @@ enum rtl_rx_desc_bit {
+ #define RxProtoIP	(PID1 | PID0)
+ #define RxProtoMask	RxProtoIP
+ 
++	RxUDPT_v3	= (1 << 29),
++	RxTCPT_v3	= (1 << 28),
++	RxUDPF_v3	= (1 << 25), /* UDP/IP checksum failed */
++	RxTCPF_v3	= (1 << 24), /* TCP/IP checksum failed */
++
+ 	RxUDPT_v4	= (1 << 19),
+ 	RxTCPT_v4	= (1 << 18),
+ 	RxUDPF_v4	= (1 << 16), /* UDP/IP checksum failed */
+@@ -702,6 +740,26 @@ struct RxDescRss {
+ 	} RxDescOpts;
+ };
+ 
++struct RxDescV3 {
++	struct {
++		__le32 reserved1;
++		__le32 reserved2;
++	} dword1;
++
++	struct {
++		__le32 rss_result;
++		__le16 header_buffer_len;
++		__le16 header_info;
++	} dword2;
++
++	__le64 addr;
++
++	struct {
++		__le32 opts2;
++		__le32 opts1;
++	} dword4;
++};
++
+ enum features {
+ 	RTL_FEATURE_MSI		= (1 << 1),
+ 	RTL_FEATURE_MSIX	= (1 << 2),
+@@ -817,6 +875,7 @@ struct rtl8169_irq {
+ enum rx_desc_ring_type {
+ 	RX_DESC_RING_TYPE_UNKNOWN = 0,
+ 	RX_DESC_RING_TYPE_DEAFULT,
++	RX_DESC_RING_TYPE_RSS_V3,
+ 	RX_DESC_RING_TYPE_RSS,
+ 	RX_DESC_RING_TYPE_MAX
+ };
+@@ -1685,9 +1744,12 @@ static bool rtl_dash_is_enabled(struct rtl8169_private *tp)
+ 
+ static bool rtl_check_rss_support(struct rtl8169_private *tp)
+ {
+-	if (tp->mac_version == RTL_GIGA_MAC_VER_80)
++	switch (tp->mac_version) {
++	case RTL_GIGA_MAC_VER_63 ... RTL_GIGA_MAC_VER_80:
+ 		return true;
+-	return false;
++	default:
++		return false;
++	}
+ }
+ 
+ static enum rtl_dash_type rtl_get_dash_type(struct rtl8169_private *tp)
+@@ -1997,6 +2059,9 @@ static void rtl8169_rx_vlan_tag(struct rtl8169_private *tp,
+ 	u32 opts2;
+ 
+ 	switch (tp->InitRxDescType) {
++	case RX_DESC_RING_TYPE_RSS_V3:
++		opts2 = le32_to_cpu(((struct RxDescV3 *)desc)->dword4.opts2);
++		break;
+ 	case RX_DESC_RING_TYPE_RSS:
+ 		opts2 = le32_to_cpu(((struct RxDescRss *)desc)->RxDescOpts.opts2);
+ 		break;
+@@ -2728,7 +2793,9 @@ static void rtl_init_rxcfg(struct rtl8169_private *tp)
+ 		break;
+ 	case RTL_GIGA_MAC_VER_63 ... RTL_GIGA_MAC_VER_LAST:
+ 		RTL_W32(tp, RxConfig, RX_FETCH_DFLT_8125 | RX_DMA_BURST |
+-			RX_PAUSE_SLOT_ON);
++			RX_PAUSE_SLOT_ON |
++			(tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3 ?
++			 RX_DESC_V3_EN : 0));
+ 		break;
+ 	default:
+ 		RTL_W32(tp, RxConfig, RX128_INT_EN | RX_DMA_BURST);
+@@ -2881,6 +2948,38 @@ static void rtl_software_parameter_initialize(struct rtl8169_private *tp)
+ 	tp->num_tx_rings = 1;
+ 
+ 	switch (tp->mac_version) {
++	case RTL_GIGA_MAC_VER_63:
++		tp->min_irq_nvecs = R8125B_MIN_IRQ;
++		tp->max_irq_nvecs = R8125_MAX_IRQ;
++		tp->HwSuppNumTxQueues = 1;
++		tp->HwSuppNumRxQueues = R8125_MAX_RX_QUEUES;
++		tp->HwSuppIndirTblEntries = RTL8127_MAX_INDIRECTION_TABLE_ENTRIES;
++		tp->HwSuppIsrVer = 2;
++		break;
++	case RTL_GIGA_MAC_VER_64:
++		tp->min_irq_nvecs = R8125D_MIN_IRQ;
++		tp->max_irq_nvecs = R8125_MAX_IRQ;
++		tp->HwSuppNumTxQueues = R8125_MAX_TX_QUEUES;
++		tp->HwSuppNumRxQueues = R8125_MAX_RX_QUEUES;
++		tp->HwSuppIndirTblEntries = RTL8127_MAX_INDIRECTION_TABLE_ENTRIES;
++		tp->HwSuppIsrVer = 5;
++		break;
++	case RTL_GIGA_MAC_VER_66:
++		tp->min_irq_nvecs = R8125BP_MIN_IRQ;
++		tp->max_irq_nvecs = R8125_MAX_IRQ;
++		tp->HwSuppNumTxQueues = R8125_MAX_TX_QUEUES;
++		tp->HwSuppNumRxQueues = R8125_MAX_RX_QUEUES;
++		tp->HwSuppIndirTblEntries = RTL8127_MAX_INDIRECTION_TABLE_ENTRIES;
++		tp->HwSuppIsrVer = 4;
++		break;
++	case RTL_GIGA_MAC_VER_70:
++		tp->min_irq_nvecs = R8126_MIN_IRQ;
++		tp->max_irq_nvecs = R8125_MAX_IRQ;
++		tp->HwSuppNumTxQueues = R8125_MAX_TX_QUEUES;
++		tp->HwSuppNumRxQueues = R8125_MAX_RX_QUEUES;
++		tp->HwSuppIndirTblEntries = RTL8127_MAX_INDIRECTION_TABLE_ENTRIES;
++		tp->HwSuppIsrVer = 3;
++		break;
+ 	case RTL_GIGA_MAC_VER_80:
+ 		tp->min_irq_nvecs = R8127_MIN_IRQ;
+ 		tp->max_irq_nvecs = R8127_MAX_IRQ;
+@@ -4114,8 +4213,21 @@ static void rtl8125_hw_set_interrupt_type(struct rtl8169_private *tp)
+ 	u8 tmp;
+ 
+ 	tmp = RTL_R8(tp, INT_CFG0_8125);
+-	tmp |= INT_CFG0_ENABLE_8125;
+-	RTL_W8(tp, INT_CFG0_8125, tmp);
++
++	switch (tp->HwCurrIsrVer) {
++	case 4:
++	case 5:
++		tmp &= ~INT_CFG0_MSIX_ENTRY_NUM_MODE;
++		fallthrough;
++	case 2:
++	case 3:
++	case 6:
++		tmp |= INT_CFG0_ENABLE_8125;
++		RTL_W8(tp, INT_CFG0_8125, tmp);
++		break;
++	default:
++		break;
++	}
+ }
+ 
+ static void rtl_hw_start_8125_common(struct rtl8169_private *tp)
+@@ -4151,8 +4263,8 @@ static void rtl_hw_start_8125_common(struct rtl8169_private *tp)
+ 	/* enable rx descriptor type v4 and set queue num for rss*/
+ 	if (tp->rss_enable) {
+ 		rtl8125_set_rx_q_num(tp);
+-		rtl8125_set_tx_q_num(tp);
+-		RTL_W8(tp, 0xd8, RTL_R8(tp, 0xd8) | 0x02);
++		if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS)
++			RTL_W8(tp, 0xd8, RTL_R8(tp, 0xd8) | 0x02);
+ 	}
+ 
+ 	if (tp->mac_version == RTL_GIGA_MAC_VER_80)
+@@ -4169,6 +4281,8 @@ static void rtl_hw_start_8125_common(struct rtl8169_private *tp)
+ 	else
+ 		r8168_mac_ocp_modify(tp, 0xe63e, 0x0c30, 0x0020);
+ 
++	rtl8125_set_tx_q_num(tp);
++
+ 	r8168_mac_ocp_modify(tp, 0xc0b4, 0x0000, 0x000c);
+ 	r8168_mac_ocp_modify(tp, 0xeb6a, 0x00ff, 0x0033);
+ 	r8168_mac_ocp_modify(tp, 0xeb50, 0x03e0, 0x0040);
+@@ -4407,8 +4521,13 @@ static void rtl_hw_start(struct  rtl8169_private *tp)
+ 	/* Initially a 10 us delay. Turned it into a PCI commit. - FR */
+ 	rtl_pci_commit(tp);
+ 
++	/* RX descriptor v3 has to be selected before the receiver is enabled */
++	if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3)
++		rtl_init_rxcfg(tp);
++
+ 	RTL_W8(tp, ChipCmd, CmdTxEnb | CmdRxEnb);
+-	rtl_init_rxcfg(tp);
++	if (tp->InitRxDescType != RX_DESC_RING_TYPE_RSS_V3)
++		rtl_init_rxcfg(tp);
+ 	rtl_set_tx_config_registers(tp);
+ 	rtl_set_rx_config_features(tp, tp->dev->features);
+ 	rtl_set_rx_mode(tp->dev);
+@@ -4437,6 +4556,16 @@ static void rtl8169_mark_to_asic_rss(struct RxDescRss *descrss)
+ 	WRITE_ONCE(descrss->RxDescOpts.opts1, cpu_to_le32(DescOwn | eor | R8169_RX_BUF_SIZE));
+ }
+ 
++static void rtl8169_mark_to_asic_v3(struct RxDescV3 *descv3)
++{
++	u32 eor = le32_to_cpu(descv3->dword4.opts1) & RingEnd;
++
++	descv3->dword4.opts2 = 0;
++	/* Force memory writes to complete before releasing descriptor */
++	dma_wmb();
++	WRITE_ONCE(descv3->dword4.opts1, cpu_to_le32(DescOwn | eor | R8169_RX_BUF_SIZE));
++}
++
+ static void rtl8169_mark_to_asic_default(struct RxDesc *desc)
+ {
+ 	u32 eor = le32_to_cpu(desc->opts1) & RingEnd;
+@@ -4450,6 +4579,9 @@ static void rtl8169_mark_to_asic_default(struct RxDesc *desc)
+ static void rtl8169_mark_to_asic(struct rtl8169_private *tp, struct RxDesc *desc)
+ {
+ 	switch (tp->InitRxDescType) {
++	case RX_DESC_RING_TYPE_RSS_V3:
++		rtl8169_mark_to_asic_v3((struct RxDescV3 *)desc);
++		break;
+ 	case RX_DESC_RING_TYPE_RSS:
+ 		rtl8169_mark_to_asic_rss((struct RxDescRss *)desc);
+ 		break;
+@@ -4459,6 +4591,15 @@ static void rtl8169_mark_to_asic(struct rtl8169_private *tp, struct RxDesc *desc
+ 	}
+ }
+ 
++static struct RxDesc *rtl8169_get_rxdesc(struct rtl8169_private *tp,
++					  struct RxDesc *desc_base, u32 index)
++{
++	if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3)
++		return (struct RxDesc *)((struct RxDescV3 *)desc_base + index);
++
++	return desc_base + index;
++}
++
+ static struct page *rtl8169_alloc_rx_data(struct rtl8169_private *tp,
+ 					  struct rtl8169_rx_ring *ring, unsigned int index)
+ {
+@@ -4466,7 +4607,7 @@ static struct page *rtl8169_alloc_rx_data(struct rtl8169_private *tp,
+ 	int node = dev_to_node(d);
+ 	dma_addr_t mapping;
+ 	struct page *data;
+-	struct RxDesc *desc = ring->RxDescArray + index;
++	struct RxDesc *desc = rtl8169_get_rxdesc(tp, ring->RxDescArray, index);
+ 
+ 	data = alloc_pages_node(node, GFP_KERNEL, get_order(R8169_RX_BUF_SIZE));
+ 	if (!data)
+@@ -4480,7 +4621,11 @@ static struct page *rtl8169_alloc_rx_data(struct rtl8169_private *tp,
+ 	}
+ 
+ 	ring->RxDescPhyAddr[index] = mapping;
+-	if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS) {
++	if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3) {
++		struct RxDescV3 *descv3 = (struct RxDescV3 *)desc;
++
++		descv3->addr = cpu_to_le64(mapping);
++	} else if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS) {
+ 		struct RxDescRss *descrss = (struct RxDescRss *)(ring->RxDescArray) + index;
+ 
+ 		descrss->addr = cpu_to_le64(mapping);
+@@ -4497,14 +4642,16 @@ static void rtl8169_rx_clear(struct rtl8169_private *tp, struct rtl8169_rx_ring
+ 	int i;
+ 
+ 	for (i = 0; i < NUM_RX_DESC && ring->Rx_databuff[i]; i++) {
++		struct RxDesc *desc = rtl8169_get_rxdesc(tp, ring->RxDescArray, i);
++
+ 		dma_unmap_page(tp_to_dev(tp),
+ 			       ring->RxDescPhyAddr[i],
+ 			       R8169_RX_BUF_SIZE, DMA_FROM_DEVICE);
+ 		__free_pages(ring->Rx_databuff[i], get_order(R8169_RX_BUF_SIZE));
+ 		ring->Rx_databuff[i] = NULL;
+ 		ring->RxDescPhyAddr[i] = 0;
+-		ring->RxDescArray[i].addr = 0;
+-		ring->RxDescArray[i].opts1 = 0;
++		memset(desc, 0, tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3 ?
++		       sizeof(struct RxDescV3) : sizeof(struct RxDesc));
+ 	}
+ }
+ 
+@@ -4513,6 +4660,11 @@ static void rtl8169_mark_as_last_descriptor_default(struct RxDesc *desc)
+ 	desc->opts1 |= cpu_to_le32(RingEnd);
+ }
+ 
++static void rtl8169_mark_as_last_descriptor_v3(struct RxDescV3 *descv3)
++{
++	descv3->dword4.opts1 |= cpu_to_le32(RingEnd);
++}
++
+ static void rtl8169_mark_as_last_descriptor_rss(struct RxDescRss *descrss)
+ {
+ 	descrss->RxDescOpts.opts1 |= cpu_to_le32(RingEnd);
+@@ -4521,6 +4673,9 @@ static void rtl8169_mark_as_last_descriptor_rss(struct RxDescRss *descrss)
+ static void rtl8169_mark_as_last_descriptor(struct rtl8169_private *tp, struct RxDesc *desc)
+ {
+ 	switch (tp->InitRxDescType) {
++	case RX_DESC_RING_TYPE_RSS_V3:
++		rtl8169_mark_as_last_descriptor_v3((struct RxDescV3 *)desc);
++		break;
+ 	case RX_DESC_RING_TYPE_RSS:
+ 		rtl8169_mark_as_last_descriptor_rss((struct RxDescRss *)desc);
+ 		break;
+@@ -4546,7 +4701,8 @@ static int rtl8169_rx_fill(struct rtl8169_private *tp, struct rtl8169_rx_ring *r
+ 	}
+ 
+ 	/* mark as last descriptor in the ring */
+-	rtl8169_mark_as_last_descriptor(tp, &ring->RxDescArray[NUM_RX_DESC - 1]);
++	rtl8169_mark_as_last_descriptor(tp, rtl8169_get_rxdesc(tp, ring->RxDescArray,
++							       NUM_RX_DESC - 1));
+ 
+ 	return 0;
+ }
+@@ -4593,7 +4749,9 @@ static int rtl8169_alloc_rx_desc(struct rtl8169_private *tp)
+ 
+ 	for (int i = 0; i < tp->num_rx_rings; i++) {
+ 		ring = &tp->rx_ring[i];
+-		ring->RxDescAllocSize = (ring->num_rx_desc + 1) * sizeof(struct RxDesc);
++		ring->RxDescAllocSize = (ring->num_rx_desc + 1) *
++			(tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3 ?
++			 sizeof(struct RxDescV3) : sizeof(struct RxDesc));
+ 		ring->RxDescArray = dma_alloc_coherent(&pdev->dev,
+ 						       ring->RxDescAllocSize,
+ 						       &ring->RxPhyAddr,
+@@ -4684,8 +4842,8 @@ static void rtl8169_tx_clear(struct rtl8169_private *tp)
+ 		rtl8169_tx_clear_range(tp, ring, ring->dirty_tx, ring->num_tx_desc);
+ 		ring->cur_tx = 0;
+ 		ring->dirty_tx = 0;
++		netdev_tx_reset_queue(netdev_get_tx_queue(tp->dev, i));
+ 	}
+-	netdev_reset_queue(tp->dev);
+ }
+ 
+ static void rtl8169_napi_disable(struct rtl8169_private *tp)
+@@ -4743,13 +4901,13 @@ static void rtl8169_rx_desc_reset(struct rtl8169_private *tp)
+ 		struct rtl8169_rx_ring *ring = &tp->rx_ring[i];
+ 
+ 		for (int j = 0; j < ring->num_rx_desc; j++)
+-			rtl8169_mark_to_asic(tp, ring->RxDescArray + j);
++			rtl8169_mark_to_asic(tp, rtl8169_get_rxdesc(tp, ring->RxDescArray, j));
+ 	}
+ }
+ 
+ static void rtl_reset_work(struct rtl8169_private *tp)
+ {
+-	netif_stop_queue(tp->dev);
++	netif_tx_stop_all_queues(tp->dev);
+ 
+ 	rtl8169_cleanup(tp);
+ 
+@@ -5066,7 +5224,7 @@ static netdev_tx_t rtl8169_start_xmit(struct sk_buff *skb,
+ 
+ 	WRITE_ONCE(ring->cur_tx, ring->cur_tx + frags + 1);
+ 
+-	stop_queue = !netif_subqueue_maybe_stop(dev, 0, rtl_tx_slots_avail(ring),
++	stop_queue = !netif_subqueue_maybe_stop(dev, queue_mapping, rtl_tx_slots_avail(ring),
+ 						R8169_TX_STOP_THRS,
+ 						R8169_TX_START_THRS);
+ 	if (door_bell || stop_queue)
+@@ -5206,7 +5364,7 @@ static int rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
+ 		dev_sw_netstats_tx_add(dev, pkts_compl, bytes_compl);
+ 		WRITE_ONCE(ring->dirty_tx, dirty_tx);
+ 
+-		netif_subqueue_completed_wake(dev, 0, pkts_compl, bytes_compl,
++		netif_subqueue_completed_wake(dev, ring->index, pkts_compl, bytes_compl,
+ 					      rtl_tx_slots_avail(ring),
+ 					      R8169_TX_START_THRS);
+ 		/*
+@@ -5223,30 +5381,44 @@ static int rtl_tx(struct net_device *dev, struct rtl8169_private *tp,
+ 	return count;
+ }
+ 
+-static inline int rtl8169_fragmented_frame(u32 status)
++static inline int rtl8169_fragmented_frame(struct rtl8169_private *tp, u32 status)
+ {
++	if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3)
++		return (status & (FirstFrag_V3 | LastFrag_V3)) !=
++		       (FirstFrag_V3 | LastFrag_V3);
++
+ 	return (status & (FirstFrag | LastFrag)) != (FirstFrag | LastFrag);
+ }
+ 
+ static inline void rtl8169_rx_hash(struct rtl8169_private *tp,
+-				   struct RxDescRss *desc,
++				   struct RxDesc *desc,
+ 				   struct sk_buff *skb)
+ {
+-	u32 rss_header_info;
+-	u32 hash_val;
++	u32 rss_header_info, hash_val, l3_mask, l4_mask;
+ 
+ 	if (!(tp->dev->features & NETIF_F_RXHASH))
+ 		return;
+ 
+-	rss_header_info = le32_to_cpu(desc->RxDescRSSDWord.RSSInfo);
++	if (tp->InitRxDescType == RX_DESC_RING_TYPE_RSS_V3) {
++		struct RxDescV3 *descv3 = (struct RxDescV3 *)desc;
+ 
+-	if (!(rss_header_info & RTL8127_RXS_RSS_L3_TYPE_MASK_V4))
+-		return;
++		rss_header_info = le16_to_cpu(descv3->dword2.header_info);
++		hash_val = le32_to_cpu(descv3->dword2.rss_result);
++		l3_mask = RTL8125_RXS_RSS_L3_TYPE_MASK;
++		l4_mask = RTL8125_RXS_RSS_L4_TYPE_MASK;
++	} else {
++		struct RxDescRss *descrss = (struct RxDescRss *)desc;
++
++		rss_header_info = le32_to_cpu(descrss->RxDescRSSDWord.RSSInfo);
++		hash_val = le32_to_cpu(descrss->RxDescRSSDWord.RSSResult);
++		l3_mask = RTL8127_RXS_RSS_L3_TYPE_MASK_V4;
++		l4_mask = RTL8127_RXS_RSS_L4_TYPE_MASK_V4;
++	}
+ 
+-	hash_val = le32_to_cpu(desc->RxDescRSSDWord.RSSResult);
++	if (!(rss_header_info & l3_mask))
++		return;
+ 
+-	skb_set_hash(skb, hash_val,
+-		     (RTL8127_RXS_RSS_L4_TYPE_MASK_V4 & rss_header_info) ?
++	skb_set_hash(skb, hash_val, (l4_mask & rss_header_info) ?
+ 		     PKT_HASH_TYPE_L4 : PKT_HASH_TYPE_L3);
+ }
+ 
+@@ -5262,6 +5434,19 @@ static inline void rtl8169_rx_csum_default(struct rtl8169_private *tp,
+ 		skb_checksum_none_assert(skb);
+ }
+ 
++static inline void rtl8169_rx_csum_v3(struct rtl8169_private *tp,
++				      struct sk_buff *skb,
++				      struct RxDescV3 *descv3)
++{
++	u32 opts2 = le32_to_cpu(descv3->dword4.opts2);
++
++	if (((opts2 & RxTCPT_v3) && !(opts2 & RxTCPF_v3)) ||
++	    ((opts2 & RxUDPT_v3) && !(opts2 & RxUDPF_v3)))
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++	else
++		skb_checksum_none_assert(skb);
++}
++
+ static inline void rtl8169_rx_csum_rss(struct rtl8169_private *tp,
+ 				       struct sk_buff *skb,
+ 				       struct RxDescRss *descrss)
+@@ -5280,6 +5465,9 @@ static inline void rtl8169_rx_csum(struct rtl8169_private *tp,
+ 				   struct RxDesc *desc)
+ {
+ 	switch (tp->InitRxDescType) {
++	case RX_DESC_RING_TYPE_RSS_V3:
++		rtl8169_rx_csum_v3(tp, skb, (struct RxDescV3 *)desc);
++		break;
+ 	case RX_DESC_RING_TYPE_RSS:
+ 		rtl8169_rx_csum_rss(tp, skb, (struct RxDescRss *)desc);
+ 		break;
+@@ -5292,6 +5480,8 @@ static inline void rtl8169_rx_csum(struct rtl8169_private *tp,
+ static u32 rtl8169_rx_desc_opts1(struct rtl8169_private *tp, struct RxDesc *desc)
+ {
+ 	switch (tp->InitRxDescType) {
++	case RX_DESC_RING_TYPE_RSS_V3:
++		return READ_ONCE(((struct RxDescV3 *)desc)->dword4.opts1);
+ 	case RX_DESC_RING_TYPE_RSS:
+ 		return READ_ONCE(((struct RxDescRss *)desc)->RxDescOpts.opts1);
+ 	default:
+@@ -5306,6 +5496,15 @@ static int rtl8169_check_rx_desc_error(struct net_device *dev,
+ 	int ret = 0;
+ 
+ 	switch (tp->InitRxDescType) {
++	case RX_DESC_RING_TYPE_RSS_V3:
++		if (unlikely(status & RxRES_V3)) {
++			if (status & (RxRWT_V3 | RxRUNT_V3))
++				dev->stats.rx_length_errors++;
++			if (status & RxCRC_V3)
++				dev->stats.rx_crc_errors++;
++			ret = -1;
++		}
++		break;
+ 	case RX_DESC_RING_TYPE_RSS:
+ 		if (unlikely(status & RxRES_RSS)) {
+ 			if (status & RxRUNT_RSS)
+@@ -5333,6 +5532,9 @@ static inline void rtl8169_set_desc_dma_addr(struct rtl8169_private *tp,
+ 					     dma_addr_t mapping)
+ {
+ 	switch (tp->InitRxDescType) {
++	case RX_DESC_RING_TYPE_RSS_V3:
++		((struct RxDescV3 *)desc)->addr = cpu_to_le64(mapping);
++		break;
+ 	case RX_DESC_RING_TYPE_RSS:
+ 		((struct RxDescRss *)desc)->addr = cpu_to_le64(mapping);
+ 		break;
+@@ -5350,7 +5552,7 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp,
+ 
+ 	for (count = 0; count < budget; count++, ring->cur_rx++) {
+ 		unsigned int pkt_size, entry = ring->cur_rx % ring->num_rx_desc;
+-		struct RxDesc *desc = ring->RxDescArray + entry;
++		struct RxDesc *desc = rtl8169_get_rxdesc(tp, ring->RxDescArray, entry);
+ 		struct sk_buff *skb;
+ 		const void *rx_buf;
+ 		dma_addr_t addr;
+@@ -5393,7 +5595,7 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp,
+ 		/* The driver does not support incoming fragmented frames.
+ 		 * They are seen as a symptom of over-mtu sized frames.
+ 		 */
+-		if (unlikely(rtl8169_fragmented_frame(status))) {
++		if (unlikely(rtl8169_fragmented_frame(tp, status))) {
+ 			dev->stats.rx_dropped++;
+ 			dev->stats.rx_length_errors++;
+ 			goto release_descriptor;
+@@ -5416,7 +5618,7 @@ static int rtl_rx(struct net_device *dev, struct rtl8169_private *tp,
+ 		dma_sync_single_for_device(d, addr, pkt_size, DMA_FROM_DEVICE);
+ 
+ 		if (tp->rss_enable)
+-			rtl8169_rx_hash(tp, (struct RxDescRss *)desc, skb);
++			rtl8169_rx_hash(tp, desc, skb);
+ 
+ 		rtl8169_rx_csum(tp, skb, desc);
+ 		skb->protocol = eth_type_trans(skb, dev);
+@@ -5494,6 +5696,23 @@ static void rtl8169_enable_hw_interrupt_msix(struct rtl8169_private *tp, int mes
+ 	RTL_W32(tp, IMR_V2_SET_REG_8125, BIT(message_id));
+ }
+ 
++static bool rtl8169_is_linkchg_msix(struct rtl8169_private *tp, int message_id)
++{
++	switch (tp->HwCurrIsrVer) {
++	case 2:
++	case 3:
++		return message_id == MSIX_ID_V2_LINKCHG;
++	case 4:
++		return message_id == MSIX_ID_V4_LINKCHG;
++	case 5:
++		return message_id == MSIX_ID_V5_LINKCHG;
++	case 6:
++		return message_id == MSIX_ID_V6_LINKCHG;
++	default:
++		return false;
++	}
++}
++
+ static irqreturn_t rtl8169_interrupt_msix(int irq, void *dev_instance)
+ {
+ 	struct rtl8169_napi *napi = dev_instance;
+@@ -5504,7 +5723,7 @@ static irqreturn_t rtl8169_interrupt_msix(int irq, void *dev_instance)
+ 
+ 	rtl8169_clear_hw_isr(tp, message_id);
+ 
+-	if (message_id == MSIX_ID_V4_LINKCHG) {
++	if (rtl8169_is_linkchg_msix(tp, message_id)) {
+ 		phy_mac_interrupt(tp->phydev);
+ 		rtl8169_enable_hw_interrupt_msix(tp, message_id);
+ 		return IRQ_HANDLED;
+@@ -5576,7 +5795,7 @@ static void rtl_task(struct work_struct *work)
+ 	if (test_and_clear_bit(RTL_FLAG_TASK_RESET_PENDING, tp->wk.flags)) {
+ reset:
+ 		rtl_reset_work(tp);
+-		netif_wake_queue(tp->dev);
++		netif_tx_wake_all_queues(tp->dev);
+ 	}
+ }
+ 
+@@ -5684,7 +5903,7 @@ static int rtl8169_close(struct net_device *dev)
+ 
+ 	pm_runtime_get_sync(&pdev->dev);
+ 
+-	netif_stop_queue(dev);
++	netif_tx_stop_all_queues(dev);
+ 
+ 	rtl8169_down(tp);
+ 
+@@ -5751,7 +5970,7 @@ static int rtl_open(struct net_device *dev)
+ 		goto err_free_irq;
+ 	rtl8169_up(tp);
+ 	rtl8169_init_counter_offsets(tp);
+-	netif_start_queue(dev);
++	netif_tx_start_all_queues(dev);
+ out:
+ 	pm_runtime_put_sync(&pdev->dev);
+ 
+@@ -5953,11 +6172,40 @@ static const struct net_device_ops rtl_netdev_ops = {
+ static void rtl_set_irq_mask(struct rtl8169_private *tp)
+ {
+ 	if (tp->features & RTL_FEATURE_MSIX) {
+-		tp->irq_mask = ISRIMR_V6_LINKCHG;
+-		for (int i = 0; i < tp->num_tx_rings; i++)
+-			tp->irq_mask |= ISRIMR_V6_TOK_Q0 << i;
+-		for (int i = 0; i < tp->num_rx_rings; i++)
+-			tp->irq_mask |= ISRIMR_V6_ROK_Q0 << i;
++		switch (tp->HwCurrIsrVer) {
++		case 2:
++			tp->irq_mask = ISRIMR_V2_LINKCHG | ISRIMR_TOK_Q0;
++			for (int i = 0; i < tp->num_rx_rings; i++)
++				tp->irq_mask |= ISRIMR_V2_ROK_Q0 << i;
++			break;
++		case 3:
++			tp->irq_mask = ISRIMR_V2_LINKCHG;
++			for (int i = 0; i < max(tp->num_tx_rings, tp->num_rx_rings); i++)
++				tp->irq_mask |= ISRIMR_V2_ROK_Q0 << i;
++			break;
++		case 4:
++			tp->irq_mask = ISRIMR_V4_LINKCHG;
++			for (int i = 0; i < max(tp->num_tx_rings, tp->num_rx_rings); i++)
++				tp->irq_mask |= ISRIMR_V4_ROK_Q0 << i;
++			break;
++		case 5:
++			tp->irq_mask = ISRIMR_V5_LINKCHG;
++			for (int i = 0; i < tp->num_tx_rings; i++)
++				tp->irq_mask |= ISRIMR_V5_TOK_Q0 << i;
++			for (int i = 0; i < tp->num_rx_rings; i++)
++				tp->irq_mask |= ISRIMR_V5_ROK_Q0 << i;
++			break;
++		case 6:
++			tp->irq_mask = ISRIMR_V6_LINKCHG;
++			for (int i = 0; i < tp->num_tx_rings; i++)
++				tp->irq_mask |= ISRIMR_V6_TOK_Q0 << i;
++			for (int i = 0; i < tp->num_rx_rings; i++)
++				tp->irq_mask |= ISRIMR_V6_ROK_Q0 << i;
++			break;
++		default:
++			tp->irq_mask = 0;
++			break;
++		}
+ 	} else {
+ 		tp->irq_mask = RxOK | RxErr | TxOK | TxErr | LinkChg;
+ 
+@@ -5966,6 +6214,15 @@ static void rtl_set_irq_mask(struct rtl8169_private *tp)
+ 	}
+ }
+ 
++/* RTL8125B uses the v3 RX descriptor format for RSS */
++static u8 rtl8169_rss_desc_type(struct rtl8169_private *tp)
++{
++	if (tp->mac_version == RTL_GIGA_MAC_VER_63)
++		return RX_DESC_RING_TYPE_RSS_V3;
++
++	return RX_DESC_RING_TYPE_RSS;
++}
++
+ static void rtl8169_double_check_rss_support(struct rtl8169_private *tp)
+ {
+ 	if (tp->HwCurrIsrVer > 1) {
+@@ -5976,16 +6233,19 @@ static void rtl8169_double_check_rss_support(struct rtl8169_private *tp)
+ 	if (tp->rss_support && tp->HwCurrIsrVer > 1) {
+ 		u8 rss_queue_num = netif_get_num_default_rss_queues();
+ 
+-		tp->num_rx_rings = min(rss_queue_num, tp->HwSuppNumRxQueues);
++		tp->num_rx_rings = rounddown_pow_of_two(min_t(u8, rss_queue_num,
++							      tp->HwSuppNumRxQueues));
+ 		if (!(tp->num_rx_rings >= 2 && tp->irq_nvecs >= tp->min_irq_nvecs))
+ 			tp->num_rx_rings = 1;
+ 	}
+ 
+ 	if (tp->num_rx_rings >= 2) {
++		tp->num_tx_rings = tp->HwSuppNumTxQueues;
+ 		tp->rss_enable = 1;
+-		tp->InitRxDescType = RX_DESC_RING_TYPE_RSS;
++		tp->InitRxDescType = rtl8169_rss_desc_type(tp);
+ 	} else {
+ 		tp->rss_enable = 0;
++		tp->num_tx_rings = 1;
+ 		if (tp->irq_nvecs > 1) {
+ 			pci_free_irq_vectors(tp->pci_dev);
+ 
+@@ -6250,11 +6510,8 @@ static int rtl8169_set_real_num_queue(struct rtl8169_private *tp)
+ {
+ 	int retval;
+ 
+-	retval = netif_set_real_num_tx_queues(tp->dev, tp->num_tx_rings);
+-	if (retval < 0)
+-		return retval;
+-
+-	retval = netif_set_real_num_rx_queues(tp->dev, tp->num_rx_rings);
++	retval = netif_set_real_num_queues(tp->dev, tp->num_tx_rings,
++					   tp->num_rx_rings);
+ 	return retval;
+ }
+ 
+@@ -6340,12 +6597,36 @@ static int rtl8169_poll_msix_tx(struct napi_struct *napi, int budget)
+ 	struct rtl8169_napi *r8169_napi = container_of(napi, struct rtl8169_napi, napi);
+ 	struct rtl8169_private *tp = r8169_napi->priv;
+ 	struct net_device *dev = tp->dev;
+-	unsigned int work_done = 0;
+ 	const int message_id = r8169_napi->index;
+-	int tx_ring_idx = message_id - 8;
++	int tx_ring_idx;
++
++	if (tp->HwCurrIsrVer == 6)
++		tx_ring_idx = message_id - 8;
++	else
++		tx_ring_idx = message_id - 16;
+ 
+ 	if (tx_ring_idx >= 0 && tx_ring_idx < tp->num_tx_rings)
+-		work_done += rtl_tx(dev, tp, &tp->tx_ring[tx_ring_idx], budget);
++		rtl_tx(dev, tp, &tp->tx_ring[tx_ring_idx], budget);
++
++	if (napi_complete_done(napi, 0))
++		rtl8169_enable_hw_interrupt_msix(tp, message_id);
++
++	return 0;
++}
++
++static int rtl8169_poll_msix_ring(struct napi_struct *napi, int budget)
++{
++	struct rtl8169_napi *r8169_napi = container_of(napi, struct rtl8169_napi, napi);
++	struct rtl8169_private *tp = r8169_napi->priv;
++	struct net_device *dev = tp->dev;
++	const int message_id = r8169_napi->index;
++	int work_done = 0;
++
++	if (message_id < tp->num_tx_rings)
++		rtl_tx(dev, tp, &tp->tx_ring[message_id], budget);
++
++	if (message_id < tp->num_rx_rings)
++		work_done = rtl_rx(dev, tp, &tp->rx_ring[message_id], budget);
+ 
+ 	if (work_done < budget && napi_complete_done(napi, work_done))
+ 		rtl8169_enable_hw_interrupt_msix(tp, message_id);
+@@ -6374,10 +6655,33 @@ static void r8169_init_napi(struct rtl8169_private *tp)
+ 		poll = rtl8169_poll;
+ 		if (tp->features & RTL_FEATURE_MSIX) {
+ 			switch (tp->HwCurrIsrVer) {
++			case 2:
++				if (i < R8125_MAX_RX_QUEUES)
++					poll = rtl8169_poll_msix_rx;
++				else if (i == 16)
++					poll = rtl8169_poll_msix_tx;
++				else
++					poll = rtl8169_poll_msix_other;
++				break;
++			case 3:
++			case 4:
++				if (i < max(tp->HwSuppNumTxQueues, tp->HwSuppNumRxQueues))
++					poll = rtl8169_poll_msix_ring;
++				else
++					poll = rtl8169_poll_msix_other;
++				break;
++			case 5:
++				if (i < R8125_MAX_RX_QUEUES)
++					poll = rtl8169_poll_msix_rx;
++				else if (i >= 16 && i < 16 + tp->num_tx_rings)
++					poll = rtl8169_poll_msix_tx;
++				else
++					poll = rtl8169_poll_msix_other;
++				break;
+ 			case 6:
+ 				if (i < R8127_MAX_RX_QUEUES)
+ 					poll = rtl8169_poll_msix_rx;
+-				else if (i > 7 && i < 16)
++				else if (i < 8 + tp->num_tx_rings)
+ 					poll = rtl8169_poll_msix_tx;
+ 				else
+ 					poll = rtl8169_poll_msix_other;
+@@ -6397,8 +6701,13 @@ static void rtl8169_get_channels(struct net_device *dev,
+ {
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+ 
+-	ch->max_rx = tp->HwSuppNumRxQueues ? tp->HwSuppNumRxQueues : 1;
+-	ch->max_tx = tp->HwSuppNumTxQueues ? tp->HwSuppNumTxQueues : 1;
++	if (tp->features & RTL_FEATURE_MSIX && tp->HwCurrIsrVer > 1) {
++		ch->max_rx = tp->HwSuppNumRxQueues;
++		ch->max_tx = tp->HwSuppNumTxQueues;
++	} else {
++		ch->max_rx = 1;
++		ch->max_tx = 1;
++	}
+ 	ch->max_other = 0;
+ 	ch->max_combined = 0;
+ 
+@@ -6408,52 +6717,140 @@ static void rtl8169_get_channels(struct net_device *dev,
+ 	ch->combined_count = 0;
+ }
+ 
++static int rtl8169_update_channels(struct rtl8169_private *tp, u32 rx_count,
++				   u32 tx_count)
++{
++	int i;
++
++	tp->num_rx_rings = rx_count;
++	tp->num_tx_rings = tx_count;
++
++	tp->rss_enable = (tp->num_rx_rings > 1 && tp->rss_support);
++
++	for (i = 0; i < tp->HwSuppIndirTblEntries; i++) {
++		if (tp->rss_enable)
++			tp->rss_indir_tbl[i] = ethtool_rxfh_indir_default(i, tp->num_rx_rings);
++		else
++			tp->rss_indir_tbl[i] = 0;
++	}
++
++	tp->InitRxDescType = tp->rss_enable ? rtl8169_rss_desc_type(tp) :
++					      RX_DESC_RING_TYPE_DEAFULT;
++
++	rtl_set_irq_mask(tp);
++
++	return netif_set_real_num_queues(tp->dev, tx_count, rx_count);
++}
++
+ static int rtl8169_set_channels(struct net_device *dev,
+ 				struct ethtool_channels *ch)
+ {
+ 	struct rtl8169_private *tp = netdev_priv(dev);
+ 	bool if_running = netif_running(dev);
+-	int i;
++	u32 old_rx = tp->num_rx_rings;
++	u32 old_tx = tp->num_tx_rings;
++	int ret, err;
+ 
+-	if (!tp->rss_support && (ch->rx_count > 1 || ch->tx_count > 1)) {
++	if ((ch->rx_count > 1 || ch->tx_count > 1) &&
++	    !(tp->rss_support && tp->features & RTL_FEATURE_MSIX &&
++	      tp->HwCurrIsrVer > 1)) {
+ 		netdev_warn(dev, "This chip does not support multiple channels/RSS.\n");
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+ 	if (ch->rx_count == 0 || ch->tx_count == 0)
+ 		return -EINVAL;
++	if (!is_power_of_2(ch->rx_count) || !is_power_of_2(ch->tx_count))
++		return -EINVAL;
+ 	if (ch->rx_count > tp->HwSuppNumRxQueues ||
+ 	    ch->tx_count > tp->HwSuppNumTxQueues)
+ 		return -EINVAL;
++	if (ch->rx_count == 1 && ch->tx_count != 1)
++		return -EINVAL;
+ 	if (ch->other_count || ch->combined_count)
+ 		return -EINVAL;
+ 
+-	if (ch->rx_count == tp->num_rx_rings &&
+-	    ch->tx_count == tp->num_tx_rings)
++	if (ch->rx_count == old_rx && ch->tx_count == old_tx)
+ 		return 0;
+ 
+-	if (if_running)
+-		rtl8169_close(dev);
++	if (!if_running) {
++		ret = rtl8169_update_channels(tp, ch->rx_count, ch->tx_count);
++		if (ret)
++			goto restore;
++		return 0;
++	}
+ 
+-	tp->num_rx_rings = ch->rx_count;
+-	tp->num_tx_rings = ch->tx_count;
++	rtl8169_close(dev);
+ 
+-	tp->rss_enable = (tp->num_rx_rings > 1 && tp->rss_support);
++	ret = rtl8169_update_channels(tp, ch->rx_count, ch->tx_count);
++	if (ret)
++		goto restore;
+ 
+-	for (i = 0; i < tp->HwSuppIndirTblEntries; i++) {
+-		if (tp->rss_enable)
+-			tp->rss_indir_tbl[i] = ethtool_rxfh_indir_default(i, tp->num_rx_rings);
+-		else
+-			tp->rss_indir_tbl[i] = 0;
++	ret = rtl_open(dev);
++	if (ret)
++		goto restore;
++
++	return 0;
++
++restore:
++	err = rtl8169_update_channels(tp, old_rx, old_tx);
++	if (!err && if_running)
++		err = rtl_open(dev);
++	if (err)
++		netdev_err(dev, "failed to restore channel configuration: %d\n", err);
++
++	return ret;
++}
++
++static int rtl8169_get_rxnfc(struct net_device *dev, struct ethtool_rxnfc *cmd,
++			     u32 *rule_locs)
++{
++	struct rtl8169_private *tp = netdev_priv(dev);
++
++	if (!tp->rss_support)
++		return -EOPNOTSUPP;
++
++	switch (cmd->cmd) {
++	case ETHTOOL_GRXRINGS:
++		cmd->data = tp->num_rx_rings;
++		return 0;
++	default:
++		return -EOPNOTSUPP;
+ 	}
++}
+ 
+-	if (tp->rss_enable)
+-		tp->InitRxDescType = RX_DESC_RING_TYPE_RSS;
+-	else
+-		tp->InitRxDescType = RX_DESC_RING_TYPE_DEAFULT;
++static u32 rtl8169_get_rxfh_key_size(struct net_device *dev)
++{
++	struct rtl8169_private *tp = netdev_priv(dev);
++
++	return tp->rss_support ? RTL8127_RSS_KEY_SIZE : 0;
++}
++
++static u32 rtl8169_get_rxfh_indir_size(struct net_device *dev)
++{
++	struct rtl8169_private *tp = netdev_priv(dev);
++
++	return tp->rss_support ? tp->HwSuppIndirTblEntries : 0;
++}
++
++static int rtl8169_get_rxfh(struct net_device *dev,
++			    struct ethtool_rxfh_param *rxfh)
++{
++	struct rtl8169_private *tp = netdev_priv(dev);
++	int i;
++
++	if (!tp->rss_support)
++		return -EOPNOTSUPP;
++
++	if (rxfh->indir) {
++		for (i = 0; i < tp->HwSuppIndirTblEntries; i++)
++			rxfh->indir[i] = tp->rss_indir_tbl[i];
++	}
++
++	if (rxfh->key)
++		memcpy(rxfh->key, tp->rss_key, RTL8127_RSS_KEY_SIZE);
+ 
+-	if (if_running)
+-		return rtl_open(dev);
++	rxfh->hfunc = ETH_RSS_HASH_TOP;
+ 
+ 	return 0;
+ }
+@@ -6478,6 +6875,10 @@ static const struct ethtool_ops rtl8169_ethtool_ops = {
+ 	.set_eee		= rtl8169_set_eee,
+ 	.get_channels		= rtl8169_get_channels,
+ 	.set_channels		= rtl8169_set_channels,
++	.get_rxnfc		= rtl8169_get_rxnfc,
++	.get_rxfh_key_size	= rtl8169_get_rxfh_key_size,
++	.get_rxfh_indir_size	= rtl8169_get_rxfh_indir_size,
++	.get_rxfh		= rtl8169_get_rxfh,
+ 	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
+ 	.set_link_ksettings	= rtl8169_set_link_ksettings,
+ 	.get_ringparam		= rtl8169_get_ringparam,

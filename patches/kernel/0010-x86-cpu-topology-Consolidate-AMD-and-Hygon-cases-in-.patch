@@ -1,0 +1,44 @@
+From 6d6f02694d6310623a5c7de232d105dbae144ae8 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 10:16:30 +0700
+Subject: [PATCH 010/110] =?UTF-8?q?x86/cpu/topology:=20=E7=A7=BB=E6=A4=8D?=
+ =?UTF-8?q?=E4=B8=8A=E6=B8=B8=20"Consolidate=20AMD=20and=20Hygon=20cases?=
+ =?UTF-8?q?=20in=20parse=5Ftopology()"?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 tip x86/cleanups (2026-03)。
+https://lkml.iu.edu/2603.2/15481.html
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/x86/kernel/cpu/topology_common.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/topology_common.c b/arch/x86/kernel/cpu/topology_common.c
+index b5a5e1411..cc63efbf5 100644
+--- a/arch/x86/kernel/cpu/topology_common.c
++++ b/arch/x86/kernel/cpu/topology_common.c
+@@ -154,8 +154,8 @@ static void parse_topology(struct topo_scan *tscan, bool early)
+ 
+ 	switch (c->x86_vendor) {
+ 	case X86_VENDOR_AMD:
+-		if (IS_ENABLED(CONFIG_CPU_SUP_AMD))
+-			cpu_parse_topology_amd(tscan);
++	case X86_VENDOR_HYGON:
++		cpu_parse_topology_amd(tscan);
+ 		break;
+ 	case X86_VENDOR_CENTAUR:
+ 	case X86_VENDOR_ZHAOXIN:
+@@ -167,10 +167,6 @@ static void parse_topology(struct topo_scan *tscan, bool early)
+ 		if (c->cpuid_level >= 0x1a)
+ 			c->topo.cpu_type = cpuid_eax(0x1a);
+ 		break;
+-	case X86_VENDOR_HYGON:
+-		if (IS_ENABLED(CONFIG_CPU_SUP_HYGON))
+-			cpu_parse_topology_amd(tscan);
+-		break;
+ 	}
+ }
+ 

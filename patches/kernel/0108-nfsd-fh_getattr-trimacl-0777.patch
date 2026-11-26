@@ -1,0 +1,37 @@
+From 0aad14e8790539856826c226669cd00ad8dc04f5 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 21:43:48 +0000
+Subject: [PATCH 108/110] =?UTF-8?q?nfsd:=20fh=5Fgetattr=20=E5=8F=AA?=
+ =?UTF-8?q?=E5=AF=B9=20trimacl=20=E6=96=87=E4=BB=B6=E5=8A=A0=200777(?=
+ =?UTF-8?q?=E5=AE=89=E5=85=A8=E4=BF=AE=E5=A4=8D)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+问题: fh_getattr 对所有导出都 stat->mode |= 0777, 普通文件系统上客户端
+看到的权限是假的。
+
+修法: 只在 IS_TRIMACL(fhp->fh_dentry) 时加(trimacl 卷和带 trimacl 挂载的
+trimafs2 都算), 其他文件系统报真实权限。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/nfsd/nfsfh.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/fs/nfsd/nfsfh.c b/fs/nfsd/nfsfh.c
+index cb1b6bc9a..cecd3f6ae 100644
+--- a/fs/nfsd/nfsfh.c
++++ b/fs/nfsd/nfsfh.c
+@@ -717,8 +717,9 @@ __be32 fh_getattr(const struct svc_fh *fhp, struct kstat *stat)
+ 	err = nfserrno(vfs_getattr(&p, stat, request_mask,
+ 				   AT_STATX_SYNC_AS_STAT));
+ 	// shasure - trimacl -->
+-	/* 客户端一律看到 rwxrwxrwx, 真正的权限由服务端 trimacl 判断 */
+-	stat->mode |= 0777;
++	/* trimacl 导出让客户端看到 rwxrwxrwx, 真正的权限由服务端 trimacl 判断; 其他文件系统报真实权限 */
++	if (IS_TRIMACL(fhp->fh_dentry))
++		stat->mode |= 0777;
+ 	// <--
+ 	return err;
+ }

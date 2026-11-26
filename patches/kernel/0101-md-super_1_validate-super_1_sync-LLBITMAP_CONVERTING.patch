@@ -1,0 +1,55 @@
+From 9a3a7b5a69f423a298e8d831f3a9b987e34f8175 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 08:10:19 +0000
+Subject: [PATCH 101/110] =?UTF-8?q?md:=20super=5F1=5Fvalidate/super=5F1=5F?=
+ =?UTF-8?q?sync=20=E5=A4=84=E7=90=86=20LLBITMAP=5FCONVERTING=20=E4=B8=8E?=
+ =?UTF-8?q?=20ext=5Fstatus,=20bind=5Frdev=5Fto=5Farray=20=E7=BB=A7?=
+ =?UTF-8?q?=E6=89=BF=20FAST=5FRESCYNC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 65444eaf3..8c2e23e90 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -2475,6 +2475,13 @@ static int super_1_validate(struct mddev *mddev, struct md_rdev *freshest, struc
+ 		mddev->reshape_backwards = 0;
+ 
+ 		mddev->resync_offset = le64_to_cpu(sb->resync_offset);
++		/* fnnas: the array was converting to llbitmap when it stopped */
++		if (le32_to_cpu(sb->feature_map) & MD_FEATURE_LLBITMAP_CONVERTING) {
++			mddev->resync_offset = 0;
++			mddev->bitmap_id = ID_LLBITMAP;
++			set_bit(MD_ARRAY_FIRST_USE, &mddev->flags);
++			set_bit(MD_LLBITMAP_CONVERTING, &mddev->flags);
++		}
+ 		memcpy(mddev->uuid, sb->set_uuid, 16);
+ 
+ 		mddev->max_disks =  (4096-256)/2;
+@@ -2694,6 +2701,10 @@ static void super_1_sync(struct mddev *mddev, struct md_rdev *rdev)
+ 		sb->feature_map = cpu_to_le32(MD_FEATURE_BITMAP_OFFSET);
+ 	}
+ 
++	if (test_bit(MD_LLBITMAP_CONVERTING, &mddev->flags))
++		sb->feature_map |= cpu_to_le32(MD_FEATURE_LLBITMAP_CONVERTING);
++	sb->ext_status = cpu_to_le32(mddev->ext_status);
++
+ 	if (rdev->raid_disk >= 0 && !test_bit(Journal, &rdev->flags) &&
+ 	    !test_bit(In_sync, &rdev->flags)) {
+ 		sb->feature_map |=
+@@ -3090,6 +3101,9 @@ static int bind_rdev_to_array(struct md_rdev *rdev, struct mddev *mddev)
+ 	/* May as well allow recovery to be retried once */
+ 	mddev->recovery_disabled++;
+ 
++	if (rdev->ext_status & MD_SB_1_EXT_STATUS_FAST_RESCYNC)
++		mddev->ext_status |= MD_SB_1_EXT_STATUS_FAST_RESCYNC;
++
+ 	return 0;
+ 
+  fail:

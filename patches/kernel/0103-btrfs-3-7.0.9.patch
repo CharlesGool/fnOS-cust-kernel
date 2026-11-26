@@ -1,0 +1,74 @@
+From 748439ce23f100968b14219a4b7d5c135a0aa9a3 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:02:34 +0700
+Subject: [PATCH 103/110] =?UTF-8?q?btrfs:=203=20=E4=B8=AA=E6=96=87?=
+ =?UTF-8?q?=E4=BB=B6=E6=81=A2=E5=A4=8D=E6=88=90=E9=A3=9E=E7=89=9B=E7=A7=BB?=
+ =?UTF-8?q?=E6=A4=8D=E7=9A=84=207.0.9=20=E7=89=88=E6=9C=AC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+rebase 到 6.18.65 时, 7.0.9 没改过的 accessors.c、ordered-data.h、
+raid-stripe-tree.h 被合入了 6.18.65 的 stable 改动, 和 7.0.9 的实现
+不配套(btrfs_finish_ordered_extent 等原型不一致)。btrfs 整体按 7.0.9
+维护, 以后跟 7.0.x 的修复。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/accessors.c        | 2 +-
+ fs/btrfs/ordered-data.h     | 8 ++++----
+ fs/btrfs/raid-stripe-tree.h | 1 -
+ 3 files changed, 5 insertions(+), 6 deletions(-)
+
+diff --git a/fs/btrfs/accessors.c b/fs/btrfs/accessors.c
+index d63ac6eb9..1248aa253 100644
+--- a/fs/btrfs/accessors.c
++++ b/fs/btrfs/accessors.c
+@@ -16,7 +16,7 @@ static void __cold report_setget_bounds(const struct extent_buffer *eb,
+ 
+ 	btrfs_warn(eb->fs_info,
+ 		   "bad eb member %s: ptr 0x%lx start %llu member offset %lu size %d",
+-		   (member_offset >= eb->len ? "start" : "end"),
++		   (member_offset > eb->len ? "start" : "end"),
+ 		   (unsigned long)ptr, eb->start, member_offset, size);
+ }
+ 
+diff --git a/fs/btrfs/ordered-data.h b/fs/btrfs/ordered-data.h
+index 2e7879c6c..1e6b0b182 100644
+--- a/fs/btrfs/ordered-data.h
++++ b/fs/btrfs/ordered-data.h
+@@ -164,9 +164,11 @@ void btrfs_put_ordered_extent(struct btrfs_ordered_extent *entry);
+ void btrfs_remove_ordered_extent(struct btrfs_inode *btrfs_inode,
+ 				struct btrfs_ordered_extent *entry);
+ void btrfs_finish_ordered_extent(struct btrfs_ordered_extent *ordered,
+-				 u64 file_offset, u64 len, bool uptodate);
++				 struct folio *folio, u64 file_offset, u64 len,
++				 bool uptodate);
+ void btrfs_mark_ordered_io_finished(struct btrfs_inode *inode,
+-				    u64 file_offset, u64 num_bytes, bool uptodate);
++				    struct folio *folio, u64 file_offset,
++				    u64 num_bytes, bool uptodate);
+ bool btrfs_dec_test_ordered_pending(struct btrfs_inode *inode,
+ 				    struct btrfs_ordered_extent **cached,
+ 				    u64 file_offset, u64 io_size);
+@@ -220,8 +222,6 @@ bool btrfs_try_lock_ordered_range(struct btrfs_inode *inode, u64 start, u64 end,
+ struct btrfs_ordered_extent *btrfs_split_ordered_extent(
+ 			struct btrfs_ordered_extent *ordered, u64 len);
+ void btrfs_mark_ordered_extent_error(struct btrfs_ordered_extent *ordered);
+-void btrfs_mark_ordered_extent_truncated(struct btrfs_ordered_extent *ordered,
+-					 u64 truncate_len);
+ int __init ordered_data_init(void);
+ void __cold ordered_data_exit(void);
+ 
+diff --git a/fs/btrfs/raid-stripe-tree.h b/fs/btrfs/raid-stripe-tree.h
+index eb02cf485..69942ad43 100644
+--- a/fs/btrfs/raid-stripe-tree.h
++++ b/fs/btrfs/raid-stripe-tree.h
+@@ -28,7 +28,6 @@ int btrfs_get_raid_extent_offset(struct btrfs_fs_info *fs_info,
+ 				 u32 stripe_index, struct btrfs_io_stripe *stripe);
+ int btrfs_insert_raid_extent(struct btrfs_trans_handle *trans,
+ 			     struct btrfs_ordered_extent *ordered_extent);
+-void btrfs_cleanup_ordered_bioc_list(struct btrfs_ordered_extent *ordered);
+ 
+ #ifdef CONFIG_BTRFS_FS_RUN_SANITY_TESTS
+ int btrfs_insert_one_raid_extent(struct btrfs_trans_handle *trans,

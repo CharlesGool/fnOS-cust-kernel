@@ -1,0 +1,41 @@
+From fa275faf4836094dc615f31efd03e9f1a11645c4 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:27:39 +0000
+Subject: [PATCH 070/110] =?UTF-8?q?md.h:=20md=5Fdone=5Fsync=20=E5=8E=BB?=
+ =?UTF-8?q?=E6=8E=89=20ok=20=E5=8F=82=E6=95=B0,=20=E5=A3=B0=E6=98=8E=20md?=
+ =?UTF-8?q?=5Fsync=5Ferror=20/=20mddev=5Fbio=5Fsplit=5Fat=5Freshape=5Foffs?=
+ =?UTF-8?q?et?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 032(2a5d4549a28d) 和 141(ffd3e73d6e0c) 的 md.h 部分, 原型与飞牛 BTF 一致。
+注意: raid1/raid10/raid5 的 md_done_sync 调用由各自子任务改(本树只编 vmlinux)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.h | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index cf7eb3f59..691feda38 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -1012,11 +1012,16 @@ extern const char *md_sync_action_name(enum sync_action action);
+ extern void md_write_start(struct mddev *mddev, struct bio *bi);
+ extern void md_write_inc(struct mddev *mddev, struct bio *bi);
+ extern void md_write_end(struct mddev *mddev);
+-extern void md_done_sync(struct mddev *mddev, int blocks, int ok);
++extern void md_done_sync(struct mddev *mddev, int blocks);
++extern void md_sync_error(struct mddev *mddev);
+ extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
+ extern void md_finish_reshape(struct mddev *mddev);
+ void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
+ 			struct bio *bio, sector_t start, sector_t size);
++struct bio *mddev_bio_split_at_reshape_offset(struct mddev *mddev,
++					      struct bio *bio,
++					      unsigned int *max_sectors,
++					      struct bio_set *bs);
+ void md_account_bio(struct mddev *mddev, struct bio **bio);
+ void md_free_cloned_bio(struct bio *bio);
+ 

@@ -1,0 +1,119 @@
+From 179966d60bb829466800feb7bc466b564f7e105d Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:41:53 +0000
+Subject: [PATCH 072/110] =?UTF-8?q?md.h:=20=E5=A3=B0=E6=98=8E=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=20md.c=20/=20md-resync-hint.c=20/=20md-dfr.c=20/=20ll?=
+ =?UTF-8?q?bitmap=20=E8=B7=A8=E6=96=87=E4=BB=B6=E5=87=BD=E6=95=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- md-resync-hint.c: md_resync_hint_add/remove/free/first/tree_init/tree_clear/init/exit
+- md.c: md_report_failure、md_sb_pending、md_speedup_resync、md_speedup_requested_resync、
+  md_mark_discard_unsupported、md_update_rdev_capabilities、validate_rdev_super、
+  md_open_candidate、stop_sync_thread_nolock
+- md-llbitmap.c(llbitmap 子任务实现): md_llbitmap_sync_target、md_llbitmap_sync_remaining
+- md-dfr.c(CONFIG_MD_DEGRADATION_FREE_RECOVER): md_dfr_*、md_start_dfr/md_stop_dfr、
+  md_rdev_in_dfr、stripe_start_dfr/stripe_end_dfr/stripe_end_bio、md_dfr_group;
+  关闭该选项时给空的 static inline。
+原型全部取自飞牛 BTF(btfproto.py)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.h | 85 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 691feda38..fcd265e58 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -1202,4 +1202,89 @@ do {									\
+ 		blk_add_trace_msg((mddev)->gendisk->queue, fmt, ##args); \
+ } while (0)
+ 
++/* fnnas: md-resync-hint.c */
++int md_resync_hint_add(struct md_resync_hint_tree *tree, sector_t h_start,
++		       sector_t h_end, gfp_t gfp_mask);
++void md_resync_hint_remove(struct md_resync_hint_tree *tree,
++			   struct md_resync_hint *hint);
++void md_resync_hint_free(struct md_resync_hint *hint);
++struct md_resync_hint *md_resync_hint_first(struct md_resync_hint_tree *tree);
++void md_resync_hint_tree_init(struct md_resync_hint_tree *tree);
++void md_resync_hint_tree_clear(struct md_resync_hint_tree *tree);
++int md_resync_hint_init(void);
++void md_resync_hint_exit(void);
++
++/* fnnas: md.c */
++void md_report_failure(struct mddev *mddev, enum md_failure failure);
++bool md_sb_pending(struct mddev *mddev);
++sector_t md_speedup_resync(struct mddev *mddev, sector_t sector_nr);
++sector_t md_speedup_requested_resync(struct mddev *mddev, sector_t sector_nr);
++void md_mark_discard_unsupported(struct bio *bio);
++void md_update_rdev_capabilities(struct mddev *mddev);
++int validate_rdev_super(struct mddev *mddev, struct md_rdev *rdev);
++int md_open_candidate(struct md_rdev *rdev, dev_t devt, void *holder,
++		      int super_format, int super_minor,
++		      struct md_rdev *refdev, bool silent);
++void stop_sync_thread_nolock(struct mddev *mddev);
++
++/* fnnas: md-llbitmap.c */
++int md_llbitmap_sync_target(struct mddev *mddev, sector_t offset);
++sector_t md_llbitmap_sync_remaining(struct mddev *mddev, sector_t resync,
++				    sector_t max_sectors);
++
++/* fnnas: md-dfr.c, degradation free recover */
++struct stripe_head;
++#ifdef CONFIG_MD_DEGRADATION_FREE_RECOVER
++extern struct attribute_group md_dfr_group;
++int md_dfr_init(void);
++void md_dfr_exit(void);
++void md_free_dfr(struct mddev *mddev);
++void md_stop_dfr_probe(struct mddev *mddev);
++bool md_dfr_started(struct mddev *mddev);
++void md_dfr_set_sync_takeover(struct mddev *mddev);
++bool md_dfr_test_sync_takeover(struct mddev *mddev);
++void md_dfr_clear_sync_takeover(struct mddev *mddev);
++bool md_rdev_in_dfr(struct mddev *mddev, struct md_rdev *rdev);
++bool md_start_dfr(struct md_rdev *rdev, struct bio *bio);
++void md_stop_dfr(struct md_rdev *rdev);
++bool md_dfr_end_clone_io(struct md_io_clone *md_io_clone, struct bio *bio);
++void md_dfr_super_start(struct mddev *mddev);
++void md_dfr_super_end(struct mddev *mddev, struct md_rdev *rdev, bool failed);
++bool stripe_start_dfr(struct md_rdev *rdev, struct stripe_head *sh);
++void stripe_end_dfr(struct stripe_head *sh);
++void stripe_end_bio(struct stripe_head *sh, struct bio *bio);
++#else
++static inline int md_dfr_init(void) { return 0; }
++static inline void md_dfr_exit(void) {}
++static inline void md_free_dfr(struct mddev *mddev) {}
++static inline void md_stop_dfr_probe(struct mddev *mddev) {}
++static inline bool md_dfr_started(struct mddev *mddev) { return false; }
++static inline void md_dfr_set_sync_takeover(struct mddev *mddev) {}
++static inline bool md_dfr_test_sync_takeover(struct mddev *mddev) { return false; }
++static inline void md_dfr_clear_sync_takeover(struct mddev *mddev) {}
++static inline bool md_rdev_in_dfr(struct mddev *mddev, struct md_rdev *rdev)
++{
++	return false;
++}
++static inline bool md_start_dfr(struct md_rdev *rdev, struct bio *bio)
++{
++	return false;
++}
++static inline void md_stop_dfr(struct md_rdev *rdev) {}
++static inline bool md_dfr_end_clone_io(struct md_io_clone *md_io_clone,
++				       struct bio *bio)
++{
++	return false;
++}
++static inline void md_dfr_super_start(struct mddev *mddev) {}
++static inline void md_dfr_super_end(struct mddev *mddev, struct md_rdev *rdev,
++				    bool failed) {}
++static inline bool stripe_start_dfr(struct md_rdev *rdev, struct stripe_head *sh)
++{
++	return false;
++}
++static inline void stripe_end_dfr(struct stripe_head *sh) {}
++static inline void stripe_end_bio(struct stripe_head *sh, struct bio *bio) {}
++#endif
++
+ #endif /* _MD_MD_H */

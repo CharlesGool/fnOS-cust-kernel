@@ -1,0 +1,30 @@
+From 04c6dfcb35e212b61c4350e201b86f5f4ca73488 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:10:18 +0000
+Subject: [PATCH 05/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-linux-?=
+ =?UTF-8?q?6.5-build.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+index b88e007..f42f4a7 100644
+--- a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -4469,6 +4469,9 @@ rwnx_cfg80211_tdls_mgmt(struct wiphy *wiphy,
+ 	const u8 *peer,
+ #else
+ 	u8 *peer,
++#endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0))
++	int link_id,
+ #endif
+ 	u8 action_code,
+ 	u8 dialog_token,

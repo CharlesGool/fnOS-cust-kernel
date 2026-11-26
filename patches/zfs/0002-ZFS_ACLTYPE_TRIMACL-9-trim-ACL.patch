@@ -1,0 +1,33 @@
+From 70701508acc41983060a829448c826c011aaa318 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:07:59 +0700
+Subject: [PATCH 2/8] =?UTF-8?q?=E5=A4=B4=E6=96=87=E4=BB=B6:=20=E6=96=B0?=
+ =?UTF-8?q?=E5=A2=9E=20ZFS=5FACLTYPE=5FTRIMACL=20=3D=209(=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=20trim=20ACL)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+include/sys/zfs_ioctl.h 是内核模块和用户态 libzfs 共用的头文件,
+acltype 的数值属于 ABI: 飞牛 zfs.ko 的 acltype 表里 "trimacl" 对应 9,
+用户态 zfs 工具也必须用同一个值。只加这一个定义, 单独提交。
+
+来源: 飞牛私有改动(由 zfs.ko 的 .rodata acltype 表反推)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/sys/zfs_ioctl.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/sys/zfs_ioctl.h b/include/sys/zfs_ioctl.h
+index cfe11f4..7426ab3 100644
+--- a/include/sys/zfs_ioctl.h
++++ b/include/sys/zfs_ioctl.h
+@@ -72,6 +72,7 @@ extern "C" {
+ #define	ZFS_ACLTYPE_OFF			0
+ #define	ZFS_ACLTYPE_POSIX		1
+ #define	ZFS_ACLTYPE_NFSV4		2
++#define	ZFS_ACLTYPE_TRIMACL		9	/* fnOS: trim ACL (system.trim_acl) */
+ 
+ /*
+  * The drr_versioninfo field of the dmu_replay_record has the

@@ -1,0 +1,39 @@
+From 6df60c1a0675b9e3fdd54d0d3c8919810f2ba766 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 10:13:07 +0700
+Subject: [PATCH 007/110] =?UTF-8?q?PCI:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=20quirk=20=E8=AE=A1=E6=97=B6=E6=94=B9=E5=8A=A8=20(?=
+ =?UTF-8?q?=E4=B8=8D=E7=9C=8B=20initcall=5Fdebug,=20=E5=8F=AA=E6=8A=A5=20>?=
+ =?UTF-8?q?10ms=20=E7=9A=84=20fixup)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/pci/quirks.c | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index d0552b7bf..19f86890e 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -134,9 +134,6 @@ int pcie_failed_link_retrain(struct pci_dev *dev)
+ static ktime_t fixup_debug_start(struct pci_dev *dev,
+ 				 void (*fn)(struct pci_dev *dev))
+ {
+-	if (initcall_debug)
+-		pci_info(dev, "calling  %pS @ %i\n", fn, task_pid_nr(current));
+-
+ 	return ktime_get();
+ }
+ 
+@@ -149,7 +146,7 @@ static void fixup_debug_report(struct pci_dev *dev, ktime_t calltime,
+ 	rettime = ktime_get();
+ 	delta = ktime_sub(rettime, calltime);
+ 	duration = (unsigned long long) ktime_to_ns(delta) >> 10;
+-	if (initcall_debug || duration > 10000)
++	if (duration > 10000)
+ 		pci_info(dev, "%pS took %lld usecs\n", fn, duration);
+ }
+ 

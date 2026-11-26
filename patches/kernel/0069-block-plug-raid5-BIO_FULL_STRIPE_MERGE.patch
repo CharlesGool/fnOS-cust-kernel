@@ -1,0 +1,81 @@
+From e215d9a0609295e631ce65fa711993b0d0644a7c Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:25 +0000
+Subject: [PATCH 069/110] =?UTF-8?q?block:=20plug=20=E5=90=88=E5=B9=B6?=
+ =?UTF-8?q?=E6=94=B9=E5=8A=A8(=E9=85=8D=E5=90=88=20raid5=20=E6=95=B4?=
+ =?UTF-8?q?=E6=9D=A1=E5=B8=A6=E5=90=88=E5=B9=B6)=E3=80=81=E5=85=8B?=
+ =?UTF-8?q?=E9=9A=86=E6=97=B6=E4=BF=9D=E7=95=99=20BIO=5FFULL=5FSTRIPE=5FME?=
+ =?UTF-8?q?RGE?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛私有。
+- __bio_clone: 源 bio 有 BIO_FULL_STRIPE_MERGE 时克隆也带上(bio_init_clone/bio_alloc_clone 均经此)。
+- blk_attempt_plug_merge: 多队列 plug 链表里遇到同队列请求合并失败后不再 break, 继续试后面的请求。
+- blk_add_rq_to_plug: 去掉"请求数 >= blk_plug_max_rq_count 或最后一个请求 >= BLK_PLUG_FLUSH_SIZE
+  就先 blk_mq_flush_plug_list"的提前下发, plug 只在 blk_finish_plug/调度时才下发。
+  (上游 6.18.65/7.3 都还有这段; 飞牛去掉是为了让 plug 里攒更多请求以拼整条带。副作用: 单个 plug
+  里的请求数不再有上限。)
+
+比对: __bio_clone、bio_init_clone、bio_alloc_clone、blk_attempt_plug_merge、blk_add_rq_to_plug、
+blk_execute_rq_nowait、blk_mq_flush_plug_list OK。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ block/bio.c       |  2 ++
+ block/blk-merge.c |  2 +-
+ block/blk-mq.c    | 10 +---------
+ 3 files changed, 4 insertions(+), 10 deletions(-)
+
+diff --git a/block/bio.c b/block/bio.c
+index 63994b8cd..f848711e7 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -836,6 +836,8 @@ static int __bio_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp)
+ 	bio->bi_write_stream = bio_src->bi_write_stream;
+ 	bio->bi_bvec_gap_bit = bio_src->bi_bvec_gap_bit;
+ 	bio->bi_iter = bio_src->bi_iter;
++	if (bio_flagged(bio_src, BIO_FULL_STRIPE_MERGE))
++		bio_set_flag(bio, BIO_FULL_STRIPE_MERGE);
+ 
+ 	if (bio->bi_bdev) {
+ 		if (bio->bi_bdev == bio_src->bi_bdev &&
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index 83cb4ceef..b97f596f0 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -1115,10 +1115,10 @@ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
+ 	rq_list_for_each(&plug->mq_list, rq) {
+ 		if (rq->q != q)
+ 			continue;
++		/* try every request of this queue in the plug, not only the first */
+ 		if (blk_attempt_bio_merge(q, rq, bio, nr_segs, false) ==
+ 		    BIO_MERGE_OK)
+ 			return true;
+-		break;
+ 	}
+ 	return false;
+ }
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 7bdc9b1d7..f4a798f75 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1429,16 +1429,8 @@ static void blk_add_rq_to_plug(struct blk_plug *plug, struct request *rq)
+ {
+ 	struct request *last = rq_list_peek(&plug->mq_list);
+ 
+-	if (!plug->rq_count) {
++	if (!plug->rq_count)
+ 		trace_block_plug(rq->q);
+-	} else if (plug->rq_count >= blk_plug_max_rq_count(plug) ||
+-		   (!blk_queue_nomerges(rq->q) &&
+-		    blk_rq_bytes(last) >= BLK_PLUG_FLUSH_SIZE)) {
+-		blk_mq_flush_plug_list(plug, false);
+-		blk_plug_invalidate_ts();
+-		last = NULL;
+-		trace_block_plug(rq->q);
+-	}
+ 
+ 	if (!plug->multiple_queues && last && last->q != rq->q)
+ 		plug->multiple_queues = true;

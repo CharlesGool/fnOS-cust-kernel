@@ -1,0 +1,714 @@
+From 0d4130f0cadce8a0a448790cbce0f1857a8f1cc2 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 09:14:17 +0700
+Subject: [PATCH 001/110] =?UTF-8?q?event=5Freport:=20=E8=BF=98=E5=8E=9F?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=E4=BA=8B=E4=BB=B6=E4=B8=8A=E6=8A=A5=E6=A8=A1?=
+ =?UTF-8?q?=E5=9D=97=20(CONFIG=5FEVENT=5FREPORT)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按飞牛 6.18.18.c1186-trim 二进制逐函数还原:
+- er_core.c: 事件队列(kfifo) + er_emit/er_event_create + sysfs 读出
+- er_sysfs.c: /sys/kernel/event_report/events
+- er_netlink.c: NETLINK 31 (sysdiag 用), HELLO/DATA 应答 + 广播
+
+比对: 17 个函数中 13 个指令一致, 2 个只差寄存器/代码排列,
+er_sysfs_read_locked / nl_recv 各差 1 条指令(比较位宽/调度), 语义相同。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/misc/Kconfig                   |   7 +
+ drivers/misc/Makefile                  |   1 +
+ drivers/misc/event_report/Makefile     |   3 +
+ drivers/misc/event_report/er_core.c    | 318 +++++++++++++++++++++++++
+ drivers/misc/event_report/er_netlink.c | 193 +++++++++++++++
+ drivers/misc/event_report/er_sysfs.c   |  54 +++++
+ include/linux/event_report.h           |  55 +++++
+ 7 files changed, 631 insertions(+)
+ create mode 100755 drivers/misc/event_report/Makefile
+ create mode 100755 drivers/misc/event_report/er_core.c
+ create mode 100755 drivers/misc/event_report/er_netlink.c
+ create mode 100755 drivers/misc/event_report/er_sysfs.c
+ create mode 100755 include/linux/event_report.h
+
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index b9c11f673..d0e54cc18 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -644,6 +644,13 @@ config MCHP_LAN966X_PCI
+ 	    - lan966x-miim (MDIO_MSCC_MIIM)
+ 	    - lan966x-switch (LAN966X_SWITCH)
+ 
++config EVENT_REPORT
++	bool "Kernel event report (fnOS)"
++	depends on NET && SYSFS
++	help
++	  fnOS: queue kernel events (e.g. SATA errors) for /sys/kernel/event_report/events
++	  and broadcast them to user space over netlink protocol 31.
++
+ source "drivers/misc/c2port/Kconfig"
+ source "drivers/misc/eeprom/Kconfig"
+ source "drivers/misc/cb710/Kconfig"
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index b32a2597d..f4ee5e2b9 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,4 @@ obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-$(CONFIG_EVENT_REPORT)		+= event_report/
+diff --git a/drivers/misc/event_report/Makefile b/drivers/misc/event_report/Makefile
+new file mode 100755
+index 000000000..1a251e37d
+--- /dev/null
++++ b/drivers/misc/event_report/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_EVENT_REPORT) += event_report.o
++event_report-y := er_core.o er_sysfs.o er_netlink.o
+diff --git a/drivers/misc/event_report/er_core.c b/drivers/misc/event_report/er_core.c
+new file mode 100755
+index 000000000..9ec63d37d
+--- /dev/null
++++ b/drivers/misc/event_report/er_core.c
+@@ -0,0 +1,318 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * 事件上报: 事件队列 + sysfs 读出 —— 按飞牛 6.18.18.c1186-trim 二进制还原
++ */
++#include <linux/event_report.h>
++#include <linux/kfifo.h>
++#include <linux/kobject.h>
++#include <linux/ktime.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/ratelimit.h>
++#include <linux/rcupdate.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/time.h>
++#include <linux/wait.h>
++
++#define EVENT_MAX_NR		128			/* 队列里最多放多少个事件(指针) */
++#define EVENT_MAX_DATA_SIZE	(1024 * 1024)
++#define EVENT_READ_BATCH	32
++
++struct er_q {
++	spinlock_t lock;
++	wait_queue_head_t q;
++	struct kfifo events_q;
++};
++
++struct sysfs_read_ctx {
++	char *buf;
++	size_t buf_size;
++	ssize_t result;
++};
++
++static DEFINE_MUTEX(er_q_update_lock);
++static struct er_q __rcu *er_q;
++
++struct event_report *er_event_create(u16 event_id, void *data, size_t data_size)
++{
++	struct event_report *ev;
++
++	if (data_size == 0 || data_size > EVENT_MAX_DATA_SIZE || !data)
++		return ERR_PTR(-EINVAL);
++
++	ev = kmalloc(sizeof(*ev) + data_size, GFP_KERNEL);
++	if (!ev)
++		return ERR_PTR(-ENOMEM);
++
++	ev->event_id = event_id;
++	ev->data_len = data_size;
++	ev->reserved = 0;
++	ev->timestamp = ktime_get_real();
++	memcpy(ev->data, data, data_size);
++
++	pr_debug("%s: Created event %p: subid=%u, len=%u, ts=%llu\n",
++		 __func__, ev, ev->event_id, ev->data_len, ev->timestamp);
++	return ev;
++}
++EXPORT_SYMBOL(er_event_create);
++
++void er_event_destroy(struct event_report *ev)
++{
++	kfree(ev);
++}
++EXPORT_SYMBOL(er_event_destroy);
++
++static int er_emit_locked(struct er_q *q, u16 event_type, u16 subevent_type,
++			  void *data, size_t len)
++{
++	struct event_report *ev = NULL;
++	unsigned int rc;
++	int ret;
++
++	if (!data)
++		return -EINVAL;
++
++	if (kfifo_is_full(&q->events_q)) {
++		pr_debug_ratelimited("Event queue is full, cannot add event\n");
++		return -ENOSPC;
++	}
++
++	ev = er_event_create(subevent_type, data, len);
++	if (IS_ERR(ev))
++		return PTR_ERR(ev);
++
++	pr_debug("Emitting event: ev=%p\n", ev);
++	ret = er_nl_send_ev_broadcast(event_type, ev);
++	if (ret)
++		pr_debug_ratelimited("%s: Failed to send broadcast event: %d\n",
++				     __func__, ret);
++
++	spin_lock(&q->lock);
++	if (kfifo_is_full(&q->events_q)) {
++		spin_unlock(&q->lock);
++		pr_warn_ratelimited("Event queue full, dropping event (consider increasing EVENT_MAX_NR)\n");
++		kfree(ev);
++		return ret ? ret : -ENOSPC;
++	}
++	rc = kfifo_in(&q->events_q, &ev, sizeof(ev));
++	spin_unlock(&q->lock);
++
++	if (rc != sizeof(ev)) {
++		pr_err_ratelimited("Unexpected kfifo_in result: rc=%d\n", rc);
++		kfree(ev);
++		return -EIO;
++	}
++
++	wake_up(&q->q);
++	return 0;
++}
++
++int er_emit(u16 event_type, u16 subevent_type, void *data, size_t len)
++{
++	struct er_q *q;
++	int ret;
++
++	mutex_lock(&er_q_update_lock);
++	q = rcu_dereference_protected(er_q, lockdep_is_held(&er_q_update_lock));
++	if (!q) {
++		mutex_unlock(&er_q_update_lock);
++		return -ENODEV;
++	}
++	ret = er_emit_locked(q, event_type, subevent_type, data, len);
++	mutex_unlock(&er_q_update_lock);
++	return ret;
++}
++EXPORT_SYMBOL(er_emit);
++
++static void free_event_q(struct er_q *q)
++{
++	struct event_report *ev = NULL;
++
++	while (kfifo_out_spinlocked(&q->events_q, &ev, sizeof(ev), &q->lock) == sizeof(ev)) {
++		if (!ev)
++			break;
++		kfree(ev);
++	}
++	kfifo_free(&q->events_q);
++	memset(&q->events_q, 0, sizeof(q->events_q));
++}
++
++static int er_sysfs_read_locked(struct er_q *q, struct sysfs_read_ctx *ctx)
++{
++	char *buf = ctx->buf;
++	struct event_report *events[EVENT_READ_BATCH];
++	int remaining = ctx->buf_size;
++	int total = 0;
++	int n, i, count;
++
++	if (!q)
++		goto out;
++
++	while (remaining > 200) {
++		if (kfifo_is_empty(&q->events_q))
++			break;
++		n = kfifo_out_spinlocked(&q->events_q, events, sizeof(events), &q->lock);
++		if (!n)
++			break;
++
++		count = n / sizeof(events[0]);
++		for (i = 0; i < count; i++) {
++			struct event_report *ev = events[i];
++			struct tm tm = { 0 };
++			int len;
++
++			if (!ev)
++				continue;
++
++			if (!buf || !remaining) {
++				kfree(ev);
++				goto fail;
++			}
++
++			time64_to_tm(ns_to_timespec64(ev->timestamp).tv_sec, 0, &tm);
++
++			if (ev->event_id == 1) {
++				if (ev->data_len >= sizeof(struct ata_error_info)) {
++					struct ata_error_info *info = (struct ata_error_info *)ev->data;
++
++					len = snprintf(buf, remaining,
++						       "[%04ld-%02d-%02d %02d:%02d:%02d] SATA_ERROR: SN=%s DESC=\"%s\" MASK=0x%08x SERR=0x%08x\n",
++						       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
++						       tm.tm_hour, tm.tm_min, tm.tm_sec,
++						       info->serial_number, info->error_desc,
++						       info->error_mask, info->serror);
++				} else {
++					len = snprintf(buf, remaining,
++						       "[%04ld-%02d-%02d %02d:%02d:%02d] SATA_EVENT: SUBID=%u LEN=%u\n",
++						       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
++						       tm.tm_hour, tm.tm_min, tm.tm_sec,
++						       ev->event_id, ev->data_len);
++				}
++			} else {
++				len = snprintf(buf, remaining,
++					       "[%04ld-%02d-%02d %02d:%02d:%02d] EVENT: SUBTYPE=%u DATA_LEN=%u\n",
++					       tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
++					       tm.tm_hour, tm.tm_min, tm.tm_sec,
++					       ev->event_id, ev->data_len);
++			}
++			kfree(events[i]);
++
++			if (len < 0) {
++fail:
++				pr_err_ratelimited("Failed to format event\n");
++				continue;
++			}
++			if (len >= remaining)
++				goto out;
++
++			total += len;
++			buf += len;
++			remaining -= len;
++		}
++	}
++
++	if (!kfifo_is_empty(&q->events_q) && remaining > 100) {
++		strcpy(buf, "\n[... more events available ...]\n");
++		total += 33;
++	}
++out:
++	ctx->result = total;
++	return 0;
++}
++
++int er_sysfs_read(char *buf, size_t buf_size, ssize_t *result)
++{
++	struct sysfs_read_ctx ctx = {
++		.buf = buf,
++		.buf_size = buf_size,
++		.result = 0,
++	};
++	struct er_q *q;
++	int ret;
++
++	if (!buf || !result)
++		return -EINVAL;
++
++	rcu_read_lock();
++	q = rcu_dereference(er_q);
++	if (!q) {
++		rcu_read_unlock();
++		*result = 0;
++		return 0;
++	}
++	ret = er_sysfs_read_locked(q, &ctx);
++	*result = ctx.result;
++	rcu_read_unlock();
++	return ret;
++}
++EXPORT_SYMBOL(er_sysfs_read);
++
++
++static int __init er_init(void)
++{
++	struct er_q *q;
++	int ret;
++
++	q = kzalloc(sizeof(*q), GFP_KERNEL);
++	if (!q)
++		return -ENOMEM;
++
++	spin_lock_init(&q->lock);
++	init_waitqueue_head(&q->q);
++	ret = kfifo_alloc(&q->events_q, EVENT_MAX_NR * sizeof(struct event_report *), GFP_KERNEL);
++	if (ret) {
++		kfree(q);
++		return -ENOMEM;
++	}
++
++	ret = er_nl_init();
++	if (ret)
++		goto err_free;
++
++	ret = er_sysfs_add();
++	if (ret)
++		goto err_nl;
++
++	mutex_lock(&er_q_update_lock);
++	rcu_assign_pointer(er_q, q);
++	mutex_unlock(&er_q_update_lock);
++
++	pr_info("Initialized event reporting module\n");
++	return ret;
++
++err_nl:
++	free_event_q(q);
++	kfree(q);
++	er_nl_exit();
++	return ret;
++err_free:
++	free_event_q(q);
++	kfree(q);
++	return ret;
++}
++
++static void __exit er_exit(void)
++{
++	struct er_q *q;
++
++	mutex_lock(&er_q_update_lock);
++	q = rcu_dereference_protected(er_q, lockdep_is_held(&er_q_update_lock));
++	RCU_INIT_POINTER(er_q, NULL);
++	mutex_unlock(&er_q_update_lock);
++
++	if (!q)
++		return;
++
++	synchronize_rcu();
++	er_sysfs_remove();
++	er_nl_exit();
++	free_event_q(q);
++	kfree(q);
++	pr_info("Exit event reporting module\n");
++}
++
++module_init(er_init);
++module_exit(er_exit);
+diff --git a/drivers/misc/event_report/er_netlink.c b/drivers/misc/event_report/er_netlink.c
+new file mode 100755
+index 000000000..1929e0e41
+--- /dev/null
++++ b/drivers/misc/event_report/er_netlink.c
+@@ -0,0 +1,193 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * 事件上报: netlink(协议 31)—— 按飞牛 6.18.18.c1186-trim 二进制还原。
++ * 内核 -> 用户态: 组播组 1 广播事件; 用户态 -> 内核: 测试用 HELLO / DATA 消息, 回一条单播 + 一条广播。
++ */
++#include <linux/event_report.h>
++#include <linux/kernel.h>
++#include <linux/minmax.h>
++#include <linux/netlink.h>
++#include <linux/skbuff.h>
++#include <linux/string.h>
++#include <net/net_namespace.h>
++#include <net/netlink.h>
++#include <net/sock.h>
++
++#define ER_NL_GROUP		1
++#define ER_NL_MSG_EVENT		0x10
++#define ER_NL_MAX_DATA		0x2000
++
++enum {
++	ER_NL_CMD_HELLO = 1,
++	ER_NL_CMD_DATA = 2,
++};
++
++static struct sock *sk;
++
++static struct sk_buff *mk_ev_skb(struct event_report *ev, int msg_type, size_t *data_len)
++{
++	struct sk_buff *skb;
++	struct nlmsghdr *nlh;
++	size_t len;
++
++	*data_len = 0;
++	if (!ev) {
++		pr_err("mk_ev_skb: event is NULL\n");
++		return NULL;
++	}
++
++	len = sizeof(*ev) + ev->data_len;
++	skb = nlmsg_new(len, GFP_KERNEL);
++	if (!skb)
++		return NULL;
++
++	nlh = nlmsg_put(skb, 0, 0, msg_type, len, 0);
++	if (!nlh) {
++		kfree_skb(skb);
++		return NULL;
++	}
++
++	*data_len = len;
++	*(struct event_report *)nlmsg_data(nlh) = *ev;
++	if (ev->data_len)
++		memcpy(nlmsg_data(nlh) + sizeof(*ev), ev->data, ev->data_len);
++	return skb;
++}
++
++static void send_ev_unicast(u32 *portid, int msg_type, struct event_report *ev)
++{
++	u32 pid = *portid;
++	struct sk_buff *skb;
++	size_t len;
++	int ret;
++
++	skb = mk_ev_skb(ev, msg_type, &len);
++	if (!skb)
++		return;
++	if (!len) {
++		kfree_skb(skb);
++		return;
++	}
++
++	NETLINK_CB(skb).dst_group = 0;
++	ret = netlink_unicast(sk, skb, pid, MSG_DONTWAIT);
++	if (ret < 0)
++		pr_err("Failed to send message to user: %d\n", ret);
++	else
++		pr_info("Message sent to user (pid=%u): type=%d, data_len=%lu\n", pid, msg_type, len);
++}
++
++int er_nl_send_ev_broadcast(int msg_type, struct event_report *ev)
++{
++	struct sk_buff *skb;
++	size_t len;
++	int ret;
++
++	skb = mk_ev_skb(ev, msg_type, &len);
++	if (!skb)
++		return -ENOMEM;
++	if (!len) {
++		kfree_skb(skb);
++		return -EINVAL;
++	}
++
++	ret = nlmsg_multicast(sk, skb, 0, ER_NL_GROUP, GFP_KERNEL);
++	if (ret < 0 && ret != -ESRCH) {
++		pr_err("Failed to broadcast message: %d\n", ret);
++		return ret;
++	}
++
++	pr_debug("Message broadcasted to users: type=%d, data_len=%lu\n", msg_type, len);
++	return 0;
++}
++EXPORT_SYMBOL(er_nl_send_ev_broadcast);
++
++static void nl_recv(struct sk_buff *skb)
++{
++	char msg[256];
++	struct nlmsghdr *nlh = nlmsg_hdr(skb);
++	struct event_report *req, *ev;
++	u32 pid = nlh->nlmsg_pid;
++
++	if (nlh->nlmsg_len < NLMSG_HDRLEN + sizeof(*req)) {
++		pr_warn("Invalid netlink message size: %u (min: %zu)\n",
++			nlh->nlmsg_len, NLMSG_HDRLEN + sizeof(*req));
++		return;
++	}
++
++	req = nlmsg_data(nlh);
++	if (req->data_len > ER_NL_MAX_DATA) {
++		pr_warn("Event data too large: %u bytes (max: %u)\n", req->data_len, ER_NL_MAX_DATA);
++		return;
++	}
++	if (nlh->nlmsg_len < NLMSG_HDRLEN + sizeof(*req) + req->data_len) {
++		pr_warn("Message size mismatch: declared=%u, actual=%zu\n",
++			req->data_len, nlh->nlmsg_len - NLMSG_HDRLEN - sizeof(*req));
++		return;
++	}
++
++	pr_debug("Received from user (pid=%u): event_id=%u, data_len=%d\n",
++		 pid, req->event_id, req->data_len);
++
++	switch (req->event_id) {
++	case ER_NL_CMD_HELLO:
++		snprintf(msg, sizeof(msg), "Hello from kernel! Got your message: %.*s",
++			 (int)min_t(size_t, req->data_len, 100), req->data);
++		ev = er_event_create(CONTROL_SUBEVENT_RESPONSE, msg, strlen(msg));
++		if (!IS_ERR(ev)) {
++			send_ev_unicast(&pid, ER_NL_MSG_EVENT, ev);
++			er_event_destroy(ev);
++		}
++		strcpy(msg, "Broadcast triggered by HELLO message");
++		break;
++	case ER_NL_CMD_DATA:
++		snprintf(msg, sizeof(msg), "Got DATA: %.*s",
++			 (int)min_t(size_t, req->data_len, 100), req->data);
++		ev = er_event_create(CONTROL_SUBEVENT_RESPONSE, msg, strlen(msg));
++		if (!IS_ERR(ev)) {
++			send_ev_unicast(&pid, ER_NL_MSG_EVENT, ev);
++			er_event_destroy(ev);
++		}
++		strcpy(msg, "Broadcast triggered by DATA message");
++		break;
++	default:
++		pr_warn("Unknown message sub-type: %d\n", req->event_id);
++		snprintf(msg, sizeof(msg), "Unknown message sub-type: %d", req->event_id);
++		ev = er_event_create(CONTROL_SUBEVENT_RESPONSE, msg, strlen(msg));
++		if (!IS_ERR(ev)) {
++			send_ev_unicast(&pid, ER_NL_MSG_EVENT, ev);
++			er_event_destroy(ev);
++		}
++		return;
++	}
++
++	ev = er_event_create(CONTROL_SUBEVENT_BROADCAST, msg, strlen(msg));
++	if (!IS_ERR(ev)) {
++		er_nl_send_ev_broadcast(ER_NL_MSG_EVENT, ev);
++		er_event_destroy(ev);
++	}
++}
++
++int er_nl_init(void)
++{
++	struct netlink_kernel_cfg cfg = {
++		.input = nl_recv,
++	};
++
++	sk = netlink_kernel_create(&init_net, NETLINK_EVENT_REPORT, &cfg);
++	if (!sk) {
++		pr_err("Failed to create netlink socket (protocol %d)\n", NETLINK_EVENT_REPORT);
++		return -ENOMEM;
++	}
++	pr_info("er_netlink: netlink socket created (protocol %d)\n", NETLINK_EVENT_REPORT);
++	return 0;
++}
++
++void er_nl_exit(void)
++{
++	if (sk) {
++		netlink_kernel_release(sk);
++		sk = NULL;
++	}
++	pr_info("er_netlink: netlink socket released\n");
++}
+diff --git a/drivers/misc/event_report/er_sysfs.c b/drivers/misc/event_report/er_sysfs.c
+new file mode 100755
+index 000000000..dac939eb5
+--- /dev/null
++++ b/drivers/misc/event_report/er_sysfs.c
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * 事件上报: /sys/kernel/event_report/events —— 按飞牛 6.18.18.c1186-trim 二进制还原
++ */
++#include <linux/event_report.h>
++#include <linux/kobject.h>
++#include <linux/sysfs.h>
++
++static struct kobject *report_obj;
++
++static ssize_t events_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++	ssize_t result = 0;
++	int ret;
++
++	if (!buf)
++		return -EINVAL;
++
++	ret = er_sysfs_read(buf, PAGE_SIZE, &result);
++	return ret < 0 ? ret : result;
++}
++
++static struct kobj_attribute report_attr = __ATTR(events, 0444, events_show, NULL);
++
++static struct attribute *event_report_attrs[] = {
++	&report_attr.attr,
++	NULL,
++};
++
++static struct attribute_group event_report_attr_group = {
++	.attrs = event_report_attrs,
++};
++
++int er_sysfs_add(void)
++{
++	int ret;
++
++	report_obj = kobject_create_and_add("event_report", kernel_kobj);
++	if (!report_obj)
++		return -ENOMEM;
++
++	ret = sysfs_create_group(report_obj, &event_report_attr_group);
++	if (ret)
++		kobject_put(report_obj);
++	return ret;
++}
++
++void er_sysfs_remove(void)
++{
++	if (report_obj) {
++		sysfs_remove_group(report_obj, &event_report_attr_group);
++		kobject_put(report_obj);
++	}
++}
+diff --git a/include/linux/event_report.h b/include/linux/event_report.h
+new file mode 100755
+index 000000000..9ec1b5d90
+--- /dev/null
++++ b/include/linux/event_report.h
+@@ -0,0 +1,55 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * 飞牛 fnOS 内核「事件上报」(CONFIG_EVENT_REPORT) —— 按 6.18.18.c1186-trim 二进制还原。
++ * 内核模块(目前只有 libata)用 er_emit() 上报事件: 放进队列(/sys/kernel/event_report/events 读出)
++ * 并经 netlink 协议 31 广播给本机用户态(飞牛 sysdiag 订阅)。
++ */
++#ifndef _LINUX_EVENT_REPORT_H
++#define _LINUX_EVENT_REPORT_H
++
++#include <linux/types.h>
++
++#define NETLINK_EVENT_REPORT	31
++
++enum control_subevent_id {
++	CONTROL_SUBEVENT_RESPONSE = 0,
++	CONTROL_SUBEVENT_BROADCAST = 1,
++};
++
++enum sata_subevent_type {
++	SATA_SUBEVENT_ERROR = 1,
++	SATA_SUBEVENT_WARNING = 2,
++	SATA_SUBEVENT_NOTICE = 3,
++	SATA_SUBEVENT_INFO = 4,
++	SATA_SUBEVENT_DEBUG = 5,
++};
++
++struct event_report {
++	__u16 event_id;
++	__u16 reserved;
++	__u32 data_len;
++	__u64 timestamp;
++	char data[];
++};
++
++struct ata_error_info {
++	char serial_number[21];
++	char error_desc[256];
++	__u32 error_mask;
++	__u32 serror;
++	__u32 print_id;
++} __packed;
++
++struct event_report *er_event_create(u16 event_id, void *data, size_t data_size);
++void er_event_destroy(struct event_report *ev);
++int er_emit(u16 event_type, u16 subevent_type, void *data, size_t len);
++
++int er_sysfs_read(char *buf, size_t buf_size, ssize_t *result);
++int er_sysfs_add(void);
++void er_sysfs_remove(void);
++
++int er_nl_init(void);
++void er_nl_exit(void);
++int er_nl_send_ev_broadcast(int msg_type, struct event_report *ev);
++
++#endif /* _LINUX_EVENT_REPORT_H */

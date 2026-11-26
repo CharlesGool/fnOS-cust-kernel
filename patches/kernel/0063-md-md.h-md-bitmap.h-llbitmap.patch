@@ -1,0 +1,476 @@
+From 77896ec3c303e27b2bb727997b4d9a3b33d3cc9e Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:46:51 +0700
+Subject: [PATCH 063/110] =?UTF-8?q?md:=20md.h=20/=20md-bitmap.h=20/=20llbi?=
+ =?UTF-8?q?tmap=20=E7=BB=93=E6=9E=84=E5=92=8C=E6=9E=9A=E4=B8=BE=E6=94=B9?=
+ =?UTF-8?q?=E6=88=90=E9=A3=9E=E7=89=9B=E5=B8=83=E5=B1=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+只改定义, 函数逻辑留给 md.c / md-bitmap / llbitmap 子任务。pahole 核对 vmlinux 与
+raid0/1/10/456/linear 模块 BTF 全部一致(struct mddev 2096 字节)。
+
+md.h
+  - struct mddev: +logical_block_size(上游 62ed1b582246); +sysfs_failures、flush_plug_threshold、
+    resync_mode、resync_rh_tree/resync_rh_mutex/resync_rh_skipped_sectors/resync_sh_tree、
+    last_resync_start、ext_status、dfr、failures、allow_fast_resync:1、
+    enable_requested_resync_hints:1(飞牛私有)。
+  - struct md_rdev: +ext_status(私有)。md_io_clone: +rdev、dfr_bio(私有)。
+  - struct md_personality: +map_sector、align_chunk_addr_virt_to_dev(私有);
+    +bitmap_sector_map、bitmap_sync_size、bitmap_array_sectors(上游 llbitmap reshape 系列)。
+  - enum mddev_flags: +MD_LLBITMAP_CONVERTING、MD_HAS_WRITE_ZEROES、MD_NO_DISCARD、MD_FAST_DISCARD(私有)。
+  - enum flag_bits: +Offline、NonFullInsync、DiskError(私有)。
+  - enum recovery_flags: 去掉 MD_RECOVERY_LAZY_RECOVER(飞牛没有); 为了能编过暂时保留一个
+    #define 临时桩(值 13, 不进枚举), 各子任务改掉引用后删除。
+  - 新增 md_resync_hint、md_resync_hint_tree、md_degradation_free_recover、enum md_failure、
+    enum md_dfr_flags(私有)。
+md-bitmap.h
+  - enum bitmap_state +BITMAP_SHUTDOWN(上游)。
+  - bitmap_operations: +prepare_range、reshape_finish、reshape_can_start、reshape_mark(上游),
+    +reshape_can_skip(私有); end_discard 改为 md_bitmap_end_discard_fn*, 新增
+    enum md_bitmap_discard_result(私有, 原型取自飞牛 BTF)。group 仍是单个指针(飞牛未取上游 groups)。
+md-llbitmap.c
+  - enum llbitmap_state +BitNeedSyncUnwritten/BitSyncingUnwritten/BitCleanUnwritten(上游);
+    enum llbitmap_action +DiscardSuccess/Unsupported/Failed(私有)、ProactiveSync/ClearUnwritten(上游);
+  - struct llbitmap +sync_size/reshape_*/reshape_lock(上游), +resync_mode/state_count[]/seq_infect(私有);
+    llbitmap_page_ctl +last_seq[8](私有); 新增 enum llbitmap_resync_mode(私有)、
+    struct llbitmap_reshape_range(上游)。
+为能编过加的临时适配(子任务按飞牛实现替换):
+  - md-bitmap.c 新增 bitmap_end_discard() 转调 bitmap_end_write()(飞牛有同名函数);
+  - llbitmap_end_discard() 加 result 参数(暂不用);
+  - md.c md_bitmap_end() 分开调用 end_discard/end_write, discard 暂传 MD_BITMAP_DISCARD_SUCCESS;
+  - md.c include "raid5.h"(飞牛 md.c 的 stripe_start_dfr 按 stripe_head->state 的 STRIPE_DFR 位操作,
+    vmlinux BTF 里有 r5conf/stripe_head)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md-bitmap.c   | 12 ++++-
+ drivers/md/md-bitmap.h   | 25 +++++++++-
+ drivers/md/md-llbitmap.c | 58 +++++++++++++++++++++++-
+ drivers/md/md.c          | 13 ++++--
+ drivers/md/md.h          | 98 +++++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 196 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/md/md-bitmap.c b/drivers/md/md-bitmap.c
+index cef236893..ba6036162 100644
+--- a/drivers/md/md-bitmap.c
++++ b/drivers/md/md-bitmap.c
+@@ -1730,6 +1730,16 @@ static void bitmap_start_write(struct mddev *mddev, sector_t offset,
+ 	}
+ }
+ 
++static void bitmap_end_write(struct mddev *mddev, sector_t offset,
++			     unsigned long sectors);
++
++static void bitmap_end_discard(struct mddev *mddev, sector_t offset,
++			       unsigned long sectors,
++			       enum md_bitmap_discard_result result)
++{
++	bitmap_end_write(mddev, offset, sectors);
++}
++
+ static void bitmap_end_write(struct mddev *mddev, sector_t offset,
+ 			     unsigned long sectors)
+ {
+@@ -3091,7 +3101,7 @@ static struct bitmap_operations bitmap_ops = {
+ 	.start_write		= bitmap_start_write,
+ 	.end_write		= bitmap_end_write,
+ 	.start_discard		= bitmap_start_write,
+-	.end_discard		= bitmap_end_write,
++	.end_discard		= bitmap_end_discard,
+ 
+ 	.start_sync		= bitmap_start_sync,
+ 	.end_sync		= bitmap_end_sync,
+diff --git a/drivers/md/md-bitmap.h b/drivers/md/md-bitmap.h
+index 890276d9c..f3111f552 100644
+--- a/drivers/md/md-bitmap.h
++++ b/drivers/md/md-bitmap.h
+@@ -81,6 +81,17 @@ struct md_bitmap_stats {
+ typedef void (md_bitmap_fn)(struct mddev *mddev, sector_t offset,
+ 			    unsigned long sectors);
+ 
++/* fnnas: result of the discard io, passed to bitmap_operations->end_discard */
++enum md_bitmap_discard_result {
++	MD_BITMAP_DISCARD_SUCCESS,
++	MD_BITMAP_DISCARD_UNSUPPORTED,
++	MD_BITMAP_DISCARD_FAILED,
++};
++
++typedef void (md_bitmap_end_discard_fn)(struct mddev *mddev, sector_t offset,
++					unsigned long sectors,
++					enum md_bitmap_discard_result result);
++
+ struct bitmap_operations {
+ 	struct md_submodule_head head;
+ 
+@@ -94,6 +105,18 @@ struct bitmap_operations {
+ 	void (*write_all)(struct mddev *mddev);
+ 	void (*dirty_bits)(struct mddev *mddev, unsigned long s,
+ 			   unsigned long e);
++	/* Prepare a range for this bitmap implementation. */
++	void (*prepare_range)(struct mddev *mddev,
++			      sector_t *offset,
++			      unsigned long *sectors,
++			      bool discard);
++	void (*reshape_finish)(struct mddev *mddev);
++	int (*reshape_can_start)(struct mddev *mddev);
++	void (*reshape_mark)(struct mddev *mddev, sector_t old_pos,
++			     sector_t new_pos);
++	/* fnnas */
++	bool (*reshape_can_skip)(struct mddev *mddev, sector_t start,
++				 sector_t end);
+ 	void (*unplug)(struct mddev *mddev, bool sync);
+ 	void (*daemon_work)(struct mddev *mddev);
+ 
+@@ -104,7 +127,7 @@ struct bitmap_operations {
+ 	md_bitmap_fn *start_write;
+ 	md_bitmap_fn *end_write;
+ 	md_bitmap_fn *start_discard;
+-	md_bitmap_fn *end_discard;
++	md_bitmap_end_discard_fn *end_discard;
+ 
+ 	sector_t (*skip_sync_blocks)(struct mddev *mddev, sector_t offset);
+ 	bool (*blocks_synced)(struct mddev *mddev, sector_t offset);
+diff --git a/drivers/md/md-llbitmap.c b/drivers/md/md-llbitmap.c
+index 903ce6bb2..e447f7222 100644
+--- a/drivers/md/md-llbitmap.c
++++ b/drivers/md/md-llbitmap.c
+@@ -208,6 +208,20 @@ enum llbitmap_state {
+ 	BitNeedSync,
+ 	/* data is synchronizing */
+ 	BitSyncing,
++	/*
++	 * Proactive sync requested for unwritten region (raid456 only).
++	 * Triggered via sysfs when user wants to pre-build XOR parity
++	 * for regions that have never been written.
++	 */
++	BitNeedSyncUnwritten,
++	/* Proactive sync in progress for unwritten region */
++	BitSyncingUnwritten,
++	/*
++	 * XOR parity has been pre-built for a region that has never had
++	 * user data written. When user writes to this region, it transitions
++	 * to BitDirty.
++	 */
++	BitCleanUnwritten,
+ 	BitStateCount,
+ 	BitNone = 0xff,
+ };
+@@ -227,11 +241,21 @@ enum llbitmap_action {
+ 	BitmapActionDaemon,
+ 	/* Data is deleted */
+ 	BitmapActionDiscard,
++	/* fnnas: discard io is done, see enum md_bitmap_discard_result */
++	BitmapActionDiscardSuccess,
++	BitmapActionDiscardUnsupported,
++	BitmapActionDiscardFailed,
+ 	/*
+ 	 * Bitmap is stale, mark all bits in addition to BitUnwritten to
+ 	 * BitNeedSync.
+ 	 */
+ 	BitmapActionStale,
++	/*
++	 * Proactive sync trigger for raid456 - builds XOR parity for
++	 * Unwritten regions without requiring user data write first.
++	 */
++	BitmapActionProactiveSync,
++	BitmapActionClearUnwritten,
+ 	BitmapActionCount,
+ 	/* Init state is BitUnwritten */
+ 	BitmapActionInit,
+@@ -249,6 +273,8 @@ struct llbitmap_page_ctl {
+ 	unsigned long flags;
+ 	wait_queue_head_t wait;
+ 	struct percpu_ref active;
++	/* fnnas: sequential write detection */
++	u16 last_seq[8];
+ 	/* Per block size dirty state, maximum 64k page / 1 sector = 128 */
+ 	unsigned long dirty[];
+ };
+@@ -267,6 +293,11 @@ struct llbitmap {
+ 	unsigned long chunksize;
+ 	/* total number of chunks */
+ 	unsigned long chunks;
++	/* total number of sectors tracked by current bitmap geometry */
++	sector_t sync_size;
++	unsigned long reshape_chunksize;
++	unsigned long reshape_chunks;
++	sector_t reshape_sync_size;
+ 	unsigned long last_end_sync;
+ 	/*
+ 	 * time in seconds that dirty bits will be cleared if the page is not
+@@ -276,13 +307,37 @@ struct llbitmap {
+ 	/* fires on first BitDirty state */
+ 	struct timer_list pending_timer;
+ 	struct work_struct daemon_work;
++	/*
++	 * Serialize reshape checkpoint remapping against normal I/O bitmap
++	 * updates without blocking concurrent I/O updates on each other.
++	 */
++	rwlock_t reshape_lock;
+ 
+ 	unsigned long flags;
+ 	__u64	events_cleared;
++	/* fnnas: enum llbitmap_resync_mode */
++	u32 resync_mode;
++	/* fnnas: number of bits in each state */
++	atomic_t state_count[BitStateCount];
+ 
+ 	/* for slow disks */
+ 	atomic_t behind_writes;
+ 	wait_queue_head_t behind_wait;
++	/* fnnas */
++	bool seq_infect;
++};
++
++/* fnnas: llbitmap->resync_mode */
++enum llbitmap_resync_mode {
++	LLBITMAP_RESYNC_MODE_RESYNC,
++	LLBITMAP_RESYNC_MODE_RECOVERY,
++};
++
++struct llbitmap_reshape_range {
++	sector_t offset;
++	unsigned long sectors;
++	sector_t start;
++	sector_t end;
+ };
+ 
+ struct llbitmap_unplug_work {
+@@ -1121,7 +1176,8 @@ static void llbitmap_start_discard(struct mddev *mddev, sector_t offset,
+ }
+ 
+ static void llbitmap_end_discard(struct mddev *mddev, sector_t offset,
+-				 unsigned long sectors)
++				 unsigned long sectors,
++				 enum md_bitmap_discard_result result)
+ {
+ 	struct llbitmap *llbitmap = mddev->bitmap;
+ 	unsigned long start = DIV_ROUND_UP_SECTOR_T(offset, llbitmap->chunksize);
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index c54f5f34b..45ff61770 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -68,6 +68,7 @@
+ #include "md.h"
+ #include "md-bitmap.h"
+ #include "md-cluster.h"
++#include "raid5.h"
+ 
+ static const char *action_name[NR_SYNC_ACTIONS] = {
+ 	[ACTION_RESYNC]		= "resync",
+@@ -9310,11 +9311,13 @@ static void md_bitmap_start(struct mddev *mddev,
+ 
+ static void md_bitmap_end(struct mddev *mddev, struct md_io_clone *md_io_clone)
+ {
+-	md_bitmap_fn *fn = unlikely(md_io_clone->rw == STAT_DISCARD) ?
+-			   mddev->bitmap_ops->end_discard :
+-			   mddev->bitmap_ops->end_write;
+-
+-	fn(mddev, md_io_clone->offset, md_io_clone->sectors);
++	if (unlikely(md_io_clone->rw == STAT_DISCARD))
++		mddev->bitmap_ops->end_discard(mddev, md_io_clone->offset,
++					       md_io_clone->sectors,
++					       MD_BITMAP_DISCARD_SUCCESS);
++	else
++		mddev->bitmap_ops->end_write(mddev, md_io_clone->offset,
++					     md_io_clone->sectors);
+ }
+ 
+ static void md_end_clone_io(struct bio *bio)
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 09ed3290d..cf7eb3f59 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -224,6 +224,8 @@ struct md_rdev {
+ 		unsigned int size;	/* Size in sectors of the PPL space */
+ 		sector_t sector;	/* First sector of the PPL space */
+ 	} ppl;
++
++	unsigned int ext_status;	/* fnnas: MD_SB_1_EXT_STATUS_* of this rdev */
+ };
+ enum flag_bits {
+ 	Faulty,			/* device is known to have a fault */
+@@ -295,6 +297,11 @@ enum flag_bits {
+ 				 * serial bios.
+ 				 */
+ 	Nonrot,			/* non-rotational device (SSD) */
++	Offline,		/* fnnas: device is offline, keep the slot
++				 * for degradation free recover */
++	NonFullInsync,		/* fnnas: device is in_sync, but not all data
++				 * is synced (fast resync) */
++	DiskError,		/* fnnas: device reported a disk error */
+ };
+ 
+ static inline int is_badblock(struct md_rdev *rdev, sector_t s, sector_t sectors,
+@@ -348,6 +355,10 @@ struct md_cluster_operations;
+  * @MD_FAILLAST_DEV: Allow last rdev to be removed.
+  * @MD_SERIALIZE_POLICY: Enforce write IO is not reordered, just used by raid1.
+  * @MD_DM_SUSPENDING: This DM raid device is suspending.
++ * @MD_LLBITMAP_CONVERTING: fnnas: bitmap is being converted to llbitmap.
++ * @MD_HAS_WRITE_ZEROES: fnnas: all member disks support write zeroes.
++ * @MD_NO_DISCARD: fnnas: discard is disabled for this array.
++ * @MD_FAST_DISCARD: fnnas: discard is handled by bitmap only.
+  *
+  * change UNSUPPORTED_MDDEV_FLAGS for each array type if new flag is added
+  */
+@@ -368,6 +379,10 @@ enum mddev_flags {
+ 	MD_FAILLAST_DEV,
+ 	MD_SERIALIZE_POLICY,
+ 	MD_DM_SUSPENDING,
++	MD_LLBITMAP_CONVERTING,
++	MD_HAS_WRITE_ZEROES,
++	MD_NO_DISCARD,
++	MD_FAST_DISCARD,
+ };
+ 
+ enum mddev_sb_flags {
+@@ -386,6 +401,51 @@ struct serial_info {
+ 	sector_t _subtree_last; /* highest sector in subtree of rb node */
+ };
+ 
++/* fnnas: range hints for requested resync / skipped sync */
++struct md_resync_hint {
++	sector_t		h_start;
++	sector_t		h_end;
++	struct rb_node		node;
++};
++
++struct md_resync_hint_tree {
++	struct rb_root_cached	root;
++	unsigned long		count;
++	unsigned long		max_count;
++};
++
++/* fnnas: bits in mddev->failures */
++enum md_failure {
++	MD_FAILURE_RESYNC,
++	NR_MD_FAILURES,
++};
++
++/* fnnas: bits in md_degradation_free_recover->flags */
++enum md_dfr_flags {
++	DFR_F_ENABLED,
++	DFR_F_PLUG,
++	DFR_F_WAITED,
++	DFR_F_SYNC_TAKEOVER,
++};
++
++/*
++ * fnnas: degradation free recover, an offline member disk keeps its slot
++ * for a while instead of being kicked out of the array.
++ */
++struct md_degradation_free_recover {
++	struct mddev		*mddev;
++	spinlock_t		lock;
++	unsigned long		flags;		/* enum md_dfr_flags */
++	atomic_t		pending;
++	struct bio_list		dfr_bios;
++	struct timer_list	dfr_timer;
++	struct work_struct	dfr_unplug_work;
++	struct work_struct	dfr_wait_work;
++	wait_queue_head_t	unplug_wait;
++	struct md_thread	*probe;
++	unsigned int		dfr_timeout;
++};
++
+ /*
+  * mddev->curr_resync stores the current sector of the resync but
+  * also has some overloaded values.
+@@ -445,6 +505,7 @@ struct mddev {
+ 	sector_t			array_sectors; /* exported array size */
+ 	int				external_size; /* size managed
+ 							* externally */
++	unsigned int			logical_block_size;
+ 	__u64				events;
+ 	/* If the last 'event' was simply a clean->dirty transition, and
+ 	 * we didn't write it to the spares, then it is safe and simple
+@@ -549,6 +610,7 @@ struct mddev {
+ 	struct kernfs_node		*sysfs_action;  /* handle for 'sync_action' */
+ 	struct kernfs_node		*sysfs_completed;	/*handle for 'sync_completed' */
+ 	struct kernfs_node		*sysfs_degraded;	/*handle for 'degraded' */
++	struct kernfs_node		*sysfs_failures;	/* fnnas: handle for 'failures' */
+ 	struct kernfs_node		*sysfs_level;		/*handle for 'level' */
+ 
+ 	/* used for delayed sysfs removal */
+@@ -624,6 +686,16 @@ struct mddev {
+ 	struct md_cluster_operations *cluster_ops;
+ 	unsigned int			good_device_nr;	/* good device num within cluster raid */
+ 
++	/* fnnas private */
++	int				flush_plug_threshold;
++	unsigned char			resync_mode;
++	struct md_resync_hint_tree	resync_rh_tree;	/* requested resync hints */
++	struct mutex			resync_rh_mutex;
++	sector_t			resync_rh_skipped_sectors;
++	struct md_resync_hint_tree	resync_sh_tree;	/* skipped sync hints */
++	sector_t			last_resync_start;
++	unsigned int			ext_status;	/* MD_SB_1_EXT_STATUS_* */
++
+ 	/*
+ 	 * Temporarily store rdev that will be finally removed when
+ 	 * reconfig_mutex is unlocked, protected by reconfig_mutex.
+@@ -632,6 +704,11 @@ struct mddev {
+ 
+ 	/* The sequence number for sync thread */
+ 	atomic_t sync_seq;
++
++	struct md_degradation_free_recover *dfr;	/* fnnas */
++	unsigned long			failures;	/* fnnas: enum md_failure */
++	bool				allow_fast_resync:1;
++	bool				enable_requested_resync_hints:1;
+ };
+ 
+ enum recovery_flags {
+@@ -675,10 +752,14 @@ enum recovery_flags {
+ 	MD_RECOVERY_RESHAPE,
+ 	/* remote node is running resync thread */
+ 	MD_RESYNCING_REMOTE,
+-	/* raid456 lazy initial recover */
+-	MD_RECOVERY_LAZY_RECOVER,
+ };
+ 
++/*
++ * 第 5 步并行还原的临时桩: 飞牛没有 MD_RECOVERY_LAZY_RECOVER(enum 里已删),
++ * md.c/md-llbitmap.c/raid5.c 的引用由各子任务改掉后删除此定义。
++ */
++#define MD_RECOVERY_LAZY_RECOVER	(MD_RESYNCING_REMOTE + 1)
++
+ enum md_ro_state {
+ 	MD_RDWR,
+ 	MD_RDONLY,
+@@ -756,6 +837,9 @@ struct md_personality
+ 	struct md_submodule_head head;
+ 
+ 	bool __must_check (*make_request)(struct mddev *mddev, struct bio *bio);
++	/* fnnas: map array sector to the sector on rdev */
++	sector_t (*map_sector)(struct mddev *mddev, struct md_rdev *rdev,
++			       sector_t sector);
+ 	/*
+ 	 * start up works that do NOT require md_thread. tasks that
+ 	 * requires md_thread should go into start()
+@@ -801,6 +885,14 @@ struct md_personality
+ 	/* convert io ranges from array to bitmap */
+ 	void (*bitmap_sector)(struct mddev *mddev, sector_t *offset,
+ 			      unsigned long *sectors);
++	void (*bitmap_sector_map)(struct mddev *mddev, sector_t *offset,
++				  unsigned long *sectors, bool previous);
++	sector_t (*bitmap_sync_size)(struct mddev *mddev, bool previous);
++	sector_t (*bitmap_array_sectors)(struct mddev *mddev, bool previous);
++	/* fnnas */
++	void (*align_chunk_addr_virt_to_dev)(struct mddev *mddev, sector_t start,
++					     sector_t end, sector_t *dev_start,
++					     sector_t *dev_end);
+ };
+ 
+ struct md_sysfs_entry {
+@@ -880,6 +972,8 @@ struct md_thread {
+ 
+ struct md_io_clone {
+ 	struct mddev	*mddev;
++	struct md_rdev	*rdev;		/* fnnas: degradation free recover */
++	bool		dfr_bio;
+ 	struct bio	*orig_bio;
+ 	unsigned long	start_time;
+ 	sector_t	offset;

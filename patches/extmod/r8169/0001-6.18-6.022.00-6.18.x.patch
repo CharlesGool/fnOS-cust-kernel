@@ -1,0 +1,324 @@
+From 1ee4ef0c004b74e5b5bbb04e12bbd70466fd9c02 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 00:03:05 +0000
+Subject: [PATCH] =?UTF-8?q?=E9=80=82=E9=85=8D=206.18:=20=E6=8A=8A=206.022.?=
+ =?UTF-8?q?00=20=E8=80=81=E9=A9=B1=E5=8A=A8=E6=94=B9=E5=88=B0=E8=83=BD?=
+ =?UTF-8?q?=E5=9C=A8=206.18.x=20=E7=BC=96=E8=BF=87?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ethtool 改 get/set_link_ksettings; 定时器改 timer_setup/from_timer(6.16+ 为 timer_container_of);
+pci_* DMA 封装映射到 dma_*; dev_addr 改 eth_hw_addr_set; ndo_tx_timeout 加 txqueue 参数;
+dma_set_mask; netif_set_tso_max_size; skb_frag 访问器; 去掉已删除的 gso_min_segs/trans_start/last_rx;
+synchronize_sched 改 synchronize_net。只做编译适配, 未在真机测试。
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ src/r8169.h   |  18 +++++++++
+ src/r8169_n.c | 103 ++++++++++++++++++++++++++++++++++----------------
+ 2 files changed, 88 insertions(+), 33 deletions(-)
+
+diff --git a/src/r8169.h b/src/r8169.h
+index 19a2a9e..f17552c 100755
+--- a/src/r8169.h
++++ b/src/r8169.h
+@@ -234,6 +234,24 @@ typedef unsigned long uintptr_t;
+ #define RTL_R16(reg)		readw (ioaddr + (reg))
+ #define RTL_R32(reg)		((unsigned long) readl (ioaddr + (reg)))
+ 
++#include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,16,0) && !defined(from_timer)
++#define from_timer(var, callback_timer, timer_fieldname) \
++        timer_container_of(var, callback_timer, timer_fieldname)
++#endif
++
++/* 新内核已删除旧的 pci_* DMA 封装, 映射到通用 DMA API */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,18,0)
++#define pci_alloc_consistent(pdev, size, handle) \
++        dma_alloc_coherent(&(pdev)->dev, size, handle, GFP_ATOMIC)
++#define pci_free_consistent(pdev, size, vaddr, handle) \
++        dma_free_coherent(&(pdev)->dev, size, vaddr, handle)
++#define pci_map_single(pdev, ptr, size, dir)  dma_map_single(&(pdev)->dev, ptr, size, dir)
++#define pci_unmap_single(pdev, addr, size, dir)  dma_unmap_single(&(pdev)->dev, addr, size, dir)
++#define PCI_DMA_FROMDEVICE DMA_FROM_DEVICE
++#define PCI_DMA_TODEVICE   DMA_TO_DEVICE
++#endif
++
+ #ifndef	DMA_64BIT_MASK
+ #define DMA_64BIT_MASK	0xffffffffffffffffULL
+ #endif
+diff --git a/src/r8169_n.c b/src/r8169_n.c
+index 10febea..e70a869 100755
+--- a/src/r8169_n.c
++++ b/src/r8169_n.c
+@@ -154,7 +154,7 @@ MODULE_VERSION(RTL8169_VERSION);
+ 
+ static void rtl8169_set_tx_config(struct net_device *dev);
+ 
+-static void rtl8169_esd_timer(unsigned long __opaque);
++static void rtl8169_esd_timer(struct timer_list *t);
+ static void rtl8169_tx_clear(struct rtl8169_private *tp);
+ static void rtl8169_rx_clear(struct rtl8169_private *tp);
+ static void rtl8169_init_ring_indexes(struct rtl8169_private *tp);
+@@ -170,7 +170,7 @@ static int rtl8169_init_ring(struct net_device *dev);
+ static void rtl8169_hw_start(struct net_device *dev);
+ static int rtl8169_close(struct net_device *dev);
+ static void rtl8169_set_rx_mode(struct net_device *dev);
+-static void rtl8169_tx_timeout(struct net_device *dev);
++static void rtl8169_tx_timeout(struct net_device *dev, unsigned int txqueue);
+ static struct net_device_stats *rtl8169_get_stats(struct net_device *dev);
+ static int rtl8169_rx_interrupt(struct net_device *, struct rtl8169_private *, void __iomem *, u32 budget);
+ static int rtl8169_change_mtu(struct net_device *dev, int new_mtu);
+@@ -1072,6 +1072,36 @@ static int rtl8169_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+         return 0;
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,6,0)
++/* 新内核只认 get/set_link_ksettings: 用旧的 ethtool_cmd 实现再转换 */
++static int rtl8169_get_link_ksettings(struct net_device *dev, struct ethtool_link_ksettings *ks)
++{
++        struct ethtool_cmd cmd;
++
++        memset(&cmd, 0, sizeof(cmd));
++        rtl8169_get_settings(dev, &cmd);
++        memset(ks, 0, sizeof(*ks));
++        ethtool_convert_legacy_u32_to_link_mode(ks->link_modes.supported, cmd.supported);
++        ethtool_convert_legacy_u32_to_link_mode(ks->link_modes.advertising, cmd.advertising);
++        ks->base.speed = ethtool_cmd_speed(&cmd);
++        ks->base.duplex = cmd.duplex;
++        ks->base.autoneg = cmd.autoneg;
++        ks->base.port = PORT_TP;
++        return 0;
++}
++
++static int rtl8169_set_link_ksettings(struct net_device *dev, const struct ethtool_link_ksettings *ks)
++{
++        struct ethtool_cmd cmd;
++
++        memset(&cmd, 0, sizeof(cmd));
++        cmd.autoneg = ks->base.autoneg;
++        ethtool_cmd_speed_set(&cmd, ks->base.speed);
++        cmd.duplex = ks->base.duplex;
++        return rtl8169_set_settings(dev, &cmd);
++}
++#endif
++
+ static void rtl8169_get_regs(struct net_device *dev, struct ethtool_regs *regs,
+                              void *p)
+ {
+@@ -1175,7 +1205,7 @@ static void rtl8169_get_ethtool_stats(struct net_device *dev,
+ 
+         ASSERT_RTNL();
+ 
+-        counters = pci_alloc_consistent(tp->pci_dev, sizeof(*counters), &paddr);
++        counters = dma_alloc_coherent(&tp->pci_dev->dev, sizeof(*counters), &paddr, GFP_ATOMIC);
+         if (!counters)
+                 return;
+ 
+@@ -1206,7 +1236,7 @@ static void rtl8169_get_ethtool_stats(struct net_device *dev,
+         data[11] = le16_to_cpu(counters->tx_aborted);
+         data[12] = le16_to_cpu(counters->tx_underun);
+ 
+-        pci_free_consistent(tp->pci_dev, sizeof(*counters), counters, paddr);
++        dma_free_coherent(&tp->pci_dev->dev, sizeof(*counters), counters, paddr);
+ }
+ 
+ static void rtl8169_get_strings(struct net_device *dev, u32 stringset, u8 *data)
+@@ -1256,8 +1286,8 @@ static struct ethtool_ops rtl8169_ethtool_ops = {
+         .get_drvinfo		= rtl8169_get_drvinfo,
+         .get_regs_len		= rtl8169_get_regs_len,
+         .get_link		= ethtool_op_get_link,
+-        .get_settings		= rtl8169_get_settings,
+-        .set_settings		= rtl8169_set_settings,
++        .get_link_ksettings	= rtl8169_get_link_ksettings,
++        .set_link_ksettings	= rtl8169_set_link_ksettings,
+         .get_msglevel		= rtl8169_get_msglevel,
+         .set_msglevel		= rtl8169_set_msglevel,
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3,3,0)
+@@ -1547,10 +1577,10 @@ static void rtl8169_hw_phy_config(struct net_device *dev)
+         spin_unlock_irqrestore(&tp->phy_lock, flags);
+ }
+ 
+-static void rtl8169_phy_timer(unsigned long __opaque)
++static void rtl8169_phy_timer(struct timer_list *t)
+ {
+-        struct net_device *dev = (struct net_device *)__opaque;
+-        struct rtl8169_private *tp = netdev_priv(dev);
++        struct rtl8169_private *tp = from_timer(tp, t, link_timer);
++        struct net_device *dev = tp->dev;
+         struct timer_list *timer = &tp->link_timer;
+         unsigned long timeout = RTL8169_PHY_TIMEOUT;
+ 
+@@ -1594,7 +1624,7 @@ static inline void rtl8169_delete_timer(struct net_device *dev)
+             (tp->pcfg >= PCFG_METHOD_6))
+                 return;
+ 
+-        del_timer_sync(timer);
++        timer_delete_sync(timer);
+ }
+ 
+ static inline void rtl8169_request_timer(struct net_device *dev)
+@@ -1606,10 +1636,8 @@ static inline void rtl8169_request_timer(struct net_device *dev)
+             (tp->pcfg >= PCFG_METHOD_6))
+                 return;
+ 
+-        init_timer(timer);
++        timer_setup(timer, rtl8169_phy_timer, 0);
+         timer->expires = jiffies + RTL8169_PHY_TIMEOUT;
+-        timer->data = (unsigned long)(dev);
+-        timer->function = rtl8169_phy_timer;
+         add_timer(timer);
+ }
+ 
+@@ -1618,7 +1646,7 @@ static inline void rtl8169_delete_esd_timer(struct net_device *dev, struct timer
+         struct rtl8169_private *tp = netdev_priv(dev);
+ 
+         spin_lock_irq(&tp->lock);
+-        del_timer_sync(timer);
++        timer_delete_sync(timer);
+         spin_unlock_irq(&tp->lock);
+ }
+ 
+@@ -1627,10 +1655,8 @@ static inline void rtl8169_request_esd_timer(struct net_device *dev)
+         struct rtl8169_private *tp = netdev_priv(dev);
+         struct timer_list *timer = &tp->esd_timer;
+ 
+-        init_timer(timer);
++        timer_setup(timer, rtl8169_esd_timer, 0);
+         timer->expires = jiffies + RTL8169_ESD_TIMEOUT;
+-        timer->data = (unsigned long)(dev);
+-        timer->function = rtl8169_esd_timer;
+         add_timer(timer);
+ }
+ 
+@@ -1719,10 +1745,9 @@ rtl8169_get_mac_address(struct net_device *dev)
+ 
+ 
+         /* Get MAC address.  FIXME: read EEPROM */
+-        for (i = 0; i < MAC_ADDR_LEN; i++) {
+-                dev->dev_addr[i] = RTL_R8(MAC0 + i);
+-                tp->org_mac_addr[i] = dev->dev_addr[i]; /* keep the original MAC address */
+-        }
++        for (i = 0; i < MAC_ADDR_LEN; i++)
++                tp->org_mac_addr[i] = RTL_R8(MAC0 + i); /* keep the original MAC address */
++        eth_hw_addr_set(dev, tp->org_mac_addr);
+ #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,13)
+         memcpy(dev->perm_addr, dev->dev_addr, dev->addr_len);
+ #endif
+@@ -1751,9 +1776,9 @@ rtl8169_set_mac_address(struct net_device *dev,
+ 
+         spin_lock_irqsave(&tp->lock, flags);
+ 
+-        memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
++        eth_hw_addr_set(dev, addr->sa_data);
+ 
+-        rtl8169_rar_set(tp, dev->dev_addr);
++        rtl8169_rar_set(tp, (u8 *)dev->dev_addr);
+ 
+         spin_unlock_irqrestore(&tp->lock, flags);
+ 
+@@ -2511,10 +2536,10 @@ static void rtl8169_phy_power_down(struct net_device *dev)
+ }
+ 
+ static void
+-rtl8169_esd_timer(unsigned long __opaque)
++rtl8169_esd_timer(struct timer_list *t)
+ {
+-        struct net_device *dev = (struct net_device *)__opaque;
+-        struct rtl8169_private *tp = netdev_priv(dev);
++        struct rtl8169_private *tp = from_timer(tp, t, esd_timer);
++        struct net_device *dev = tp->dev;
+         struct pci_dev *pdev = tp->pci_dev;
+         struct timer_list *timer = &tp->esd_timer;
+         unsigned long timeout = RTL8169_ESD_TIMEOUT;
+@@ -2748,11 +2773,11 @@ rtl8169_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+         tp->cp_cmd = PCIMulRW | RxChkSum;
+ 
+         if ((sizeof(dma_addr_t) > 4) &&
+-            !pci_set_dma_mask(pdev, DMA_64BIT_MASK) && use_dac) {
++            !dma_set_mask(&pdev->dev, DMA_64BIT_MASK) && use_dac) {
+                 tp->cp_cmd |= PCIDAC;
+                 dev->features |= NETIF_F_HIGHDMA;
+         } else {
+-                rc = pci_set_dma_mask(pdev, DMA_32BIT_MASK);
++                rc = dma_set_mask(&pdev->dev, DMA_32BIT_MASK);
+                 if (rc < 0) {
+ #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,0)
+                         if (netif_msg_probe(tp)) {
+@@ -2842,9 +2867,11 @@ rtl8169_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+         dev->vlan_features = NETIF_F_SG | NETIF_F_IP_CSUM | NETIF_F_TSO |
+                              NETIF_F_HIGHDMA;
+ 
+-        netif_set_gso_max_size(dev, LSO_32K);
++        netif_set_tso_max_size(dev, LSO_32K);
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,18,0)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6,2,0)
+         dev->gso_min_segs = NIC_MIN_PHYS_BUF_COUNT;
++#endif
+         dev->gso_max_segs = NIC_MAX_PHYS_BUF_COUNT_LSO_64K;
+ #endif
+ #endif
+@@ -3674,7 +3701,7 @@ static void rtl8169_reset_task(struct work_struct *work)
+         }
+ }
+ 
+-static void rtl8169_tx_timeout(struct net_device *dev)
++static void rtl8169_tx_timeout(struct net_device *dev, unsigned int txqueue)
+ {
+         struct rtl8169_private *tp = netdev_priv(dev);
+         unsigned long flags;
+@@ -3705,8 +3732,14 @@ static int rtl8169_xmit_frags(struct rtl8169_private *tp, struct sk_buff *skb,
+                 entry = (entry + 1) % NUM_TX_DESC;
+ 
+                 txd = tp->TxDescArray + entry;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
++                len = skb_frag_size(frag);
++                addr = skb_frag_address(frag);
++#else
+                 len = frag->size;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(3,2,0)
++#endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,4,0)
++#elif LINUX_VERSION_CODE < KERNEL_VERSION(3,2,0)
+                 addr = ((void *) page_address(frag->page)) + frag->page_offset;
+ #else
+                 addr = ((void *) page_address(frag->page.p)) + frag->page_offset;
+@@ -3897,7 +3930,9 @@ static int rtl8169_start_xmit(struct sk_buff *skb, struct net_device *dev)
+         wmb();
+         txd->opts1 = cpu_to_le32(status);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4,7,0)
+         dev->trans_start = jiffies;
++#endif
+ 
+         tp->cur_tx += frags + 1;
+ 
+@@ -4168,7 +4203,9 @@ process_pkt:
+                         if (rtl8169_rx_vlan_skb(tp, desc, skb) < 0)
+                                 rtl8169_rx_skb(skb);
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4,11,0)
+                         dev->last_rx = jiffies;
++#endif
+                         RTLDEV->stats.rx_bytes += pkt_size;
+                         RTLDEV->stats.rx_packets++;
+                 }
+@@ -4350,7 +4387,7 @@ static void rtl8169_down(struct net_device *dev)
+ 
+ #if LINUX_VERSION_CODE > KERNEL_VERSION(2,6,11)
+         /* Give a racing hard_start_xmit a few cycles to complete. */
+-        synchronize_sched();  /* FIXME: should this be synchronize_irq()? */
++        synchronize_net();  /* FIXME: should this be synchronize_irq()? */
+ #endif
+ 
+         /*
+@@ -4496,7 +4533,7 @@ static int rtl8169_resume(struct pci_dev *pdev)
+         pci_enable_wake(pdev, PCI_D0, 0);
+ 
+         /* restore last modified mac address */
+-        rtl8169_rar_set(tp, dev->dev_addr);
++        rtl8169_rar_set(tp, (u8 *)dev->dev_addr);
+ 
+         if (!netif_running(dev))
+                 goto out;

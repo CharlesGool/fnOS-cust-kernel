@@ -1,0 +1,441 @@
+From 89250ce9297502d81b3c9e296e8a57470a038840 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:46:50 +0700
+Subject: [PATCH 054/110] =?UTF-8?q?bonding:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E7=A7=81=E6=9C=89=20802.3ad=20=E6=B7=B7=E5=90=88?=
+ =?UTF-8?q?=E9=80=9F=E7=8E=87=20/=20=E6=8C=89=E9=80=9F=E7=8E=87=E5=8A=A0?=
+ =?UTF-8?q?=E6=9D=83=E5=8F=91=E5=8C=85=20(fn=5Fmode)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 模块参数 fn_mode (0/1): 置 1 时新建 bond 默认打开下面两个选项
+- ad_mixed_speed: 端口 key 不含速率, 不同速率的口可进同一聚合组;
+  聚合带宽 = 各启用口速率之和; 速率变化时重启 LACP 状态机
+- ad_packet_wrr: 802.3ad 模式下按口速率做平滑加权轮询发包;
+  只开 ad_mixed_speed 时按速率加权选哈希桶
+- sysfs / netlink (IFLA_BOND_AD_MIXED_SPEED / AD_PACKET_WRR) / bond_opts 接口
+
+bond_header_create/parse、bond_rcv_validate、bond_xmit_broadcast、
+bond_do_ioctl 与 6.18.65 一致, 属官方 stable 修复, 未还原。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/net/bonding/bond_3ad.c     | 17 +++++-
+ drivers/net/bonding/bond_main.c    | 93 ++++++++++++++++++++++++++++++
+ drivers/net/bonding/bond_netlink.c | 32 ++++++++++
+ drivers/net/bonding/bond_options.c | 52 +++++++++++++++++
+ drivers/net/bonding/bond_sysfs.c   | 34 +++++++++++
+ 5 files changed, 226 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/bonding/bond_3ad.c b/drivers/net/bonding/bond_3ad.c
+index e82eabeb1..6124a5054 100644
+--- a/drivers/net/bonding/bond_3ad.c
++++ b/drivers/net/bonding/bond_3ad.c
+@@ -782,9 +782,16 @@ static unsigned int __agg_ports_priority(const struct aggregator *agg)
+ static u32 __get_agg_bandwidth(struct aggregator *aggregator)
+ {
+ 	int nports = __agg_active_ports(aggregator);
++	struct port *port = aggregator->lag_ports;
+ 	u32 bandwidth = 0;
+ 
+-	if (nports) {
++	/* Mixed-speed aggregator: the bandwidth is the sum of the port speeds */
++	if (port && port->slave->bond->params.ad_mixed_speed) {
++		for (; port; port = port->next_port_in_aggregator) {
++			if (port->is_enabled && port->slave->speed != SPEED_UNKNOWN)
++				bandwidth += port->slave->speed;
++		}
++	} else if (nports) {
+ 		switch (__get_link_speed(aggregator->lag_ports)) {
+ 		case AD_LINK_SPEED_1MBPS:
+ 			bandwidth = nports;
+@@ -2698,7 +2705,10 @@ static void ad_update_actor_keys(struct port *port, bool reset)
+ 		speed = __get_link_speed(port);
+ 		ospeed = (old_oper_key & AD_SPEED_KEY_MASKS) >> 1;
+ 		duplex = __get_duplex(port);
+-		port->actor_admin_port_key |= (speed << 1) | duplex;
++		/* Mixed-speed mode: ports of different speeds share one key */
++		port->actor_admin_port_key |= duplex;
++		if (!port->slave->bond->params.ad_mixed_speed)
++			port->actor_admin_port_key |= speed << 1;
+ 	}
+ 	port->actor_oper_port_key = port->actor_admin_port_key;
+ 
+@@ -2746,6 +2756,9 @@ void bond_3ad_adapter_speed_duplex_changed(struct slave *slave)
+ 
+ 	spin_lock_bh(&slave->bond->mode_lock);
+ 	ad_update_actor_keys(port, false);
++	/* The key does not change with the speed, restart LACP explicitly */
++	if (slave->bond->params.ad_mixed_speed)
++		port->sm_vars |= AD_PORT_BEGIN;
+ 	spin_unlock_bh(&slave->bond->mode_lock);
+ 	slave_dbg(slave->bond->dev, slave->dev, "Port %d changed speed/duplex\n",
+ 		  port->actor_port_number);
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 2e9e1b4d7..eea1bdfa1 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -123,6 +123,7 @@ static struct bond_params bonding_defaults;
+ static int resend_igmp = BOND_DEFAULT_RESEND_IGMP;
+ static int packets_per_slave = 1;
+ static int lp_interval = BOND_ALB_DEFAULT_LP_INTERVAL;
++static int fn_mode;
+ 
+ module_param(max_bonds, int, 0);
+ MODULE_PARM_DESC(max_bonds, "Max number of bonded devices");
+@@ -202,6 +203,8 @@ module_param(lp_interval, uint, 0);
+ MODULE_PARM_DESC(lp_interval, "The number of seconds between instances where "
+ 			      "the bonding driver sends learning packets to "
+ 			      "each slaves peer switch. The default is 1.");
++module_param(fn_mode, int, 0);
++MODULE_PARM_DESC(fn_mode, "Enable mixed-speed 802.3ad and speed-weighted packet scheduling (0/1, default 0)");
+ 
+ /*----------------------------- Global variables ----------------------------*/
+ 
+@@ -5144,6 +5147,65 @@ static void bond_reset_slave_arr(struct bonding *bond)
+ 	bond_set_slave_arr(bond, NULL, NULL);
+ }
+ 
++/* fnOS 802.3ad extensions: weight of a slave is its link speed in Mb/s */
++static u64 bond_ad_slave_weight(const struct slave *slave)
++{
++	u32 speed = slave->speed;
++
++	if (speed == 0 || speed == SPEED_UNKNOWN)
++		return SPEED_1000;
++	return speed;
++}
++
++/* Smooth weighted round robin over the usable slaves (per packet). */
++static struct slave *bond_ad_wrr_slave_get(struct bonding *bond,
++					   struct bond_up_slave *slaves)
++{
++	unsigned int count = slaves->count, i;
++	struct slave *best = NULL;
++	s64 total = 0;
++
++	spin_lock_bh(&bond->ad_wrr_lock);
++	for (i = 0; i < count; i++) {
++		struct slave *slave = slaves->arr[i];
++		s64 weight = bond_ad_slave_weight(slave);
++
++		total += weight;
++		slave->ad_wrr_current += weight;
++		if (!best || slave->ad_wrr_current > best->ad_wrr_current)
++			best = slave;
++	}
++	if (best)
++		best->ad_wrr_current -= total;
++	spin_unlock_bh(&bond->ad_wrr_lock);
++
++	return best;
++}
++
++/* Map the flow hash onto the slaves in proportion to their speeds. */
++static struct slave *bond_ad_speed_weighted_slave_get(struct bond_up_slave *slaves,
++						      u32 hash)
++{
++	unsigned int count = slaves->count, i;
++	u64 total = 0, point;
++
++	for (i = 0; i < count; i++)
++		total += bond_ad_slave_weight(slaves->arr[i]);
++
++	if (total) {
++		point = (u64)hash % total;
++		for (i = 0; i < count; i++) {
++			u64 weight = bond_ad_slave_weight(slaves->arr[i]);
++
++			if (point < weight)
++				return slaves->arr[i];
++			point -= weight;
++		}
++	}
++
++	return slaves->arr[hash % count];
++}
++
+ /* Build the usable slaves array in control path for modes that use xmit-hash
+  * to determine the slave interface -
+  * (a) BOND_MODE_8023AD
+@@ -5159,6 +5221,7 @@ int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave)
+ 	struct list_head *iter;
+ 	int agg_id = 0;
+ 	int ret = 0;
++	unsigned int i;
+ 
+ 	might_sleep();
+ 
+@@ -5209,6 +5272,14 @@ int bond_update_slave_arr(struct bonding *bond, struct slave *skipslave)
+ 	}
+ 	rcu_read_unlock();
+ 
++	/* New set of slaves: restart the smooth weighted round robin */
++	if (bond->params.ad_packet_wrr) {
++		spin_lock_bh(&bond->ad_wrr_lock);
++		for (i = 0; i < usable_slaves->count; i++)
++			usable_slaves->arr[i]->ad_wrr_current = 0;
++		spin_unlock_bh(&bond->ad_wrr_lock);
++	}
++
+ 	bond_set_slave_arr(bond, usable_slaves, all_slaves);
+ 	return ret;
+ out:
+@@ -5237,6 +5308,13 @@ static struct slave *bond_xmit_3ad_xor_slave_get(struct bonding *bond,
+ 	if (unlikely(!count))
+ 		return NULL;
+ 
++	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
++		if (bond->params.ad_packet_wrr)
++			return bond_ad_wrr_slave_get(bond, slaves);
++		if (bond->params.ad_mixed_speed)
++			return bond_ad_speed_weighted_slave_get(slaves, hash);
++	}
++
+ 	slave = slaves->arr[hash % count];
+ 	return slave;
+ }
+@@ -5254,6 +5332,13 @@ static struct slave *bond_xdp_xmit_3ad_xor_slave_get(struct bonding *bond,
+ 	if (unlikely(!count))
+ 		return NULL;
+ 
++	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
++		if (bond->params.ad_packet_wrr)
++			return bond_ad_wrr_slave_get(bond, slaves);
++		if (bond->params.ad_mixed_speed)
++			return bond_ad_speed_weighted_slave_get(slaves, hash);
++	}
++
+ 	return slaves->arr[hash % count];
+ }
+ 
+@@ -5991,6 +6076,7 @@ void bond_setup(struct net_device *bond_dev)
+ 	struct bonding *bond = netdev_priv(bond_dev);
+ 
+ 	spin_lock_init(&bond->mode_lock);
++	spin_lock_init(&bond->ad_wrr_lock);
+ 	bond->params = bonding_defaults;
+ 
+ 	/* Initialize pointers */
+@@ -6094,6 +6180,11 @@ static int __init bond_check_params(struct bond_params *params)
+ 	int lacp_fast = 0;
+ 	int tlb_dynamic_lb;
+ 
++	if (fn_mode != 0 && fn_mode != 1) {
++		pr_err("fn_mode must be 0 or 1\n");
++		return -EINVAL;
++	}
++
+ 	/* Convert string parameters. */
+ 	if (mode) {
+ 		bond_opt_initstr(&newval, mode);
+@@ -6445,6 +6536,8 @@ static int __init bond_check_params(struct bond_params *params)
+ 	params->ad_actor_sys_prio = ad_actor_sys_prio;
+ 	eth_zero_addr(params->ad_actor_system);
+ 	params->ad_user_port_key = ad_user_port_key;
++	params->ad_mixed_speed = fn_mode;
++	params->ad_packet_wrr = fn_mode;
+ 	params->coupled_control = 1;
+ 	params->broadcast_neighbor = 0;
+ 	params->lacp_strict = 0;
+diff --git a/drivers/net/bonding/bond_netlink.c b/drivers/net/bonding/bond_netlink.c
+index 4367cac1f..5f3928d78 100644
+--- a/drivers/net/bonding/bond_netlink.c
++++ b/drivers/net/bonding/bond_netlink.c
+@@ -144,6 +144,8 @@ static const struct nla_policy bond_policy[IFLA_BOND_MAX + 1] = {
+ 	[IFLA_BOND_COUPLED_CONTROL]	= { .type = NLA_U8 },
+ 	[IFLA_BOND_BROADCAST_NEIGH]	= { .type = NLA_U8 },
+ 	[IFLA_BOND_LACP_STRICT]		= { .type = NLA_U8 },
++	[IFLA_BOND_AD_MIXED_SPEED]	= { .type = NLA_U8 },
++	[IFLA_BOND_AD_PACKET_WRR]	= { .type = NLA_U8 },
+ };
+ 
+ static const struct nla_policy bond_slave_policy[IFLA_BOND_SLAVE_MAX + 1] = {
+@@ -610,6 +612,26 @@ static int bond_changelink(struct net_device *bond_dev, struct nlattr *tb[],
+ 			return err;
+ 	}
+ 
++	if (data[IFLA_BOND_AD_MIXED_SPEED]) {
++		int ad_mixed_speed = nla_get_u8(data[IFLA_BOND_AD_MIXED_SPEED]);
++
++		bond_opt_initval(&newval, ad_mixed_speed);
++		err = __bond_opt_set(bond, BOND_OPT_AD_MIXED_SPEED, &newval,
++				     data[IFLA_BOND_AD_MIXED_SPEED], extack);
++		if (err)
++			return err;
++	}
++
++	if (data[IFLA_BOND_AD_PACKET_WRR]) {
++		int ad_packet_wrr = nla_get_u8(data[IFLA_BOND_AD_PACKET_WRR]);
++
++		bond_opt_initval(&newval, ad_packet_wrr);
++		err = __bond_opt_set(bond, BOND_OPT_AD_PACKET_WRR, &newval,
++				     data[IFLA_BOND_AD_PACKET_WRR], extack);
++		if (err)
++			return err;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -683,6 +705,8 @@ static size_t bond_get_size(const struct net_device *bond_dev)
+ 		nla_total_size(sizeof(u8)) +	/* IFLA_BOND_COUPLED_CONTROL */
+ 		nla_total_size(sizeof(u8)) +	/* IFLA_BOND_BROADCAST_NEIGH */
+ 		nla_total_size(sizeof(u8)) +	/* IFLA_BOND_LACP_STRICT */
++		nla_total_size(sizeof(u8)) +	/* IFLA_BOND_AD_MIXED_SPEED */
++		nla_total_size(sizeof(u8)) +	/* IFLA_BOND_AD_PACKET_WRR */
+ 		0;
+ }
+ 
+@@ -869,6 +893,14 @@ static int bond_fill_info(struct sk_buff *skb,
+ 			if (nla_put(skb, IFLA_BOND_AD_ACTOR_SYSTEM,
+ 				    ETH_ALEN, &bond->params.ad_actor_system))
+ 				goto nla_put_failure;
++
++			if (nla_put_u8(skb, IFLA_BOND_AD_MIXED_SPEED,
++				       bond->params.ad_mixed_speed))
++				goto nla_put_failure;
++
++			if (nla_put_u8(skb, IFLA_BOND_AD_PACKET_WRR,
++				       bond->params.ad_packet_wrr))
++				goto nla_put_failure;
+ 		}
+ 		if (!bond_3ad_get_active_agg_info(bond, &info)) {
+ 			struct nlattr *nest;
+diff --git a/drivers/net/bonding/bond_options.c b/drivers/net/bonding/bond_options.c
+index 1b2cb2c80..14fdfb8d8 100644
+--- a/drivers/net/bonding/bond_options.c
++++ b/drivers/net/bonding/bond_options.c
+@@ -93,6 +93,10 @@ static int bond_option_coupled_control_set(struct bonding *bond,
+ 					   const struct bond_opt_value *newval);
+ static int bond_option_broadcast_neigh_set(struct bonding *bond,
+ 					   const struct bond_opt_value *newval);
++static int bond_option_ad_mixed_speed_set(struct bonding *bond,
++					  const struct bond_opt_value *newval);
++static int bond_option_ad_packet_wrr_set(struct bonding *bond,
++					 const struct bond_opt_value *newval);
+ 
+ static const struct bond_opt_value bond_mode_tbl[] = {
+ 	{ "balance-rr",    BOND_MODE_ROUNDROBIN,   BOND_VALFLAG_DEFAULT},
+@@ -258,6 +262,18 @@ static const struct bond_opt_value bond_broadcast_neigh_tbl[] = {
+ 	{ NULL,  -1, 0}
+ };
+ 
++static const struct bond_opt_value bond_ad_mixed_speed[] = {
++	{ "off", 0, BOND_VALFLAG_DEFAULT},
++	{ "on",	 1, 0},
++	{ NULL,  -1, 0}
++};
++
++static const struct bond_opt_value bond_ad_packet_wrr[] = {
++	{ "off", 0, BOND_VALFLAG_DEFAULT},
++	{ "on",	 1, 0},
++	{ NULL,  -1, 0}
++};
++
+ static const struct bond_option bond_opts[BOND_OPT_LAST] = {
+ 	[BOND_OPT_MODE] = {
+ 		.id = BOND_OPT_MODE,
+@@ -554,6 +570,24 @@ static const struct bond_option bond_opts[BOND_OPT_LAST] = {
+ 		.unsuppmodes = BOND_MODE_ALL_EX(BIT(BOND_MODE_8023AD)),
+ 		.values = bond_broadcast_neigh_tbl,
+ 		.set = bond_option_broadcast_neigh_set,
++	},
++	[BOND_OPT_AD_MIXED_SPEED] = {
++		.id = BOND_OPT_AD_MIXED_SPEED,
++		.name = "ad_mixed_speed",
++		.desc = "FN opt-in 802.3ad enhancement",
++		.flags = BOND_OPTFLAG_NOSLAVES | BOND_OPTFLAG_IFDOWN,
++		.unsuppmodes = BOND_MODE_ALL_EX(BIT(BOND_MODE_8023AD)),
++		.values = bond_ad_mixed_speed,
++		.set = bond_option_ad_mixed_speed_set,
++	},
++	[BOND_OPT_AD_PACKET_WRR] = {
++		.id = BOND_OPT_AD_PACKET_WRR,
++		.name = "ad_packet_wrr",
++		.desc = "FN opt-in 802.3ad enhancement",
++		.flags = BOND_OPTFLAG_NOSLAVES | BOND_OPTFLAG_IFDOWN,
++		.unsuppmodes = BOND_MODE_ALL_EX(BIT(BOND_MODE_8023AD)),
++		.values = bond_ad_packet_wrr,
++		.set = bond_option_ad_packet_wrr_set,
+ 	}
+ };
+ 
+@@ -1657,6 +1691,24 @@ static int bond_option_lp_interval_set(struct bonding *bond,
+ 	return 0;
+ }
+ 
++/* 飞牛私有: 802.3ad 混合速率聚合 */
++static int bond_option_ad_mixed_speed_set(struct bonding *bond,
++					  const struct bond_opt_value *newval)
++{
++	bond->params.ad_mixed_speed = newval->value;
++
++	return 0;
++}
++
++/* 飞牛私有: 802.3ad 按速率加权轮询发包 */
++static int bond_option_ad_packet_wrr_set(struct bonding *bond,
++					 const struct bond_opt_value *newval)
++{
++	bond->params.ad_packet_wrr = newval->value;
++
++	return 0;
++}
++
+ static int bond_option_pps_set(struct bonding *bond,
+ 			       const struct bond_opt_value *newval)
+ {
+diff --git a/drivers/net/bonding/bond_sysfs.c b/drivers/net/bonding/bond_sysfs.c
+index eaba44c76..2f98d54cb 100644
+--- a/drivers/net/bonding/bond_sysfs.c
++++ b/drivers/net/bonding/bond_sysfs.c
+@@ -365,6 +365,38 @@ static ssize_t bonding_show_lacp_active(struct device *d,
+ static DEVICE_ATTR(lacp_active, 0644,
+ 		   bonding_show_lacp_active, bonding_sysfs_store_option);
+ 
++static ssize_t bonding_show_ad_mixed_speed(struct device *d,
++					   struct device_attribute *attr,
++					   char *buf)
++{
++	struct bonding *bond = to_bond(d);
++	const struct bond_opt_value *val;
++
++	val = bond_opt_get_val(BOND_OPT_AD_MIXED_SPEED,
++			       bond->params.ad_mixed_speed);
++
++	return sysfs_emit(buf, "%s %d\n", val->string,
++			  bond->params.ad_mixed_speed);
++}
++static DEVICE_ATTR(ad_mixed_speed, 0644,
++		   bonding_show_ad_mixed_speed, bonding_sysfs_store_option);
++
++static ssize_t bonding_show_ad_packet_wrr(struct device *d,
++					  struct device_attribute *attr,
++					  char *buf)
++{
++	struct bonding *bond = to_bond(d);
++	const struct bond_opt_value *val;
++
++	val = bond_opt_get_val(BOND_OPT_AD_PACKET_WRR,
++			       bond->params.ad_packet_wrr);
++
++	return sysfs_emit(buf, "%s %d\n", val->string,
++			  bond->params.ad_packet_wrr);
++}
++static DEVICE_ATTR(ad_packet_wrr, 0644,
++		   bonding_show_ad_packet_wrr, bonding_sysfs_store_option);
++
+ static ssize_t bonding_show_lacp_rate(struct device *d,
+ 				      struct device_attribute *attr,
+ 				      char *buf)
+@@ -762,6 +794,8 @@ static struct attribute *per_bond_attrs[] = {
+ 	&dev_attr_updelay.attr,
+ 	&dev_attr_peer_notif_delay.attr,
+ 	&dev_attr_lacp_active.attr,
++	&dev_attr_ad_mixed_speed.attr,
++	&dev_attr_ad_packet_wrr.attr,
+ 	&dev_attr_lacp_rate.attr,
+ 	&dev_attr_ad_select.attr,
+ 	&dev_attr_xmit_hash_policy.attr,

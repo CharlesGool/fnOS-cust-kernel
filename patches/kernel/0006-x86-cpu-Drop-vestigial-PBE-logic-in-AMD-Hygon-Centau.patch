@@ -1,0 +1,89 @@
+From 0eef5a55f8f9a9082452410207873da8f8f62182 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 10:13:07 +0700
+Subject: [PATCH 006/110] =?UTF-8?q?x86/cpu:=20=E7=A7=BB=E6=A4=8D=E4=B8=8A?=
+ =?UTF-8?q?=E6=B8=B8=20"Drop=20vestigial=20PBE=20logic=20in=20AMD/Hygon/Ce?=
+ =?UTF-8?q?ntaur/Cyrix"?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 tip x86/cpu (2025-12), 飞牛在 init_amd/init_hygon 里已带此改动。
+https://lkml.iu.edu/2512.1/05370.html
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/x86/kernel/cpu/amd.c     | 6 ------
+ arch/x86/kernel/cpu/centaur.c | 6 ------
+ arch/x86/kernel/cpu/cyrix.c   | 6 ------
+ arch/x86/kernel/cpu/hygon.c   | 6 ------
+ 4 files changed, 24 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index ef55c76a3..7036f989a 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -1068,12 +1068,6 @@ static void init_amd(struct cpuinfo_x86 *c)
+ 
+ 	early_init_amd(c);
+ 
+-	/*
+-	 * Bit 31 in normal CPUID used for nonstandard 3DNow ID;
+-	 * 3DNow is IDd by bit 31 in extended CPUID (1*32+31) anyway
+-	 */
+-	clear_cpu_cap(c, 0*32+31);
+-
+ 	if (c->x86 >= 0x10)
+ 		set_cpu_cap(c, X86_FEATURE_REP_GOOD);
+ 
+diff --git a/arch/x86/kernel/cpu/centaur.c b/arch/x86/kernel/cpu/centaur.c
+index a3b55db35..c8398940b 100644
+--- a/arch/x86/kernel/cpu/centaur.c
++++ b/arch/x86/kernel/cpu/centaur.c
+@@ -119,12 +119,6 @@ static void init_centaur(struct cpuinfo_x86 *c)
+ 	u32  fcr_clr = 0;
+ 	u32  lo, hi, newlo;
+ 	u32  aa, bb, cc, dd;
+-
+-	/*
+-	 * Bit 31 in normal CPUID used for nonstandard 3DNow ID;
+-	 * 3DNow is IDd by bit 31 in extended CPUID (1*32+31) anyway
+-	 */
+-	clear_cpu_cap(c, 0*32+31);
+ #endif
+ 	early_init_centaur(c);
+ 	init_intel_cacheinfo(c);
+diff --git a/arch/x86/kernel/cpu/cyrix.c b/arch/x86/kernel/cpu/cyrix.c
+index dfec2c61e..8f22085c4 100644
+--- a/arch/x86/kernel/cpu/cyrix.c
++++ b/arch/x86/kernel/cpu/cyrix.c
+@@ -195,12 +195,6 @@ static void init_cyrix(struct cpuinfo_x86 *c)
+ 	char *buf = c->x86_model_id;
+ 	const char *p = NULL;
+ 
+-	/*
+-	 * Bit 31 in normal CPUID used for nonstandard 3DNow ID;
+-	 * 3DNow is IDd by bit 31 in extended CPUID (1*32+31) anyway
+-	 */
+-	clear_cpu_cap(c, 0*32+31);
+-
+ 	/* Cyrix used bit 24 in extended (AMD) CPUID for Cyrix MMX extensions */
+ 	if (test_cpu_cap(c, 1*32+24)) {
+ 		clear_cpu_cap(c, 1*32+24);
+diff --git a/arch/x86/kernel/cpu/hygon.c b/arch/x86/kernel/cpu/hygon.c
+index 1fda6c3a2..7f95a74e4 100644
+--- a/arch/x86/kernel/cpu/hygon.c
++++ b/arch/x86/kernel/cpu/hygon.c
+@@ -174,12 +174,6 @@ static void init_hygon(struct cpuinfo_x86 *c)
+ 
+ 	early_init_hygon(c);
+ 
+-	/*
+-	 * Bit 31 in normal CPUID used for nonstandard 3DNow ID;
+-	 * 3DNow is IDd by bit 31 in extended CPUID (1*32+31) anyway
+-	 */
+-	clear_cpu_cap(c, 0*32+31);
+-
+ 	set_cpu_cap(c, X86_FEATURE_REP_GOOD);
+ 
+ 	/*

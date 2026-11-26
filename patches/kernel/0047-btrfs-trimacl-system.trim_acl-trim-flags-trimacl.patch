@@ -1,0 +1,410 @@
+From 4cd832712356a50381f8d8db9954881c201cd8f9 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:47:46 +0700
+Subject: [PATCH 047/110] =?UTF-8?q?btrfs:=20trimacl=20=E6=94=AF=E6=8C=81?=
+ =?UTF-8?q?=20=E2=80=94=20system.trim=5Facl=20=E6=89=A9=E5=B1=95=E5=B1=9E?=
+ =?UTF-8?q?=E6=80=A7=E3=80=81trim=20flags=E3=80=81trimacl=20=E6=8C=82?=
+ =?UTF-8?q?=E8=BD=BD=E9=80=89=E9=A1=B9=20(=E9=A3=9E=E7=89=9B=E7=A7=81?=
+ =?UTF-8?q?=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 新文件 fs/btrfs/trim_acl.c: btrfs_get_trim_acl / btrfs_set_trim_acl (inode_operations
+  回调, 带 trim acl 缓存), btrfs_get_trim_flags / btrfs_set_trim_flags (只读子卷 -EROFS),
+  xattr 处理器 btrfs_xattr_trimacl_access_handler ("system.trim_acl", 无 .list)。
+  磁盘格式: 直接用 btrfs 的 xattr 项, 名字 "system.trim_acl" / "system.trim_flags"。
+  飞牛第一次 btrfs_getxattr 传的缓冲区是 "" (长度 0), 照抄。
+- xattr.c: btrfs_xattr_handlers 末尾加 trim_inode_flags_xattr_handler、trimacl 处理器。
+- inode.c: dir/file/special iops 挂 get/set_trim_acl + get/set_trim_flags, symlink 只挂
+  trim flags; btrfs_setattr 在 SB_TRIMACL 卷上 ATTR_MODE 改走 trim_acl_chmod。
+- ioctl.c btrfs_may_create (建子卷/快照): SB_TRIMACL 卷上改查
+  trim_permission(父目录, MAY_EXEC | MAY_APPEND), 与 VFS may_create 建目录相同。
+- 挂载选项 trimacl / notrimacl (BTRFS_MOUNT_TRIM_ACL = 1 << 62):
+  fill_super 成功后置 SB_TRIMACL | SB_POSIXACL; remount 时 trimacl 强制 SB_POSIXACL,
+  结束时按选项置/清 SB_TRIMACL; show_options 输出 ",trimacl"。
+- fs.h 引入 <linux/trim_acl.h> (放头文件里, 不改 .c 的行号)。
+
+比对: 新增 8 个函数全部一致; btrfs_setattr、btrfs_mksubvol、btrfs_parse_param、
+btrfs_show_options、btrfs_reconfigure 一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/Makefile   |   1 +
+ fs/btrfs/fs.h       |   3 +
+ fs/btrfs/inode.c    |  22 ++++++-
+ fs/btrfs/ioctl.c    |   3 +
+ fs/btrfs/super.c    |  21 +++++++
+ fs/btrfs/trim_acl.c | 144 ++++++++++++++++++++++++++++++++++++++++++++
+ fs/btrfs/xattr.c    |   2 +
+ fs/btrfs/xattr.h    |  11 ++++
+ 8 files changed, 205 insertions(+), 2 deletions(-)
+ create mode 100644 fs/btrfs/trim_acl.c
+
+diff --git a/fs/btrfs/Makefile b/fs/btrfs/Makefile
+index 309431a62..8a65d9c12 100644
+--- a/fs/btrfs/Makefile
++++ b/fs/btrfs/Makefile
+@@ -37,6 +37,7 @@ btrfs-y += super.o ctree.o extent-tree.o print-tree.o root-tree.o dir-item.o \
+ 	   lru_cache.o raid-stripe-tree.o fiemap.o direct-io.o
+ 
+ btrfs-$(CONFIG_BTRFS_FS_POSIX_ACL) += acl.o
++btrfs-y += trim_acl.o
+ btrfs-$(CONFIG_BTRFS_DEBUG) += ref-verify.o
+ btrfs-$(CONFIG_BLK_DEV_ZONED) += zoned.o
+ btrfs-$(CONFIG_FS_VERITY) += verity.o
+diff --git a/fs/btrfs/fs.h b/fs/btrfs/fs.h
+index c8b8d9135..6498b1ca5 100644
+--- a/fs/btrfs/fs.h
++++ b/fs/btrfs/fs.h
+@@ -30,6 +30,7 @@
+ #include "async-thread.h"
+ #include "block-rsv.h"
+ #include "messages.h"
++#include <linux/trim_acl.h>
+ 
+ struct inode;
+ struct super_block;
+@@ -267,6 +268,8 @@ enum {
+ 	BTRFS_MOUNT_IGNOREMETACSUMS		= (1ULL << 31),
+ 	BTRFS_MOUNT_IGNORESUPERFLAGS		= (1ULL << 32),
+ 	BTRFS_MOUNT_REF_TRACKER			= (1ULL << 33),
++	// shasure - trimacl
++	BTRFS_MOUNT_TRIM_ACL			= (1ULL << 62),
+ };
+ 
+ /* These mount options require a full read-only fs, no new transaction is allowed. */
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index cec3dc442..549bff562 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -5512,8 +5512,12 @@ static int btrfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		inode_inc_iversion(inode);
+ 		ret = btrfs_dirty_inode(BTRFS_I(inode));
+ 
+-		if (!ret && attr->ia_valid & ATTR_MODE)
+-			ret = posix_acl_chmod(idmap, dentry, inode->i_mode);
++		if (!ret && attr->ia_valid & ATTR_MODE) {
++			if (IS_TRIMACL(dentry))
++				ret = trim_acl_chmod(idmap, dentry, inode->i_mode);
++			else
++				ret = posix_acl_chmod(idmap, dentry, inode->i_mode);
++		}
+ 	}
+ 
+ 	return ret;
+@@ -10709,6 +10713,10 @@ static const struct inode_operations btrfs_dir_inode_operations = {
+ 	.tmpfile        = btrfs_tmpfile,
+ 	.fileattr_get	= btrfs_fileattr_get,
+ 	.fileattr_set	= btrfs_fileattr_set,
++	.get_trim_acl	= btrfs_get_trim_acl,
++	.set_trim_acl	= btrfs_set_trim_acl,
++	.get_trim_flags	= btrfs_get_trim_flags,
++	.set_trim_flags	= btrfs_set_trim_flags,
+ };
+ 
+ static const struct file_operations btrfs_dir_file_operations = {
+@@ -10762,6 +10770,10 @@ static const struct inode_operations btrfs_file_inode_operations = {
+ 	.update_time	= btrfs_update_time,
+ 	.fileattr_get	= btrfs_fileattr_get,
+ 	.fileattr_set	= btrfs_fileattr_set,
++	.get_trim_acl	= btrfs_get_trim_acl,
++	.set_trim_acl	= btrfs_set_trim_acl,
++	.get_trim_flags	= btrfs_get_trim_flags,
++	.set_trim_flags	= btrfs_set_trim_flags,
+ };
+ static const struct inode_operations btrfs_special_inode_operations = {
+ 	.getattr	= btrfs_getattr,
+@@ -10771,6 +10783,10 @@ static const struct inode_operations btrfs_special_inode_operations = {
+ 	.get_inode_acl	= btrfs_get_acl,
+ 	.set_acl	= btrfs_set_acl,
+ 	.update_time	= btrfs_update_time,
++	.get_trim_acl	= btrfs_get_trim_acl,
++	.set_trim_acl	= btrfs_set_trim_acl,
++	.get_trim_flags	= btrfs_get_trim_flags,
++	.set_trim_flags	= btrfs_set_trim_flags,
+ };
+ static const struct inode_operations btrfs_symlink_inode_operations = {
+ 	.get_link	= page_get_link,
+@@ -10779,6 +10795,8 @@ static const struct inode_operations btrfs_symlink_inode_operations = {
+ 	.permission	= btrfs_permission,
+ 	.listxattr	= btrfs_listxattr,
+ 	.update_time	= btrfs_update_time,
++	.get_trim_flags	= btrfs_get_trim_flags,
++	.set_trim_flags	= btrfs_set_trim_flags,
+ };
+ 
+ const struct dentry_operations btrfs_dentry_operations = {
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index cd97770f1..dfd21a4fd 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -887,6 +887,9 @@ static inline int btrfs_may_create(struct mnt_idmap *idmap,
+ 		return -ENOENT;
+ 	if (!fsuidgid_has_mapping(dir->i_sb, idmap))
+ 		return -EOVERFLOW;
++	// shasure - trimacl: 建子卷按"添加子目录"查 trim acl
++	if (IS_TRIMACL(child->d_parent))
++		return trim_permission(idmap, child->d_parent, MAY_EXEC | MAY_APPEND);
+ 	return inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
+ }
+ 
+diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
+index fcd1a8f15..e82e0115e 100644
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@ -136,6 +136,9 @@ enum {
+ 	Opt_ref_verify,
+ 	Opt_ref_tracker,
+ #endif
++	// shasure - trimacl
++	Opt_trimacl,
++	Opt_notrimacl,
+ 	Opt_err,
+ };
+ 
+@@ -259,6 +262,8 @@ static const struct fs_parameter_spec btrfs_fs_parameters[] = {
+ 	fsparam_flag("ref_tracker", Opt_ref_tracker),
+ 	fsparam_flag("ref_verify", Opt_ref_verify),
+ #endif
++	fsparam_flag("trimacl", Opt_trimacl),
++	fsparam_flag("notrimacl", Opt_notrimacl),
+ 	{}
+ };
+ 
+@@ -552,6 +557,12 @@ static int btrfs_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ 		else
+ 			btrfs_set_opt(ctx->mount_opt, ENOSPC_DEBUG);
+ 		break;
++	case Opt_trimacl:
++		btrfs_set_opt(ctx->mount_opt, TRIM_ACL);
++		break;
++	case Opt_notrimacl:
++		btrfs_clear_opt(ctx->mount_opt, TRIM_ACL);
++		break;
+ 	case Opt_defrag:
+ 		if (result.negated)
+ 			btrfs_clear_opt(ctx->mount_opt, AUTO_DEFRAG);
+@@ -999,6 +1010,8 @@ static int btrfs_fill_super(struct super_block *sb,
+ 		goto fail_close;
+ 	}
+ 
++	if (btrfs_test_opt(fs_info, TRIM_ACL))
++		sb->s_flags |= SB_TRIMACL | SB_POSIXACL;
+ 	sb->s_flags |= SB_ACTIVE;
+ 	return 0;
+ 
+@@ -1114,6 +1127,8 @@ static int btrfs_show_options(struct seq_file *seq, struct dentry *dentry)
+ 		seq_puts(seq, ",discard=async");
+ 	if (!(info->sb->s_flags & SB_POSIXACL))
+ 		seq_puts(seq, ",noacl");
++	if (btrfs_test_opt(info, TRIM_ACL))
++		seq_puts(seq, ",trimacl");
+ 	if (btrfs_free_space_cache_v1_active(info))
+ 		seq_puts(seq, ",space_cache");
+ 	else if (btrfs_fs_compat_ro(info, FREE_SPACE_TREE))
+@@ -1526,6 +1541,8 @@ static int btrfs_reconfigure(struct fs_context *fc)
+ 		return ret;
+ 
+ 	btrfs_ctx_to_info(fs_info, ctx);
++	if (btrfs_test_opt(fs_info, TRIM_ACL))
++		fc->sb_flags |= SB_POSIXACL;
+ 	btrfs_remount_begin(fs_info, old_ctx.mount_opt, fc->sb_flags);
+ 	btrfs_resize_thread_pool(fs_info, fs_info->thread_pool_size,
+ 				 old_ctx.thread_pool_size);
+@@ -1567,6 +1584,10 @@ static int btrfs_reconfigure(struct fs_context *fc)
+ 	btrfs_remount_cleanup(fs_info, old_ctx.mount_opt);
+ 	btrfs_clear_oneshot_options(fs_info);
+ 	clear_bit(BTRFS_FS_STATE_REMOUNTING, &fs_info->fs_state);
++	if (btrfs_test_opt(fs_info, TRIM_ACL))
++		sb->s_flags |= SB_TRIMACL;
++	else
++		sb->s_flags &= ~SB_TRIMACL;
+ 
+ 	return 0;
+ restore:
+diff --git a/fs/btrfs/trim_acl.c b/fs/btrfs/trim_acl.c
+new file mode 100644
+index 000000000..dbd11ed9b
+--- /dev/null
++++ b/fs/btrfs/trim_acl.c
+@@ -0,0 +1,144 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * btrfs 的 Trim-ACL 支持 (飞牛私有): trim acl 存在扩展属性 "system.trim_acl",
++ * trim flags 存在 "system.trim_flags" (处理器在 fs/trim_flags.c)。
++ * Copyright (C) T.R.I.M Inc.
++ */
++#include <linux/fs.h>
++#include <linux/xattr.h>
++#include <linux/slab.h>
++#include <linux/trim_acl.h>
++#include "ctree.h"
++#include "btrfs_inode.h"
++#include "xattr.h"
++
++ssize_t btrfs_get_trim_flags(struct inode *inode, void *buffer, size_t size)
++{
++	return btrfs_getxattr(inode, TRIM_INODE_FLAGS_XATTR, buffer, size);
++}
++
++int btrfs_set_trim_flags(struct inode *inode, const void *value, size_t size,
++			 int flags)
++{
++	if (btrfs_root_readonly(BTRFS_I(inode)->root))
++		return -EROFS;
++	return btrfs_setxattr_trans(inode, TRIM_INODE_FLAGS_XATTR, value, size, flags);
++}
++
++/*
++ * Inode operation get_trim_acl(): 先查缓存, 没有缓存时读 xattr 并缓存结果。
++ */
++struct trim_acl *btrfs_get_trim_acl(struct mnt_idmap *idmap, struct inode *inode)
++{
++	struct trim_acl *acl;
++	char *value = NULL;
++	int size;
++
++	acl = get_cached_trim_acl(inode);
++	if (!is_uncached_trim_acl(acl))
++		return acl;
++
++	size = btrfs_getxattr(inode, TRIM_ACL_XATTR_ACCESS, "", 0);
++	if (size > 0) {
++		value = kzalloc(size, GFP_NOFS);
++		if (!value)
++			return ERR_PTR(-ENOMEM);
++		size = btrfs_getxattr(inode, TRIM_ACL_XATTR_ACCESS, value, size);
++	}
++	if (size > 0)
++		acl = trim_acl_from_disk(value, size);
++	else if (size == -ENOENT || size == -ENODATA || size == 0)
++		acl = NULL;
++	else
++		acl = ERR_PTR(size);
++	kfree(value);
++
++	if (!IS_ERR(acl))
++		set_cached_trim_acl(inode, acl);
++
++	return acl;
++}
++
++static inline int __btrfs_set_trim_acl(struct inode *inode, struct trim_acl *acl)
++{
++	void *value = NULL;
++	size_t size = 0;
++	int ret;
++
++	if (acl) {
++		ret = trim_acl_valid(acl);
++		if (ret < 0)
++			return ret;
++		value = trim_acl_to_disk(acl, &size);
++		if (IS_ERR(value))
++			return PTR_ERR(value);
++	}
++
++	ret = btrfs_setxattr_trans(inode, TRIM_ACL_XATTR_ACCESS, value, size, 0);
++	kfree(value);
++	if (!ret)
++		set_cached_trim_acl(inode, acl);
++
++	return ret;
++}
++
++/*
++ * Inode operation set_trim_acl().
++ */
++int btrfs_set_trim_acl(struct mnt_idmap *idmap, struct inode *inode,
++		       struct trim_acl *acl)
++{
++	if (!inode)
++		return -EINVAL;
++	return __btrfs_set_trim_acl(inode, acl);
++}
++
++static int btrfs_xattr_trim_acl_get(const struct xattr_handler *handler,
++				    struct dentry *dentry, struct inode *unused,
++				    const char *name, void *buffer, size_t size)
++{
++	struct trim_acl *acl;
++	int ret;
++
++	acl = btrfs_get_trim_acl(&nop_mnt_idmap, d_inode(dentry));
++	if (IS_ERR(acl))
++		return PTR_ERR(acl);
++	if (!acl)
++		return -ENODATA;
++	ret = trim_acl_to_xattr(acl, buffer, size);
++	trim_acl_release(acl);
++
++	return ret;
++}
++
++static int btrfs_xattr_trim_acl_set(const struct xattr_handler *handler,
++				    struct mnt_idmap *idmap,
++				    struct dentry *dentry, struct inode *unused,
++				    const char *name, const void *value,
++				    size_t size, int flags)
++{
++	struct trim_acl *acl = NULL;
++	int ret;
++
++	if (value) {
++		acl = trim_acl_from_xattr(value, size);
++		if (IS_ERR(acl))
++			return PTR_ERR(acl);
++		if (acl) {
++			ret = trim_acl_valid(acl);
++			if (ret)
++				goto out;
++		}
++	}
++
++	ret = __btrfs_set_trim_acl(d_inode(dentry), acl);
++out:
++	trim_acl_release(acl);
++	return ret;
++}
++
++const struct xattr_handler btrfs_xattr_trimacl_access_handler = {
++	.name	= TRIM_ACL_XATTR_ACCESS,
++	.get	= btrfs_xattr_trim_acl_get,
++	.set	= btrfs_xattr_trim_acl_set,
++};
+diff --git a/fs/btrfs/xattr.c b/fs/btrfs/xattr.c
+index ab55d10bd..d73ad740c 100644
+--- a/fs/btrfs/xattr.c
++++ b/fs/btrfs/xattr.c
+@@ -477,6 +477,8 @@ const struct xattr_handler * const btrfs_xattr_handlers[] = {
+ 	&btrfs_trusted_xattr_handler,
+ 	&btrfs_user_xattr_handler,
+ 	&btrfs_btrfs_xattr_handler,
++	&trim_inode_flags_xattr_handler,
++	&btrfs_xattr_trimacl_access_handler,
+ 	NULL,
+ };
+ 
+diff --git a/fs/btrfs/xattr.h b/fs/btrfs/xattr.h
+index 0ce10e4ec..3e45adc3d 100644
+--- a/fs/btrfs/xattr.h
++++ b/fs/btrfs/xattr.h
+@@ -24,6 +24,17 @@ int btrfs_setxattr_trans(struct inode *inode, const char *name,
+ 			 const void *value, size_t size, int flags);
+ ssize_t btrfs_listxattr(struct dentry *dentry, char *buffer, size_t size);
+ 
++/* shasure - trimacl (trim_acl.c) */
++struct trim_acl;
++struct mnt_idmap;
++extern const struct xattr_handler btrfs_xattr_trimacl_access_handler;
++struct trim_acl *btrfs_get_trim_acl(struct mnt_idmap *idmap, struct inode *inode);
++int btrfs_set_trim_acl(struct mnt_idmap *idmap, struct inode *inode,
++		       struct trim_acl *acl);
++ssize_t btrfs_get_trim_flags(struct inode *inode, void *buffer, size_t size);
++int btrfs_set_trim_flags(struct inode *inode, const void *value, size_t size,
++			 int flags);
++
+ int btrfs_xattr_security_init(struct btrfs_trans_handle *trans,
+ 				     struct inode *inode, struct inode *dir,
+ 				     const struct qstr *qstr);

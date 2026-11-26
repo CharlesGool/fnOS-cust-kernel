@@ -1,0 +1,34 @@
+From 00e08b8edf7c890b411fbf7bdfe67c45cf284383 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 10:21:45 +0700
+Subject: [PATCH 011/110] =?UTF-8?q?gpiolib:=20acpi:=20=E8=BF=98=E5=8E=9F?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=20AZW=20ME=20Pro=20T-4=20=E6=80=AA=E7=99=96?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+该机型固件重复占用 AMDI0030:00 的 0 号引脚, 申请时返回 -EBUSY, 飞牛静默跳过不报错。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpio/gpiolib-acpi-core.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/gpio/gpiolib-acpi-core.c b/drivers/gpio/gpiolib-acpi-core.c
+index 8851e4866..5e3859d94 100644
+--- a/drivers/gpio/gpiolib-acpi-core.c
++++ b/drivers/gpio/gpiolib-acpi-core.c
+@@ -392,6 +392,13 @@ static acpi_status acpi_gpiochip_alloc_event(struct acpi_resource *ares,
+ 
+ 	desc = acpi_request_own_gpiod(chip, agpio, 0, "ACPI:Event");
+ 	if (IS_ERR(desc)) {
++		/* fnOS: AZW ME Pro T-4 firmware claims pin 0 twice, harmless */
++		if (PTR_ERR(desc) == -EBUSY && pin == 0 &&
++		    !strcmp(dev_name(chip->parent), "AMDI0030:00") &&
++		    dmi_match(DMI_SYS_VENDOR, "AZW") &&
++		    dmi_match(DMI_PRODUCT_NAME, "ME Pro T-4"))
++			return AE_OK;
++
+ 		dev_err(chip->parent,
+ 			"Failed to request GPIO for pin 0x%04X, err %pe\n",
+ 			pin, desc);

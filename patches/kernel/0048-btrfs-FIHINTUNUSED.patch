@@ -1,0 +1,574 @@
+From 952f0a68ce1340550fa7aca7f1449ce4aa66955e Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:01:50 +0700
+Subject: [PATCH 048/110] =?UTF-8?q?btrfs:=20FIHINTUNUSED=20=E6=9C=AA?=
+ =?UTF-8?q?=E7=94=A8=E7=A9=BA=E9=97=B4=E6=8F=90=E7=A4=BA=20(=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+按飞牛 btrfs.ko 反汇编还原:
+- ioctl.c: 新增 btrfs_ioctl_hint_unused (FIHINTUNUSED), 要求 CAP_SYS_ADMIN;
+  统计支持 unused hint 的设备 (blk_queue_unused_hint), 没有返回 -EOPNOTSUPP;
+  range.len 小于块大小返回 -EINVAL; 调 btrfs_trim_fs(.., TRIM_SEND_HINT),
+  成功后打印 "total send %llu bytes hints"; 不回写 range。FITRIM 传 TRIM_SEND_TRIM。
+- btrfs_issue_discard / do_discard_extent / btrfs_discard_extent / do_trimming /
+  trim_no_bitmap / trim_bitmaps / btrfs_trim_block_group / btrfs_trim_free_extents(_throttle) /
+  btrfs_trim_fs 加 enum trim_act 参数; HINT 时发 blkdev_hint_unused 而不是 discard。
+  其他调用者 (提交时 discard、重映射、relocation、异步 discard) 都传 TRIM_SEND_TRIM。
+- 设备未分配空间: HINT 模式用新的 extent 位 EXTENT_UNUSED_HINT (插在 EXTENT_NOWAIT 前,
+  名字取自飞牛 BTF) 记录已提示的范围, 设备做完后整段清掉。
+- btrfs_trim_fs: HINT 时先做设备未分配空间再做块组; 块组循环跳过 SYSTEM 块组
+  (FITRIM 也跳过, 飞牛二进制如此)。
+- btrfs_trim_free_extents_throttle 带上上游 7.1 的修复 (WRITEABLE / bdev 为空先判断),
+  飞牛二进制里有; 与私有改动同一函数, 先合 stable 修复再改。
+
+blkdev_hint_unused 的实现在块层那一步 (本树只有声明)。
+
+比对: btrfs_issue_discard、do_trimming、trim_no_bitmap、trim_bitmaps、
+btrfs_trim_block_group(_extents/_bitmaps)、btrfs_ioctl_fitrim 一致;
+btrfs_discard_extent、btrfs_trim_fs、btrfs_trim_free_extents、btrfs_ioctl_hint_unused
+调用/立即数/字符串集合与飞牛相同, 只差寄存器分配和块布局 (≈)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/extent-io-tree.h   |   5 ++
+ fs/btrfs/extent-tree.c      | 113 +++++++++++++++++++++++++++---------
+ fs/btrfs/extent-tree.h      |   6 +-
+ fs/btrfs/free-space-cache.c |  27 +++++----
+ fs/btrfs/free-space-cache.h |   3 +-
+ fs/btrfs/inode.c            |   2 +-
+ fs/btrfs/ioctl.c            |  43 +++++++++++++-
+ fs/btrfs/volumes.c          |   3 +-
+ 8 files changed, 155 insertions(+), 47 deletions(-)
+
+diff --git a/fs/btrfs/extent-io-tree.h b/fs/btrfs/extent-io-tree.h
+index 6f07b965e..19e500e1b 100644
+--- a/fs/btrfs/extent-io-tree.h
++++ b/fs/btrfs/extent-io-tree.h
+@@ -56,6 +56,11 @@ enum {
+ 	 * want the extent states to go away.
+ 	 */
+ 	ENUM_BIT(EXTENT_CLEAR_ALL_BITS),
++	/*
++	 * Device alloc_state only: range already sent as unused hint during the
++	 * current FIHINTUNUSED pass (cleared when the device is finished).
++	 */
++	ENUM_BIT(EXTENT_UNUSED_HINT),
+ 
+ 	/*
+ 	 * This must be last.
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 098e64106..f923ce379 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -1291,7 +1291,7 @@ static int remove_extent_backref(struct btrfs_trans_handle *trans,
+ }
+ 
+ static int btrfs_issue_discard(struct block_device *bdev, u64 start, u64 len,
+-			       u64 *discarded_bytes)
++			       u64 *discarded_bytes, enum trim_act act)
+ {
+ 	int j, ret = 0;
+ 	u64 bytes_left, end;
+@@ -1338,9 +1338,14 @@ static int btrfs_issue_discard(struct block_device *bdev, u64 start, u64 len,
+ 		}
+ 
+ 		if (size) {
+-			ret = blkdev_issue_discard(bdev, start >> SECTOR_SHIFT,
+-						   size >> SECTOR_SHIFT,
+-						   GFP_NOFS);
++			if (act == TRIM_SEND_HINT)
++				ret = blkdev_hint_unused(bdev, start >> SECTOR_SHIFT,
++							 size >> SECTOR_SHIFT,
++							 GFP_NOFS);
++			else
++				ret = blkdev_issue_discard(bdev, start >> SECTOR_SHIFT,
++							   size >> SECTOR_SHIFT,
++							   GFP_NOFS);
+ 			if (!ret)
+ 				*discarded_bytes += size;
+ 			else if (ret != -EOPNOTSUPP)
+@@ -1358,9 +1363,14 @@ static int btrfs_issue_discard(struct block_device *bdev, u64 start, u64 len,
+ 	while (bytes_left) {
+ 		u64 bytes_to_discard = min(BTRFS_MAX_DISCARD_CHUNK_SIZE, bytes_left);
+ 
+-		ret = blkdev_issue_discard(bdev, start >> SECTOR_SHIFT,
+-					   bytes_to_discard >> SECTOR_SHIFT,
+-					   GFP_NOFS);
++		if (act == TRIM_SEND_HINT)
++			ret = blkdev_hint_unused(bdev, start >> SECTOR_SHIFT,
++						 bytes_to_discard >> SECTOR_SHIFT,
++						 GFP_NOFS);
++		else
++			ret = blkdev_issue_discard(bdev, start >> SECTOR_SHIFT,
++						   bytes_to_discard >> SECTOR_SHIFT,
++						   GFP_NOFS);
+ 
+ 		if (ret) {
+ 			if (ret != -EOPNOTSUPP)
+@@ -1381,7 +1391,8 @@ static int btrfs_issue_discard(struct block_device *bdev, u64 start, u64 len,
+ 	return ret;
+ }
+ 
+-static int do_discard_extent(struct btrfs_discard_stripe *stripe, u64 *bytes)
++static int do_discard_extent(struct btrfs_discard_stripe *stripe, u64 *bytes,
++			     enum trim_act act)
+ {
+ 	struct btrfs_device *dev = stripe->dev;
+ 	struct btrfs_fs_info *fs_info = dev->fs_info;
+@@ -1409,8 +1420,10 @@ static int do_discard_extent(struct btrfs_discard_stripe *stripe, u64 *bytes)
+ 		ret = btrfs_reset_device_zone(dev_replace->tgtdev, phys, len,
+ 					      &discarded);
+ 		discarded += src_disc;
+-	} else if (bdev_max_discard_sectors(stripe->dev->bdev)) {
+-		ret = btrfs_issue_discard(dev->bdev, phys, len, &discarded);
++	} else if (bdev_max_discard_sectors(stripe->dev->bdev) ||
++		   (act == TRIM_SEND_HINT &&
++		    blk_queue_unused_hint(bdev_get_queue(stripe->dev->bdev)))) {
++		ret = btrfs_issue_discard(dev->bdev, phys, len, &discarded, act);
+ 	} else {
+ 		ret = 0;
+ 		*bytes = 0;
+@@ -1422,7 +1435,8 @@ static int do_discard_extent(struct btrfs_discard_stripe *stripe, u64 *bytes)
+ }
+ 
+ int btrfs_discard_extent(struct btrfs_fs_info *fs_info, u64 bytenr,
+-			 u64 num_bytes, u64 *actual_bytes, bool do_remap)
++			 u64 num_bytes, u64 *actual_bytes, bool do_remap,
++			 enum trim_act act)
+ {
+ 	int ret = 0;
+ 	u64 discarded_bytes = 0;
+@@ -1462,7 +1476,7 @@ int btrfs_discard_extent(struct btrfs_fs_info *fs_info, u64 bytenr,
+ 					&stripe->dev->dev_state))
+ 				continue;
+ 
+-			ret = do_discard_extent(stripe, &bytes);
++			ret = do_discard_extent(stripe, &bytes, act);
+ 			if (ret) {
+ 				/*
+ 				 * Keep going if discard is not supported by the
+@@ -2962,7 +2976,8 @@ void btrfs_handle_fully_remapped_bgs(struct btrfs_fs_info *fs_info)
+ 		list_del_init(&bg->bg_list);
+ 		spin_unlock(&fs_info->unused_bgs_lock);
+ 
+-		btrfs_discard_extent(fs_info, bg->start, bg->length, NULL, false);
++		btrfs_discard_extent(fs_info, bg->start, bg->length, NULL, false,
++				     TRIM_SEND_TRIM);
+ 
+ 		ret = btrfs_complete_bg_remapping(bg);
+ 		if (ret) {
+@@ -2996,7 +3011,8 @@ int btrfs_finish_extent_commit(struct btrfs_trans_handle *trans)
+ 
+ 		if (btrfs_test_opt(fs_info, DISCARD_SYNC)) {
+ 			ret = btrfs_discard_extent(fs_info, start,
+-						   end + 1 - start, NULL, true);
++						   end + 1 - start, NULL, true,
++						   TRIM_SEND_TRIM);
+ 			if (ret) {
+ 				btrfs_warn(fs_info,
+ 				"discard failed for extent [%llu, %llu]: errno=%d %s",
+@@ -3060,7 +3076,8 @@ int btrfs_finish_extent_commit(struct btrfs_trans_handle *trans)
+ 		ret = -EROFS;
+ 		if (!TRANS_ABORTED(trans))
+ 			ret = btrfs_discard_extent(fs_info, block_group->start,
+-						   block_group->length, NULL, true);
++						   block_group->length, NULL, true,
++						   TRIM_SEND_TRIM);
+ 
+ 		/*
+ 		 * Not strictly necessary to lock, as the block_group should be
+@@ -6608,21 +6625,33 @@ void btrfs_error_unpin_extent_range(struct btrfs_fs_info *fs_info, u64 start, u6
+  * held back allocations.
+  */
+ static int btrfs_trim_free_extents_throttle(struct btrfs_device *device,
+-					    u64 *trimmed, u64 pos, u64 *ret_next_pos)
++					    u64 *trimmed, u64 pos, u64 *ret_next_pos,
++					    enum trim_act act)
+ {
+ 	int ret;
+ 	u64 start = pos;
+ 	u64 trim_len = 0;
++	u32 done_bit = CHUNK_TRIMMED;
+ 
+ 	*trimmed = 0;
+ 
+-	/* Discard not supported = nothing to do. */
+-	if (!bdev_max_discard_sectors(device->bdev))
++	/*
++	 * The caller only filters out MISSING devices, but a device that was
++	 * missing at mount and later rescanned has MISSING cleared while bdev
++	 * is still NULL and WRITEABLE is still unset. Skip those here.
++	 */
++	if (!test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state) || !device->bdev)
+ 		return 0;
+ 
+-	/* Not writable = nothing to do. */
+-	if (!test_bit(BTRFS_DEV_STATE_WRITEABLE, &device->dev_state))
++	if (act == TRIM_SEND_HINT) {
++		/* Unused hint not supported = nothing to do. */
++		if (!blk_queue_unused_hint(bdev_get_queue(device->bdev)))
++			return 0;
++		done_bit = EXTENT_UNUSED_HINT;
++	} else if (!bdev_max_discard_sectors(device->bdev)) {
++		/* Discard not supported = nothing to do. */
+ 		return 0;
++	}
+ 
+ 	/* No free space = nothing to do. */
+ 	if (device->total_bytes <= device->bytes_used)
+@@ -6644,7 +6673,7 @@ static int btrfs_trim_free_extents_throttle(struct btrfs_device *device,
+ 		cur_start = start;
+ 		btrfs_find_first_clear_extent_bit(&device->alloc_state, start,
+ 						  &start, &end,
+-						  CHUNK_TRIMMED | CHUNK_ALLOCATED);
++						  done_bit | CHUNK_ALLOCATED);
+ 		start = max(start, cur_start);
+ 
+ 		/* Check if there are any CHUNK_* bits left */
+@@ -6681,10 +6710,10 @@ static int btrfs_trim_free_extents_throttle(struct btrfs_device *device,
+ 		}
+ 
+ 		ret = btrfs_issue_discard(device->bdev, start, len,
+-					  &bytes);
++					  &bytes, act);
+ 		if (!ret)
+ 			btrfs_set_extent_bit(&device->alloc_state, start,
+-					     start + bytes - 1, CHUNK_TRIMMED, NULL);
++					     start + bytes - 1, done_bit, NULL);
+ 		mutex_unlock(&fs_info->chunk_mutex);
+ 
+ 		if (ret)
+@@ -6711,7 +6740,8 @@ static int btrfs_trim_free_extents_throttle(struct btrfs_device *device,
+ }
+ 
+ static int btrfs_trim_free_extents(struct btrfs_fs_info *fs_info, u64 *trimmed,
+-				   u64 *dev_failed, int *dev_ret)
++				   u64 *dev_failed, int *dev_ret,
++				   enum trim_act act)
+ {
+ 	struct btrfs_device *dev;
+ 	struct btrfs_device *working_dev = NULL;
+@@ -6752,7 +6782,7 @@ static int btrfs_trim_free_extents(struct btrfs_fs_info *fs_info, u64 *trimmed,
+ 				continue;
+ 			if (dev == working_dev) {
+ 				ret = btrfs_trim_free_extents_throttle(working_dev,
+-						&group_trimmed, start, &next_pos);
++						&group_trimmed, start, &next_pos, act);
+ 				break;
+ 			}
+ 		}
+@@ -6766,6 +6796,14 @@ static int btrfs_trim_free_extents(struct btrfs_fs_info *fs_info, u64 *trimmed,
+ 			continue;
+ 		}
+ 
++		/* Device done: forget what was hinted so the next pass sends again. */
++		if (act == TRIM_SEND_HINT && dev == working_dev) {
++			mutex_lock(&fs_info->chunk_mutex);
++			btrfs_clear_extent_bit(&working_dev->alloc_state, 0, (u64)-1,
++					       EXTENT_UNUSED_HINT, NULL);
++			mutex_unlock(&fs_info->chunk_mutex);
++		}
++
+ 		/* User interrupted. */
+ 		if (ret == -ERESTARTSYS || ret == -EINTR) {
+ 			mutex_unlock(&fs_devices->device_list_mutex);
+@@ -6835,7 +6873,8 @@ static int btrfs_trim_free_extents(struct btrfs_fs_info *fs_info, u64 *trimmed,
+  * an error.  The return value will be the first error, or 0 if nothing bad
+  * happens.
+  */
+-int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range)
++int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range,
++		  enum trim_act act)
+ {
+ 	struct btrfs_block_group *cache = NULL;
+ 	u64 group_trimmed;
+@@ -6860,6 +6899,15 @@ int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range)
+ 	    check_add_overflow(range->start, range->len, &range_end))
+ 		return -EINVAL;
+ 
++	/* Unused hint: unallocated device space first, then block groups. */
++	if (act == TRIM_SEND_HINT) {
++		ret = btrfs_trim_free_extents(fs_info, &group_trimmed, &dev_failed,
++					      &dev_ret, act);
++		if (ret == -ERESTARTSYS || ret == -EINTR)
++			return ret;
++		trimmed += group_trimmed;
++	}
++
+ 	cache = btrfs_lookup_first_block_group(fs_info, range->start);
+ 	for (; cache; cache = btrfs_next_block_group(cache)) {
+ 		if (cache->start >= range_end) {
+@@ -6867,6 +6915,10 @@ int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range)
+ 			break;
+ 		}
+ 
++		/* Skip the system chunks. */
++		if (cache->flags & BTRFS_BLOCK_GROUP_SYSTEM)
++			continue;
++
+ 		start = max(range->start, cache->start);
+ 		end = min(range_end, btrfs_block_group_end(cache));
+ 
+@@ -6884,7 +6936,7 @@ int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range)
+ 						     &group_trimmed,
+ 						     start,
+ 						     end,
+-						     range->minlen);
++						     range->minlen, act);
+ 
+ 			trimmed += group_trimmed;
+ 			if (ret == -ERESTARTSYS || ret == -EINTR) {
+@@ -6908,8 +6960,11 @@ int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range)
+ 	if (ret == -ERESTARTSYS || ret == -EINTR)
+ 		return ret;
+ 
+-	ret = btrfs_trim_free_extents(fs_info, &group_trimmed, &dev_failed, &dev_ret);
+-	trimmed += group_trimmed;
++	if (act != TRIM_SEND_HINT) {
++		ret = btrfs_trim_free_extents(fs_info, &group_trimmed, &dev_failed,
++					      &dev_ret, TRIM_SEND_TRIM);
++		trimmed += group_trimmed;
++	}
+ 
+ 	if (dev_failed)
+ 		btrfs_warn(fs_info,
+diff --git a/fs/btrfs/extent-tree.h b/fs/btrfs/extent-tree.h
+index ff330d489..18f8f83f8 100644
+--- a/fs/btrfs/extent-tree.h
++++ b/fs/btrfs/extent-tree.h
+@@ -161,8 +161,10 @@ int btrfs_drop_subtree(struct btrfs_trans_handle *trans,
+ 			struct extent_buffer *parent);
+ void btrfs_error_unpin_extent_range(struct btrfs_fs_info *fs_info, u64 start, u64 end);
+ int btrfs_discard_extent(struct btrfs_fs_info *fs_info, u64 bytenr,
+-			 u64 num_bytes, u64 *actual_bytes, bool do_remap);
+-int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range);
++			 u64 num_bytes, u64 *actual_bytes, bool do_remap,
++			 enum trim_act act);
++int btrfs_trim_fs(struct btrfs_fs_info *fs_info, struct fstrim_range *range,
++		  enum trim_act act);
+ void btrfs_handle_fully_remapped_bgs(struct btrfs_fs_info *fs_info);
+ int btrfs_complete_bg_remapping(struct btrfs_block_group *bg);
+ 
+diff --git a/fs/btrfs/free-space-cache.c b/fs/btrfs/free-space-cache.c
+index ab22e4f9f..ba786e0df 100644
+--- a/fs/btrfs/free-space-cache.c
++++ b/fs/btrfs/free-space-cache.c
+@@ -3653,7 +3653,7 @@ static int do_trimming(struct btrfs_block_group *block_group,
+ 		       u64 *total_trimmed, u64 start, u64 bytes,
+ 		       u64 reserved_start, u64 reserved_bytes,
+ 		       enum btrfs_trim_state reserved_trim_state,
+-		       struct btrfs_trim_range *trim_entry)
++		       struct btrfs_trim_range *trim_entry, enum trim_act act)
+ {
+ 	struct btrfs_space_info *space_info = block_group->space_info;
+ 	struct btrfs_fs_info *fs_info = block_group->fs_info;
+@@ -3677,7 +3677,7 @@ static int do_trimming(struct btrfs_block_group *block_group,
+ 	}
+ 	spin_unlock(&space_info->lock);
+ 
+-	ret = btrfs_discard_extent(fs_info, start, bytes, &trimmed, false);
++	ret = btrfs_discard_extent(fs_info, start, bytes, &trimmed, false, act);
+ 	if (!ret) {
+ 		*total_trimmed += trimmed;
+ 		trim_state = BTRFS_TRIM_STATE_TRIMMED;
+@@ -3716,7 +3716,7 @@ static int do_trimming(struct btrfs_block_group *block_group,
+  */
+ static int trim_no_bitmap(struct btrfs_block_group *block_group,
+ 			  u64 *total_trimmed, u64 start, u64 end, u64 minlen,
+-			  bool async)
++			  bool async, enum trim_act act)
+ {
+ 	struct btrfs_discard_ctl *discard_ctl =
+ 					&block_group->fs_info->discard_ctl;
+@@ -3805,7 +3805,7 @@ static int trim_no_bitmap(struct btrfs_block_group *block_group,
+ 
+ 		ret = do_trimming(block_group, total_trimmed, start, bytes,
+ 				  extent_start, extent_bytes, extent_trim_state,
+-				  &trim_entry);
++				  &trim_entry, act);
+ 		if (ret) {
+ 			block_group->discard_cursor = start + bytes;
+ 			break;
+@@ -3866,7 +3866,8 @@ void btrfs_trim_fully_remapped_block_group(struct btrfs_block_group *bg)
+ 	    bytes >= (max_discard_size + BTRFS_ASYNC_DISCARD_MIN_FILTER))
+ 		bytes = max_discard_size;
+ 
+-	ret = btrfs_discard_extent(fs_info, bg->discard_cursor, bytes, &trimmed, false);
++	ret = btrfs_discard_extent(fs_info, bg->discard_cursor, bytes, &trimmed, false,
++				   TRIM_SEND_TRIM);
+ 	if (ret)
+ 		return;
+ 
+@@ -3926,7 +3927,7 @@ static void end_trimming_bitmap(struct btrfs_free_space_ctl *ctl,
+  */
+ static int trim_bitmaps(struct btrfs_block_group *block_group,
+ 			u64 *total_trimmed, u64 start, u64 end, u64 minlen,
+-			u64 maxlen, bool async)
++			u64 maxlen, bool async, enum trim_act act)
+ {
+ 	struct btrfs_discard_ctl *discard_ctl =
+ 					&block_group->fs_info->discard_ctl;
+@@ -4035,7 +4036,7 @@ static int trim_bitmaps(struct btrfs_block_group *block_group,
+ 		mutex_unlock(&ctl->cache_writeout_mutex);
+ 
+ 		ret = do_trimming(block_group, total_trimmed, start, bytes,
+-				  start, bytes, 0, &trim_entry);
++				  start, bytes, 0, &trim_entry, act);
+ 		if (ret) {
+ 			reset_trimming_bitmap(ctl, offset);
+ 			block_group->discard_cursor =
+@@ -4068,7 +4069,8 @@ static int trim_bitmaps(struct btrfs_block_group *block_group,
+ }
+ 
+ int btrfs_trim_block_group(struct btrfs_block_group *block_group,
+-			   u64 *trimmed, u64 start, u64 end, u64 minlen)
++			   u64 *trimmed, u64 start, u64 end, u64 minlen,
++			   enum trim_act act)
+ {
+ 	struct btrfs_free_space_ctl *ctl = block_group->free_space_ctl;
+ 	int ret;
+@@ -4086,11 +4088,11 @@ int btrfs_trim_block_group(struct btrfs_block_group *block_group,
+ 	btrfs_freeze_block_group(block_group);
+ 	spin_unlock(&block_group->lock);
+ 
+-	ret = trim_no_bitmap(block_group, trimmed, start, end, minlen, false);
++	ret = trim_no_bitmap(block_group, trimmed, start, end, minlen, false, act);
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = trim_bitmaps(block_group, trimmed, start, end, minlen, 0, false);
++	ret = trim_bitmaps(block_group, trimmed, start, end, minlen, 0, false, act);
+ 	div64_u64_rem(end, BITS_PER_BITMAP * ctl->unit, &rem);
+ 	/* If we ended in the middle of a bitmap, reset the trimming flag */
+ 	if (rem)
+@@ -4116,7 +4118,8 @@ int btrfs_trim_block_group_extents(struct btrfs_block_group *block_group,
+ 	btrfs_freeze_block_group(block_group);
+ 	spin_unlock(&block_group->lock);
+ 
+-	ret = trim_no_bitmap(block_group, trimmed, start, end, minlen, async);
++	ret = trim_no_bitmap(block_group, trimmed, start, end, minlen, async,
++			     TRIM_SEND_TRIM);
+ 	btrfs_unfreeze_block_group(block_group);
+ 
+ 	return ret;
+@@ -4139,7 +4142,7 @@ int btrfs_trim_block_group_bitmaps(struct btrfs_block_group *block_group,
+ 	spin_unlock(&block_group->lock);
+ 
+ 	ret = trim_bitmaps(block_group, trimmed, start, end, minlen, maxlen,
+-			   async);
++			   async, TRIM_SEND_TRIM);
+ 
+ 	btrfs_unfreeze_block_group(block_group);
+ 
+diff --git a/fs/btrfs/free-space-cache.h b/fs/btrfs/free-space-cache.h
+index 33fc3b245..6ddcae6d1 100644
+--- a/fs/btrfs/free-space-cache.h
++++ b/fs/btrfs/free-space-cache.h
+@@ -159,7 +159,8 @@ void btrfs_return_cluster_to_free_space(
+ 			       struct btrfs_block_group *block_group,
+ 			       struct btrfs_free_cluster *cluster);
+ int btrfs_trim_block_group(struct btrfs_block_group *block_group,
+-			   u64 *trimmed, u64 start, u64 end, u64 minlen);
++			   u64 *trimmed, u64 start, u64 end, u64 minlen,
++			   enum trim_act act);
+ int btrfs_trim_block_group_extents(struct btrfs_block_group *block_group,
+ 				   u64 *trimmed, u64 start, u64 end, u64 minlen,
+ 				   bool async);
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 549bff562..afa608a01 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -3417,7 +3417,7 @@ int btrfs_finish_one_ordered(struct btrfs_ordered_extent *ordered_extent)
+ 				btrfs_discard_extent(fs_info,
+ 						ordered_extent->disk_bytenr,
+ 						ordered_extent->disk_num_bytes,
+-						NULL, true);
++						NULL, true, TRIM_SEND_TRIM);
+ 			btrfs_free_reserved_extent(fs_info,
+ 					ordered_extent->disk_bytenr,
+ 					ordered_extent->disk_num_bytes, true);
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index dfd21a4fd..c622af49b 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -461,7 +461,7 @@ static noinline int btrfs_ioctl_fitrim(struct btrfs_fs_info *fs_info,
+ 		return -EINVAL;
+ 
+ 	range.minlen = max(range.minlen, minlen);
+-	ret = btrfs_trim_fs(fs_info, &range);
++	ret = btrfs_trim_fs(fs_info, &range, TRIM_SEND_TRIM);
+ 
+ 	if (copy_to_user(arg, &range, sizeof(range)))
+ 		return -EFAULT;
+@@ -2675,6 +2675,45 @@ static long btrfs_ioctl_rm_dev_v2(struct file *file, void __user *arg)
+ 	return ret;
+ }
+ 
++/*
++ * FIHINTUNUSED (fnOS): tell the block device which ranges are unused, the same
++ * walk as FITRIM but sending unused hints instead of discards.
++ */
++static noinline int btrfs_ioctl_hint_unused(struct file *file, void __user *arg)
++{
++	struct btrfs_fs_info *fs_info = inode_to_fs_info(file_inode(file));
++	struct btrfs_device *device;
++	struct fstrim_range range = { 0 };
++	u64 num_devices = 0;
++	int ret;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(device, &fs_info->fs_devices->devices,
++				dev_list) {
++		if (!device->bdev ||
++		    !blk_queue_unused_hint(bdev_get_queue(device->bdev)))
++			continue;
++		num_devices++;
++	}
++	rcu_read_unlock();
++
++	if (!num_devices)
++		return -EOPNOTSUPP;
++	if (copy_from_user(&range, arg, sizeof(range)))
++		return -EFAULT;
++	if (range.len < fs_info->sb->s_blocksize)
++		return -EINVAL;
++
++	ret = btrfs_trim_fs(fs_info, &range, TRIM_SEND_HINT);
++	if (!ret)
++		btrfs_info(fs_info, "total send %llu bytes hints", range.len);
++
++	return ret;
++}
++
+ static long btrfs_ioctl_rm_dev(struct file *file, void __user *arg)
+ {
+ 	BTRFS_DEV_LOOKUP_ARGS(args);
+@@ -5244,6 +5283,8 @@ long btrfs_ioctl(struct file *file, unsigned int
+ 		return btrfs_ioctl_set_fslabel(file, argp);
+ 	case FITRIM:
+ 		return btrfs_ioctl_fitrim(fs_info, argp);
++	case FIHINTUNUSED:
++		return btrfs_ioctl_hint_unused(file, argp);
+ 	case BTRFS_IOC_SNAP_CREATE:
+ 		return btrfs_ioctl_snap_create(file, argp, false);
+ 	case BTRFS_IOC_SNAP_CREATE_V2:
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 636c9695b..05f900bf3 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -3543,7 +3543,8 @@ static int btrfs_relocate_chunk_finish(struct btrfs_fs_info *fs_info,
+ 	 * filesystem's point of view.
+ 	 */
+ 	if (btrfs_is_zoned(fs_info)) {
+-		ret = btrfs_discard_extent(fs_info, bg->start, length, NULL, true);
++		ret = btrfs_discard_extent(fs_info, bg->start, length, NULL, true,
++					   TRIM_SEND_TRIM);
+ 		if (ret)
+ 			btrfs_info(fs_info, "failed to reset zone %llu after relocation",
+ 				   bg->start);

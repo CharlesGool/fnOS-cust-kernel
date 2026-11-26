@@ -1,0 +1,52 @@
+From f2ba5f4b2e7459bf77891cb726d09b1982894ea3 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:46:03 +0000
+Subject: [PATCH 076/110] =?UTF-8?q?md-bitmap.h:=20=E5=A3=B0=E6=98=8E=20md?=
+ =?UTF-8?q?=5Fllbitmap=5Fsync=5Fremaining=20/=20md=5Fllbitmap=5Fsync=5Ftar?=
+ =?UTF-8?q?get?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛 md-llbitmap.c 导出给 md.c 的两个全局函数(System.map 为 T, 原型取自飞牛 BTF):
+- sector_t md_llbitmap_sync_remaining(struct mddev *, sector_t resync, sector_t max_sectors)
+- int md_llbitmap_sync_target(struct mddev *, sector_t offset)
+未开 CONFIG_MD_LLBITMAP 时给内联桩(返回 max_sectors - resync / -1)。
+只加声明, 不改任何结构布局。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md-bitmap.h | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/drivers/md/md-bitmap.h b/drivers/md/md-bitmap.h
+index f3111f552..89fa2aa2e 100644
+--- a/drivers/md/md-bitmap.h
++++ b/drivers/md/md-bitmap.h
+@@ -209,6 +209,9 @@ static inline void md_bitmap_exit(void)
+ #ifdef CONFIG_MD_LLBITMAP
+ int md_llbitmap_init(void);
+ void md_llbitmap_exit(void);
++sector_t md_llbitmap_sync_remaining(struct mddev *mddev, sector_t resync,
++				    sector_t max_sectors);
++int md_llbitmap_sync_target(struct mddev *mddev, sector_t offset);
+ #else
+ static inline int md_llbitmap_init(void)
+ {
+@@ -217,6 +220,16 @@ static inline int md_llbitmap_init(void)
+ static inline void md_llbitmap_exit(void)
+ {
+ }
++static inline sector_t md_llbitmap_sync_remaining(struct mddev *mddev,
++						  sector_t resync,
++						  sector_t max_sectors)
++{
++	return max_sectors - resync;
++}
++static inline int md_llbitmap_sync_target(struct mddev *mddev, sector_t offset)
++{
++	return -1;
++}
+ #endif
+ 
+ #endif

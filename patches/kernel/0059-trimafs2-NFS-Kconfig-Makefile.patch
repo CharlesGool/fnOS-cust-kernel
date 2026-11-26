@@ -1,0 +1,557 @@
+From cd324f32e48b5e313463f2453eec31b807fc4bb5 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 05:56:39 +0000
+Subject: [PATCH 059/110] =?UTF-8?q?trimafs2:=20=E5=88=86=E6=94=AF=E7=AE=A1?=
+ =?UTF-8?q?=E7=90=86=E3=80=81NFS=20=E5=AF=BC=E5=87=BA,=20=E6=8E=A5?=
+ =?UTF-8?q?=E5=85=A5=20Kconfig/Makefile?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+分支(桥)用 xarray 按 branch_id 管理; NFS 文件句柄分上层内存对象
+(0xa1)和桥下对象(0xa2, 内嵌下层句柄)两种. CONFIG_TRIMAFS2_FS 放在
+overlayfs 之后, 与飞牛配置一致.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/Kconfig           |   1 +
+ fs/Makefile          |   1 +
+ fs/trimafs2/Kconfig  |  11 +
+ fs/trimafs2/Makefile |   8 +
+ fs/trimafs2/export.c | 470 +++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 491 insertions(+)
+ create mode 100644 fs/trimafs2/Kconfig
+ create mode 100644 fs/trimafs2/Makefile
+ create mode 100644 fs/trimafs2/export.c
+
+diff --git a/fs/Kconfig b/fs/Kconfig
+index 21dc5d64e..2af2b0f4a 100644
+--- a/fs/Kconfig
++++ b/fs/Kconfig
+@@ -139,6 +139,7 @@ source "fs/quota/Kconfig"
+ source "fs/autofs/Kconfig"
+ source "fs/fuse/Kconfig"
+ source "fs/overlayfs/Kconfig"
++source "fs/trimafs2/Kconfig"
+ 
+ menu "Caches"
+ 
+diff --git a/fs/Makefile b/fs/Makefile
+index 49f8aea1b..3458af51f 100644
+--- a/fs/Makefile
++++ b/fs/Makefile
+@@ -105,6 +105,7 @@ obj-$(CONFIG_AUTOFS_FS)		+= autofs/
+ obj-$(CONFIG_ADFS_FS)		+= adfs/
+ obj-$(CONFIG_FUSE_FS)		+= fuse/
+ obj-$(CONFIG_OVERLAY_FS)	+= overlayfs/
++obj-$(CONFIG_TRIMAFS2_FS)	+= trimafs2/
+ obj-$(CONFIG_ORANGEFS_FS)       += orangefs/
+ obj-$(CONFIG_UDF_FS)		+= udf/
+ obj-$(CONFIG_SUN_OPENPROMFS)	+= openpromfs/
+diff --git a/fs/trimafs2/Kconfig b/fs/trimafs2/Kconfig
+new file mode 100644
+index 000000000..e12ab73bb
+--- /dev/null
++++ b/fs/trimafs2/Kconfig
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config TRIMAFS2_FS
++	tristate "TRIM aggregate stacking filesystem"
++	depends on FS_TRIM_ACL && EXPORTFS
++	select FS_STACK
++	help
++	  飞牛 fnOS 的聚合堆叠文件系统(文件系统类型 "trimafs"). 上层是一棵
++	  内存目录树, root 用绝对路径 symlink 把下层目录挂成"桥", 桥下的
++	  对象全部转发到下层文件系统, 并支持 TRIM ACL 和 NFS 导出.
++
++	  不确定就选 N.
+diff --git a/fs/trimafs2/Makefile b/fs/trimafs2/Makefile
+new file mode 100644
+index 000000000..785ed175e
+--- /dev/null
++++ b/fs/trimafs2/Makefile
+@@ -0,0 +1,8 @@
++# SPDX-License-Identifier: GPL-2.0-only
++#
++# Makefile for the TRIM aggregate stacking filesystem.
++#
++
++obj-$(CONFIG_TRIMAFS2_FS) += trimafs2.o
++
++trimafs2-y := super.o dentry.o inode.o file.o export.o
+diff --git a/fs/trimafs2/export.c b/fs/trimafs2/export.c
+new file mode 100644
+index 000000000..e19196a14
+--- /dev/null
++++ b/fs/trimafs2/export.c
+@@ -0,0 +1,470 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * TRIM aggregate stacking filesystem: 分支(桥)管理与 NFS 导出
++ *
++ * 文件句柄两种:
++ *   0xa1 上层内存对象: {gen, object_id}
++ *   0xa2 桥下对象:     {gen, 下层 fh_type, 下层 fh_len, branch_id, 下层句柄}
++ */
++#include <linux/slab.h>
++#include <linux/cred.h>
++#include <linux/user_namespace.h>
++#include "internal.h"
++
++struct trimafs2_decode_ctx {
++	struct trimafs2_branch *branch;
++	struct dentry *lower_root;
++};
++
++static int trimafs2_lower_acceptable(void *data, struct dentry *dentry)
++{
++	struct trimafs2_decode_ctx *ctx = data;
++	struct path path, root;
++
++	if (!d_is_dir(dentry))
++		return 1;
++	if (dentry->d_flags & DCACHE_DISCONNECTED)
++		return 0;
++	if (d_unlinked(dentry))
++		return 0;
++
++	path.mnt = ctx->branch->lower_mnt;
++	path.dentry = dentry;
++	root.mnt = ctx->branch->lower_mnt;
++	root.dentry = ctx->lower_root;
++	return path_is_under(&path, &root);
++}
++
++/* 调用者持 xa_lock */
++static struct trimafs2_branch *trimafs2_branch_get_locked(struct trimafs2_fs_info *fsi,
++							  u64 branch_id,
++							  struct dentry **upper_dentry)
++{
++	struct trimafs2_branch *branch;
++
++	branch = xa_load(&fsi->branches, branch_id);
++	if (!branch || !refcount_inc_not_zero(&branch->refs))
++		return NULL;
++
++	if (upper_dentry) {
++		*upper_dentry = NULL;
++		if (branch->upper_dentry) {
++			spin_lock(&branch->upper_dentry->d_lock);
++			*upper_dentry = dget_dlock(branch->upper_dentry);
++			spin_unlock(&branch->upper_dentry->d_lock);
++		}
++		if (!*upper_dentry) {
++			refcount_dec(&branch->refs);
++			return NULL;
++		}
++	}
++	return branch;
++}
++
++static int trimafs2_encode_fh(struct inode *inode, u32 *fh, int *max_len,
++			      struct inode *parent)
++{
++	struct trimafs2_fs_info *fsi = TRIMAFS2_SB(inode->i_sb);
++	struct trimafs2_inode_info *ii = TRIMAFS2_I(inode);
++	union trimafs2_fid *fid = (union trimafs2_fid *)fh;
++	const struct export_operations *nop;
++	struct trimafs2_dentry_info *di;
++	struct path lower_path = {};
++	struct dentry *alias, *lower;
++	int len = *max_len;
++	int lower_len = 0;
++	u64 branch_id;
++	int type;
++
++	if (!ii->branch_id) {
++		/* 上层内存对象 */
++		if (WARN_ON_ONCE(!ii->internal_id))
++			return FILEID_INVALID;
++		if (len < TRIMAFS2_FID_ROOT_WORDS) {
++			*max_len = TRIMAFS2_FID_ROOT_WORDS;
++			return FILEID_INVALID;
++		}
++		memset(fh, 0, TRIMAFS2_FID_ROOT_WORDS * sizeof(u32));
++		fid->root.gen = fsi->fh_gen;
++		fid->root.object_id = ii->internal_id;
++		*max_len = TRIMAFS2_FID_ROOT_WORDS;
++		return TRIMAFS2_FILEID_ROOT;
++	}
++
++	alias = d_find_alias(inode);
++	if (!alias)
++		alias = d_find_any_alias(inode);
++	if (!alias)
++		return -ESTALE;
++	di = TRIMAFS2_D(alias);
++	if (!di || !di->lower_dentry || !di->branch) {
++		dput(alias);
++		return -ESTALE;
++	}
++	branch_id = di->branch->branch_id;
++	trimafs2_get_lower_path(alias, &lower_path);
++	dput(alias);
++
++	lower = lower_path.dentry;
++	type = -ESTALE;
++	if ((d_is_dir(lower) && (lower->d_flags & DCACHE_DISCONNECTED)) || !d_inode(lower) ||
++	    !trimafs2_inode_matches_lower(inode, branch_id, d_inode(lower)))
++		goto out;
++
++	/* 下层必须能按句柄找回对象(非目录还要能找父目录) */
++	type = -EOPNOTSUPP;
++	nop = d_inode(lower)->i_sb->s_export_op;
++	if (!nop || !nop->encode_fh || !nop->fh_to_dentry ||
++	    (!d_is_dir(lower) && !nop->fh_to_parent))
++		goto out;
++
++	if (len <= TRIMAFS2_FID_LOWER_HDR_WORDS) {
++		/* 空间不够: 只算需要的长度 */
++		u32 probe[TRIMAFS2_FID_LOWER_FH_WORDS] = {};
++
++		lower_len = TRIMAFS2_FID_LOWER_FH_WORDS;
++		type = exportfs_encode_fh(lower, (struct fid *)probe, &lower_len,
++					  EXPORT_FH_CONNECTABLE);
++		if (type < 0)
++			goto out;
++		if (lower_len > TRIMAFS2_FID_LOWER_FH_WORDS) {
++			type = -EOVERFLOW;
++			goto out;
++		}
++		*max_len = lower_len + TRIMAFS2_FID_LOWER_HDR_WORDS;
++		type = FILEID_INVALID;
++		goto out;
++	}
++
++	memset(fh, 0, TRIMAFS2_FID_LOWER_HDR_WORDS * sizeof(u32));
++	lower_len = min(len - TRIMAFS2_FID_LOWER_HDR_WORDS, TRIMAFS2_FID_LOWER_FH_WORDS);
++	type = exportfs_encode_fh(lower, (struct fid *)fid->lower.lower_fh, &lower_len,
++				  EXPORT_FH_CONNECTABLE);
++	if (type < 0)
++		goto out;
++	if (type == FILEID_INVALID) {
++		if (lower_len > TRIMAFS2_FID_LOWER_FH_WORDS) {
++			type = -EOVERFLOW;
++			goto out;
++		}
++		*max_len = lower_len + TRIMAFS2_FID_LOWER_HDR_WORDS;
++		goto out;
++	}
++	if (lower_len < 1 || lower_len > TRIMAFS2_FID_LOWER_FH_WORDS) {
++		type = FILEID_INVALID;
++		goto out;
++	}
++	if (len < lower_len + TRIMAFS2_FID_LOWER_HDR_WORDS) {
++		*max_len = lower_len + TRIMAFS2_FID_LOWER_HDR_WORDS;
++		type = FILEID_INVALID;
++		goto out;
++	}
++
++	fid->lower.gen = fsi->fh_gen;
++	fid->lower.fh_type = type;
++	fid->lower.fh_len = lower_len;
++	fid->lower.branch_id = branch_id;
++	*max_len = lower_len + TRIMAFS2_FID_LOWER_HDR_WORDS;
++	type = TRIMAFS2_FILEID_LOWER;
++out:
++	path_put(&lower_path);
++	return type;
++}
++
++void trimafs2_branch_put(struct trimafs2_branch *branch)
++{
++	if (branch && refcount_dec_and_test(&branch->refs)) {
++		mntput(branch->lower_mnt);
++		kfree(branch);
++	}
++}
++
++/* 下层 dentry → 上层 dentry: 目录沿路径逐级 lookup, 非目录建匿名 dentry */
++static struct dentry *trimafs2_map_lower_to_upper(struct trimafs2_branch *branch,
++						  struct dentry *upper_root,
++						  struct dentry *lower_root,
++						  struct dentry *lower)
++{
++	struct path path = { .mnt = branch->lower_mnt, .dentry = lower };
++	struct path root = { .mnt = branch->lower_mnt, .dentry = lower_root };
++	struct dentry **chain = NULL, **tmp;
++	struct dentry *d, *parent, *cur, *next;
++	int n = 0, cap = 0, i;
++
++	if (!d_is_dir(lower)) {
++		struct path lower_path = { .mnt = branch->lower_mnt, .dentry = lower };
++		struct dentry *dentry;
++		struct inode *inode;
++		int err;
++
++		inode = trimafs2_get_lower_inode(upper_root->d_sb, &lower_path, branch->branch_id);
++		if (IS_ERR(inode))
++			return ERR_CAST(inode);
++		dentry = d_alloc_anon(upper_root->d_sb);
++		if (!dentry) {
++			iput(inode);
++			return ERR_PTR(-ENOMEM);
++		}
++		err = trimafs2_set_lower(dentry, &lower_path, branch->branch_id);
++		if (err) {
++			dput(dentry);
++			iput(inode);
++			return ERR_PTR(err);
++		}
++		TRIMAFS2_D(dentry)->disconnected_nfs_path = trimafs2_is_nfs_path(upper_root);
++		dentry->d_flags |= DCACHE_DISCONNECTED;
++		d_instantiate(dentry, inode);
++		return dentry;
++	}
++
++	if (!path_is_under(&path, &root))
++		return ERR_PTR(-ESTALE);
++
++	/* 收集 lower 到 lower_root 之间的各级目录 */
++	d = dget(lower);
++	while (d != lower_root) {
++		if (IS_ROOT(d)) {
++			dput(d);
++			goto out_stale;
++		}
++		if (n == TRIMAFS2_MAX_DECODE_DEPTH) {
++			dput(d);
++			for (i = 0; i < n; i++)
++				dput(chain[i]);
++			kfree(chain);
++			return ERR_PTR(-E2BIG);
++		}
++		if (n == cap) {
++			cap = cap ? min(cap * 2, TRIMAFS2_MAX_DECODE_DEPTH) : 8;
++			tmp = krealloc(chain, cap * sizeof(*chain), GFP_KERNEL);
++			if (!tmp) {
++				dput(d);
++				for (i = 0; i < n; i++)
++					dput(chain[i]);
++				kfree(chain);
++				return ERR_PTR(-ENOMEM);
++			}
++			chain = tmp;
++		}
++		chain[n++] = d;
++		parent = dget_parent(d);
++		if (parent == d) {
++			dput(parent);
++			goto out_stale;
++		}
++		d = parent;
++	}
++	dput(d);
++
++	/* 倒过来, 从上层根往下逐级查找 */
++	for (i = 0; i < n / 2; i++) {
++		tmp = (struct dentry **)chain[i];
++		chain[i] = chain[n - 1 - i];
++		chain[n - 1 - i] = (struct dentry *)tmp;
++	}
++
++	cur = dget(upper_root);
++	for (i = 0; i < n; i++) {
++		struct trimafs2_dentry_info *di = TRIMAFS2_D(cur);
++		struct vfsmount *mnt = di && di->branch ? di->branch->lower_mnt : NULL;
++		struct name_snapshot name = {};
++
++		take_dentry_name_snapshot(&name, chain[i]);
++		next = lookup_noperm_unlocked(&name.name, cur);
++		release_dentry_name_snapshot(&name);
++		if (IS_ERR(next)) {
++			dput(cur);
++			cur = next;
++			break;
++		}
++		di = TRIMAFS2_D(next);
++		if (d_is_negative(next) || !di || !di->lower_dentry || !di->branch ||
++		    di->branch->branch_id != branch->branch_id || di->lower_dentry != chain[i] ||
++		    di->branch->lower_mnt != mnt) {
++			dput(next);
++			dput(cur);
++			cur = ERR_PTR(-ESTALE);
++			break;
++		}
++		dput(cur);
++		cur = next;
++	}
++	for (i = 0; i < n; i++)
++		dput(chain[i]);
++	kfree(chain);
++	return cur;
++
++out_stale:
++	for (i = 0; i < n; i++)
++		dput(chain[i]);
++	kfree(chain);
++	return ERR_PTR(-ESTALE);
++}
++
++static struct dentry *trimafs2_fh_to_dentry(struct super_block *sb, struct fid *fh,
++					    int fh_len, int fh_type)
++{
++	struct trimafs2_fs_info *fsi = TRIMAFS2_SB(sb);
++	union trimafs2_fid *fid = (union trimafs2_fid *)fh;
++	struct trimafs2_decode_ctx ctx = {};
++	struct path lower_root = {};
++	struct dentry *upper_root = NULL;
++	struct trimafs2_branch *branch;
++	struct dentry *lower, *ret;
++	int lower_len;
++
++	if (fh_type == TRIMAFS2_FILEID_ROOT) {
++		struct inode *inode;
++
++		if (fh_len < TRIMAFS2_FID_ROOT_WORDS || fid->root.gen != fsi->fh_gen)
++			return NULL;
++		inode = trimafs2_find_internal_inode(sb, fid->root.object_id);
++		if (!inode)
++			return NULL;
++		ret = d_find_alias(inode);
++		iput(inode);
++		return ret;
++	}
++	if (fh_type != TRIMAFS2_FILEID_LOWER)
++		return NULL;
++
++	if (fh_len < TRIMAFS2_FID_LOWER_HDR_WORDS || fid->lower.gen != fsi->fh_gen)
++		return NULL;
++	lower_len = fid->lower.fh_len;
++	if (lower_len < 1 || lower_len > TRIMAFS2_FID_LOWER_FH_WORDS ||
++	    lower_len + TRIMAFS2_FID_LOWER_HDR_WORDS > fh_len)
++		return NULL;
++
++	xa_lock(&fsi->branches);
++	branch = trimafs2_branch_get_locked(fsi, fid->lower.branch_id, &upper_root);
++	xa_unlock(&fsi->branches);
++	if (!branch)
++		return NULL;
++
++	ret = NULL;
++	if (!trimafs2_has_lower(upper_root))
++		goto out;
++	trimafs2_get_lower_path(upper_root, &lower_root);
++	if (lower_root.mnt != branch->lower_mnt || mnt_idmap(lower_root.mnt) != &nop_mnt_idmap)
++		goto out_path;
++
++	ctx.branch = branch;
++	ctx.lower_root = lower_root.dentry;
++	lower = exportfs_decode_fh(lower_root.mnt, (struct fid *)fid->lower.lower_fh,
++				   lower_len, fid->lower.fh_type,
++				   trimafs2_lower_acceptable, &ctx);
++	if (IS_ERR(lower)) {
++		ret = lower;
++		goto out_path;
++	}
++	if (!d_inode(lower) || d_is_negative(lower)) {
++		dput(lower);
++		goto out_path;
++	}
++	ret = trimafs2_map_lower_to_upper(branch, upper_root, lower_root.dentry, lower);
++	dput(lower);
++out_path:
++	path_put(&lower_root);
++out:
++	dput(upper_root);
++	trimafs2_branch_put(branch);
++	return ret;
++}
++
++int trimafs2_validate_lower_path(const struct path *lower_path)
++{
++	if (mnt_idmap(lower_path->mnt) != &nop_mnt_idmap ||
++	    !current_in_userns(lower_path->dentry->d_sb->s_user_ns))
++		return -EOPNOTSUPP;
++	return 0;
++}
++
++int trimafs2_validate_lower_runtime_path(const struct path *lower_path)
++{
++	if (mnt_idmap(lower_path->mnt) != &nop_mnt_idmap)
++		return -EOPNOTSUPP;
++	return 0;
++}
++
++struct trimafs2_branch *trimafs2_branch_get(struct super_block *sb, u64 branch_id)
++{
++	struct trimafs2_fs_info *fsi = TRIMAFS2_SB(sb);
++	struct trimafs2_branch *branch;
++
++	xa_lock(&fsi->branches);
++	branch = trimafs2_branch_get_locked(fsi, branch_id, NULL);
++	xa_unlock(&fsi->branches);
++	return branch;
++}
++
++int trimafs2_check_stack_depth(struct super_block *sb, const struct path *lower_path)
++{
++	struct super_block *lower_sb = lower_path->mnt->mnt_sb;
++
++	if (lower_sb == sb)
++		return -ELOOP;
++	if (lower_sb->s_stack_depth)
++		return -EOPNOTSUPP;
++	return 0;
++}
++
++int trimafs2_register_branch(struct dentry *upper_dentry, const struct path *lower_path,
++			     u64 branch_id)
++{
++	struct super_block *sb = upper_dentry->d_sb;
++	struct trimafs2_fs_info *fsi = TRIMAFS2_SB(sb);
++	struct trimafs2_branch *branch;
++	int err;
++
++	err = trimafs2_validate_lower_path(lower_path);
++	if (err)
++		return err;
++	err = trimafs2_check_stack_depth(sb, lower_path);
++	if (err)
++		return err;
++
++	branch = kzalloc(sizeof(*branch), GFP_KERNEL);
++	if (!branch)
++		return -ENOMEM;
++	refcount_set(&branch->refs, 1);
++	branch->sb = sb;
++	branch->branch_id = branch_id;
++	branch->upper_dentry = upper_dentry;
++	branch->lower_mnt = mntget(lower_path->mnt);
++
++	err = xa_insert(&fsi->branches, branch_id, branch, GFP_KERNEL);
++	if (err) {
++		trimafs2_branch_put(branch);
++		return err == -EBUSY ? -EEXIST : err;
++	}
++
++	spin_lock(&fsi->stack_depth_lock);
++	if (sb->s_stack_depth < 1)
++		sb->s_stack_depth = 1;
++	spin_unlock(&fsi->stack_depth_lock);
++	return 0;
++}
++
++void trimafs2_unregister_branch(struct super_block *sb, u64 branch_id)
++{
++	trimafs2_branch_put(xa_erase(&TRIMAFS2_SB(sb)->branches, branch_id));
++}
++
++void trimafs2_destroy_branches(struct super_block *sb)
++{
++	struct trimafs2_fs_info *fsi = TRIMAFS2_SB(sb);
++	struct trimafs2_branch *branch;
++	unsigned long index;
++
++	xa_for_each(&fsi->branches, index, branch) {
++		xa_erase(&fsi->branches, index);
++		trimafs2_branch_put(branch);
++	}
++	xa_destroy(&fsi->branches);
++}
++
++const struct export_operations trimafs2_export_ops = {
++	.encode_fh	= trimafs2_encode_fh,
++	.fh_to_dentry	= trimafs2_fh_to_dentry,
++	.flags		= EXPORT_OP_NOSUBTREECHK,
++};

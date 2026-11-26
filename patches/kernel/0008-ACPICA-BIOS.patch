@@ -1,0 +1,78 @@
+From afa7ad8a69fa0efb40f3063420deb0303b1bb2e2 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 10:13:08 +0700
+Subject: [PATCH 008/110] =?UTF-8?q?ACPICA:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=20BIOS=20=E5=91=BD=E5=90=8D=E7=A9=BA=E9=97=B4?=
+ =?UTF-8?q?=E6=8A=A5=E9=94=99=E7=99=BD=E5=90=8D=E5=8D=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛硬件已知无害的 BIOS 错误不打印:
+AE_NOT_FOUND: \\_SB.PCI0.GPPX / GPP6.WLAN / GPP2.RTL8
+AE_ALREADY_EXISTS: \\_SB.PCI0.GPP9._PRW
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/acpi/acpica/uterror.c | 34 +++++++++++++++++++++++++++++-----
+ 1 file changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/acpi/acpica/uterror.c b/drivers/acpi/acpica/uterror.c
+index 918aca7c4..0f29f1f4d 100644
+--- a/drivers/acpi/acpica/uterror.c
++++ b/drivers/acpi/acpica/uterror.c
+@@ -164,6 +164,25 @@ acpi_ut_predefined_bios_error(const char *module_name,
+  *
+  ******************************************************************************/
+ 
++/* Known harmless BIOS bugs on fnOS hardware */
++static bool
++acpi_ut_namespace_error_quiet(const char *full_path, acpi_status lookup_status)
++{
++	if (!full_path)
++		return false;
++
++	switch (lookup_status) {
++	case AE_NOT_FOUND:
++		return !strcmp(full_path, "\\_SB.PCI0.GPPX") ||
++		       !strcmp(full_path, "\\_SB.PCI0.GPP6.WLAN") ||
++		       !strcmp(full_path, "\\_SB.PCI0.GPP2.RTL8");
++	case AE_ALREADY_EXISTS:
++		return !strcmp(full_path, "\\_SB.PCI0.GPP9._PRW");
++	default:
++		return false;
++	}
++}
++
+ void
+ acpi_ut_prefixed_namespace_error(const char *module_name,
+ 				 u32 line_number,
+@@ -174,6 +193,16 @@ acpi_ut_prefixed_namespace_error(const char *module_name,
+ 	char *full_path;
+ 	const char *message;
+ 
++	/* Concatenate the prefix path and the internal path */
++
++	full_path =
++	    acpi_ns_build_prefixed_pathname(prefix_scope, internal_path);
++
++	if (acpi_ut_namespace_error_quiet(full_path, lookup_status)) {
++		ACPI_FREE(full_path);
++		return;
++	}
++
+ 	/*
+ 	 * Main cases:
+ 	 * 1) Object creation, object must not already exist
+@@ -199,11 +228,6 @@ acpi_ut_prefixed_namespace_error(const char *module_name,
+ 		break;
+ 	}
+ 
+-	/* Concatenate the prefix path and the internal path */
+-
+-	full_path =
+-	    acpi_ns_build_prefixed_pathname(prefix_scope, internal_path);
+-
+ 	acpi_os_printf("%s [%s], %s", message,
+ 		       full_path ? full_path : "Could not get pathname",
+ 		       acpi_format_exception(lookup_status));

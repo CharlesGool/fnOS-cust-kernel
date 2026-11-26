@@ -1,0 +1,46 @@
+From 5855b4578c398a0699e1c34e23b943007d5a7063 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:14:59 +0700
+Subject: [PATCH 051/110] =?UTF-8?q?x86/syscalls:=20=E8=BF=98=E5=8E=9F?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89=20recvfile=20=E7=B3=BB?=
+ =?UTF-8?q?=E7=BB=9F=E8=B0=83=E7=94=A8=E5=8F=B7=20802?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛在 x86_64 (ABI 64, x32 不提供) 和 i386 表里都把 802 号给了
+sys_recvfile, 中间 470..801 为空, 因此 NR_syscalls 变成 803
+(sys_call_table 803 项、x64_sys_call/ia32_sys_call 的 switch 有 0x322 分支)。
+
+原型、struct recvfile_io_stats (uapi/linux/fs.h)、file_operations.recvfile
+(位于 splice_read 与 splice_eof 之间) 和 generic_recvfile 声明已随
+15010b68d 的头文件一起进树, 这里只补系统调用表。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ arch/x86/entry/syscalls/syscall_32.tbl | 1 +
+ arch/x86/entry/syscalls/syscall_64.tbl | 5 +++++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/arch/x86/entry/syscalls/syscall_32.tbl b/arch/x86/entry/syscalls/syscall_32.tbl
+index 4877e16da..1e223220f 100644
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@ -475,3 +475,4 @@
+ 467	i386	open_tree_attr		sys_open_tree_attr
+ 468	i386	file_getattr		sys_file_getattr
+ 469	i386	file_setattr		sys_file_setattr
++802	i386	recvfile		sys_recvfile
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index ced2a1dee..f1edb6c21 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -439,3 +439,8 @@
+ 547	x32	pwritev2		compat_sys_pwritev64v2
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
++
++#
++# fnOS private: socket -> file zero-copy receive (for Samba)
++#
++802	64	recvfile		sys_recvfile

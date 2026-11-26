@@ -1,0 +1,170 @@
+From 5119e028fb6129a7e8bd8fd968411244ec365dee Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 11:56:48 +0700
+Subject: [PATCH 033/110] =?UTF-8?q?vfs:=20stat/remap=5Frange/notify/inode?=
+ =?UTF-8?q?=20=E7=9A=84=20trimacl=20=E9=92=A9=E5=AD=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- vfs_getattr_nosec: trimacl 文件系统取完属性后由 trim_to_mode 折算 mode
+  (飞牛在调 getattr 前判断, 两条路径各写一份, 照此还原)
+- may_dedupe_file: trimacl 走 trim_permission(MAY_WRITE)
+- inotify_find_inode / fanotify_find_path: trimacl 走 trim_permission(MAY_READ)
+- inode_init_always_gfp: i_trim_acl=ACL_NOT_CACHED, trim flags 清零/UNKNOWN
+- __destroy_inode: 释放缓存的 trim acl
+
+vmlinux fcmp: vfs_getattr_nosec、vfs_dedupe_file_range_one、inotify_find_inode、
+do_fanotify_mark、inode_init_always_gfp、__destroy_inode 全部一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/inode.c                         |  9 +++++++++
+ fs/notify/fanotify/fanotify_user.c |  6 +++++-
+ fs/notify/inotify/inotify_user.c   |  6 +++++-
+ fs/remap_range.c                   |  7 ++++++-
+ fs/stat.c                          | 16 ++++++++++++++++
+ 5 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/fs/inode.c b/fs/inode.c
+index b60111fad..dcbea1e87 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -26,6 +26,8 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/timestamp.h>
+ 
++#include <linux/trim_acl.h>
++#include <linux/trim_flags.h>
+ #include "internal.h"
+ 
+ /*
+@@ -293,6 +295,11 @@ int inode_init_always_gfp(struct super_block *sb, struct inode *inode, gfp_t gfp
+ 	inode->i_private = NULL;
+ 	inode->i_mapping = mapping;
+ 	INIT_HLIST_HEAD(&inode->i_dentry);	/* buggered by rcu freeing */
++	/* fnOS: trim acl 未缓存, trim flags 未读 */
++	inode->i_trim_acl = ACL_NOT_CACHED;
++	atomic64_set(&inode->i_trim_flags, 0);
++	inode->i_trim_flags_state = TRIM_INODE_FLAGS_UNKNOWN;
++	inode->i_trim_flags_generation = 0;
+ #ifdef CONFIG_FS_POSIX_ACL
+ 	inode->i_acl = inode->i_default_acl = ACL_NOT_CACHED;
+ #endif
+@@ -374,6 +381,8 @@ void __destroy_inode(struct inode *inode)
+ 		atomic_long_dec(&inode->i_sb->s_remove_count);
+ 	}
+ 
++	if (inode->i_trim_acl && !is_uncached_trim_acl(inode->i_trim_acl))
++		trim_acl_release(inode->i_trim_acl);
+ #ifdef CONFIG_FS_POSIX_ACL
+ 	if (inode->i_acl && !is_uncached_acl(inode->i_acl))
+ 		posix_acl_release(inode->i_acl);
+diff --git a/fs/notify/fanotify/fanotify_user.c b/fs/notify/fanotify/fanotify_user.c
+index 629407c3e..3756cef68 100644
+--- a/fs/notify/fanotify/fanotify_user.c
++++ b/fs/notify/fanotify/fanotify_user.c
+@@ -25,6 +25,7 @@
+ #include "../fsnotify.h"
+ #include "../fdinfo.h"
+ #include "fanotify.h"
++#include <linux/trim_acl.h>
+ 
+ #define FANOTIFY_DEFAULT_MAX_EVENTS	16384
+ #define FANOTIFY_OLD_DEFAULT_MAX_MARKS	8192
+@@ -2068,7 +2069,10 @@ static int do_fanotify_mark(int fanotify_fd, unsigned int flags, __u64 mask,
+ 	}
+ 
+ 	/* you can only watch an inode if you have read permissions on it */
+-	ret = path_permission(&path, MAY_READ);
++	if (IS_TRIMACL(path.dentry))
++		ret = trim_permission(mnt_idmap(path.mnt), path.dentry, MAY_READ);
++	else
++		ret = path_permission(&path, MAY_READ);
+ 	if (ret)
+ 		goto path_put_and_out;
+ 
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index 6eaf0d382..0e95463c8 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -33,6 +33,7 @@
+ #include <linux/security.h>
+ 
+ #include "inotify.h"
++#include <linux/trim_acl.h>
+ #include "../fdinfo.h"
+ 
+ #include <asm/ioctls.h>
+@@ -378,7 +379,10 @@ static int inotify_find_inode(const char __user *dirname, struct path *path,
+ 	if (error)
+ 		return error;
+ 	/* you can only watch an inode if you have read permissions on it */
+-	error = path_permission(path, MAY_READ);
++	if (IS_TRIMACL(path->dentry))
++		error = trim_permission(mnt_idmap(path->mnt), path->dentry, MAY_READ);
++	else
++		error = path_permission(path, MAY_READ);
+ 	if (error) {
+ 		path_put(path);
+ 		return error;
+diff --git a/fs/remap_range.c b/fs/remap_range.c
+index 26afbbbfb..520d25fd0 100644
+--- a/fs/remap_range.c
++++ b/fs/remap_range.c
+@@ -16,6 +16,7 @@
+ #include <linux/fs.h>
+ #include <linux/dax.h>
+ #include <linux/overflow.h>
++#include <linux/trim_acl.h>
+ #include "internal.h"
+ 
+ #include <linux/uaccess.h>
+@@ -424,8 +425,12 @@ static bool may_dedupe_file(struct file *file)
+ 		return true;
+ 	if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), current_fsuid()))
+ 		return true;
+-	if (!inode_permission(idmap, inode, MAY_WRITE))
++	if (IS_TRIMACL(file_dentry(file))) {
++		if (!trim_permission(idmap, file_dentry(file), MAY_WRITE))
++			return true;
++	} else if (!inode_permission(idmap, inode, MAY_WRITE)) {
+ 		return true;
++	}
+ 	return false;
+ }
+ 
+diff --git a/fs/stat.c b/fs/stat.c
+index 3bc049f0b..2cd87a7a2 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -21,6 +21,7 @@
+ #include <linux/iversion.h>
+ 
+ #include <linux/uaccess.h>
++#include <linux/trim_acl.h>
+ #include <asm/unistd.h>
+ 
+ #include <trace/events/timestamp.h>
+@@ -211,6 +212,21 @@ int vfs_getattr_nosec(const struct path *path, struct kstat *stat,
+ 				  STATX_ATTR_VERITY);
+ 
+ 	idmap = mnt_idmap(path->mnt);
++	if (IS_TRIMACL(path->dentry)) {
++		/* fnOS: trimacl 文件系统上 mode 由 trim acl 折算 */
++		if (inode->i_op->getattr) {
++			int ret;
++
++			ret = inode->i_op->getattr(idmap, path, stat, request_mask,
++					query_flags);
++			if (ret)
++				return ret;
++		} else {
++			generic_fillattr(idmap, request_mask, inode, stat);
++		}
++		return trim_to_mode(idmap, path->dentry, stat);
++	}
++
+ 	if (inode->i_op->getattr) {
+ 		int ret;
+ 

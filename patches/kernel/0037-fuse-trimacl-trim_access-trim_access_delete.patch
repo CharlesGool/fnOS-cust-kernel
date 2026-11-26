@@ -1,0 +1,141 @@
+From c6ba30f8ed14bec2d3f7935a984f0869dce019dd Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:35:12 +0700
+Subject: [PATCH 037/110] =?UTF-8?q?fuse:=20trimacl=20=E7=9A=84=20trim=5Fac?=
+ =?UTF-8?q?cess=20/=20trim=5Faccess=5Fdelete=20=E5=9B=9E=E8=B0=83=20(?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fuse_trim_access 是 fuse_permission 的复制: 属性刷新 (fuse_perm_getattr) 逻辑不变,
+default_permissions 时把 generic_permission 换成 trim_access(idmap, dentry, mask, ta);
+非 default_permissions 时照旧走 FUSE_ACCESS 请求。fuse_trim_access_delete 检查父目录的
+MAY_WRITE。挂在 fuse_dir_inode_operations 和 fuse_common_inode_operations 上。
+没有新的 FUSE 协议操作码或 INIT 标志 (fuse_send_init 的标志位与官方相同)。
+
+比对: fuse_trim_access、fuse_trim_access_delete、fuse_permission 一致;
+fs/fuse 其余 6 个不同的函数 (fuse_send_init、request_wait_answer、__fuse_simple_request、
+fuse_file_release、fuse_emit、fuse_copy_folio) 是飞牛挑的 stable 修复 (abort_on_kill 等), 不还原。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/fuse/dir.c | 84 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 84 insertions(+)
+
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 9e20bc9db..a0dfcc3d1 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -18,6 +18,7 @@
+ #include <linux/xattr.h>
+ #include <linux/iversion.h>
+ #include <linux/posix_acl.h>
++#include <linux/trimvfs.h>
+ #include <linux/security.h>
+ #include <linux/types.h>
+ #include <linux/kernel.h>
+@@ -1623,6 +1624,85 @@ static int fuse_permission(struct mnt_idmap *idmap,
+ 	return err;
+ }
+ 
++// shasure - trimacl -->
++/*
++ * fuse_permission() 的 trimacl 版本: 属性刷新逻辑相同, 只是把
++ * generic_permission() 换成 trim_access(), 由 VFS 的 trim_access 回调调用。
++ */
++static int fuse_trim_access(struct mnt_idmap *idmap, struct dentry *dentry,
++			    int mask, struct trim_access_t *ta)
++{
++	struct inode *inode = d_inode(dentry);
++	struct fuse_conn *fc = get_fuse_conn(inode);
++	bool refreshed = false;
++	int err = 0;
++
++	if (fuse_is_bad(inode))
++		return -EIO;
++
++	if (!fuse_allow_current_process(fc))
++		return -EACCES;
++
++	/*
++	 * If attributes are needed, refresh them before proceeding
++	 */
++	if (fc->default_permissions ||
++	    ((mask & MAY_EXEC) && S_ISREG(inode->i_mode))) {
++		struct fuse_inode *fi = get_fuse_inode(inode);
++		u32 perm_mask = STATX_MODE | STATX_UID | STATX_GID;
++
++		if (perm_mask & READ_ONCE(fi->inval_mask) ||
++		    time_before64(fi->i_time, get_jiffies_64())) {
++			refreshed = true;
++
++			err = fuse_perm_getattr(inode, mask);
++			if (err)
++				return err;
++		}
++	}
++
++	if (fc->default_permissions) {
++		err = trim_access(idmap, dentry, mask, ta);
++
++		if (err == -EACCES && !refreshed) {
++			err = fuse_perm_getattr(inode, mask);
++			if (!err)
++				err = trim_access(idmap, dentry, mask, ta);
++		}
++	} else if (mask & (MAY_ACCESS | MAY_CHDIR)) {
++		err = fuse_access(inode, mask);
++	} else if ((mask & MAY_EXEC) && S_ISREG(inode->i_mode)) {
++		if (!(inode->i_mode & S_IXUGO)) {
++			if (refreshed)
++				return -EACCES;
++
++			err = fuse_perm_getattr(inode, mask);
++			if (!err && !(inode->i_mode & S_IXUGO))
++				return -EACCES;
++		}
++	}
++	return err;
++}
++
++/* 删除权限: 看对父目录有没有写权限 */
++static int fuse_trim_access_delete(struct mnt_idmap *idmap, struct dentry *dentry,
++				   struct trim_access_t *ta)
++{
++	struct dentry *parent;
++	int err;
++
++	parent = dget_parent(dentry);
++	if (!parent)
++		return -ENOENT;
++	if (IS_ERR(parent))
++		return PTR_ERR(parent);
++
++	err = fuse_trim_access(idmap, parent, MAY_WRITE, ta);
++	dput(parent);
++	return err;
++}
++// <--
++
+ static int fuse_readlink_folio(struct inode *inode, struct folio *folio)
+ {
+ 	struct fuse_mount *fm = get_fuse_mount(inode);
+@@ -2231,6 +2311,8 @@ static const struct inode_operations fuse_dir_inode_operations = {
+ 	.set_acl	= fuse_set_acl,
+ 	.fileattr_get	= fuse_fileattr_get,
+ 	.fileattr_set	= fuse_fileattr_set,
++	.trim_access	= fuse_trim_access,
++	.trim_access_delete = fuse_trim_access_delete,
+ };
+ 
+ static const struct file_operations fuse_dir_operations = {
+@@ -2254,6 +2336,8 @@ static const struct inode_operations fuse_common_inode_operations = {
+ 	.set_acl	= fuse_set_acl,
+ 	.fileattr_get	= fuse_fileattr_get,
+ 	.fileattr_set	= fuse_fileattr_set,
++	.trim_access	= fuse_trim_access,
++	.trim_access_delete = fuse_trim_access_delete,
+ };
+ 
+ static const struct inode_operations fuse_symlink_inode_operations = {

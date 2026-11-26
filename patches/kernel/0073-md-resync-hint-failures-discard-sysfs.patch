@@ -1,0 +1,1177 @@
+From e50586893c4799b46048fbd3f27a3f69fac6a40d Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:41:58 +0000
+Subject: [PATCH 073/110] =?UTF-8?q?md:=20resync=20hint=E3=80=81failures?=
+ =?UTF-8?q?=E3=80=81=E5=BF=AB=E9=80=9F=20discard=E3=80=81=E6=96=B0=20sysfs?=
+ =?UTF-8?q?=20=E5=B1=9E=E6=80=A7(=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- 新文件 md-resync-hint.c: 按起点排序的 rbtree 区间集合(相邻/重叠合并, 上限 300000 个),
+  kmem_cache "md_resync_hint"。
+- md_submit_bio 收 REQ_OP_UNUSED_HINT: enable_fast_resync 且 hint >= 1MiB 且正在重建
+  (md_is_rebuilding)时, 记入 mddev->resync_rh_tree, 然后直接结束 bio。
+- md_speedup_resync / md_speedup_requested_resync(导出给 raid 模块 sync_request 用)。
+- 模块参数 enable_fast_resync(int, 0600, 默认 1)。
+- failures: md_report_failure / md_sync_error 记 MD_FAILURE_RESYNC, sysfs failures(写 0 清除)。
+- /proc/mdstat 与 sync_completed: 拆出 md_status_max_sectors / md_status_resync /
+  md_sync_finish_time_secs(剩余量由 md_llbitmap_sync_remaining 给出), 输出格式不变。
+- sysfs: md/sync_finish_time、hints、enable_requested_resync_hints、array_sectors、max_disks、
+  utime、ctime、events、failures; md_attr_groups 加 md_dfr_group(md/dfr/)。
+- 快速 discard: llbitmap + MD_FAST_DISCARD 时 md 直接按 pers->map_sector 给成员盘发
+  discard(raid456 为整条带 write zeroes), md_clone_bio 带 offset/sectors,
+  md_end_clone_io_result 把 discard 结果传给 bitmap end_discard, md_dfr_end_clone_io 钩子。
+- md_update_rdev_capabilities、md_mark_discard_unsupported。
+- md_write_start 等待条件改为 md_sb_pending()(DFR 期间不等超级块)。
+包含上游 137(start_time 清零)、140(空范围不记 bitmap)、142(prepare_range) 的对应部分。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/Makefile         |   2 +-
+ drivers/md/md-resync-hint.c | 104 +++++
+ drivers/md/md.c             | 796 ++++++++++++++++++++++++++++++++----
+ 3 files changed, 813 insertions(+), 89 deletions(-)
+ create mode 100644 drivers/md/md-resync-hint.c
+
+diff --git a/drivers/md/Makefile b/drivers/md/Makefile
+index c338cc6fb..d1dcabf94 100644
+--- a/drivers/md/Makefile
++++ b/drivers/md/Makefile
+@@ -27,7 +27,7 @@ dm-clone-y	+= dm-clone-target.o dm-clone-metadata.o
+ dm-verity-y	+= dm-verity-target.o
+ dm-zoned-y	+= dm-zoned-target.o dm-zoned-metadata.o dm-zoned-reclaim.o
+ 
+-md-mod-y	+= md.o
++md-mod-y	+= md.o md-resync-hint.o
+ md-mod-$(CONFIG_MD_BITMAP)	+= md-bitmap.o
+ md-mod-$(CONFIG_MD_LLBITMAP)	+= md-llbitmap.o
+ raid456-y	+= raid5.o raid5-cache.o raid5-ppl.o
+diff --git a/drivers/md/md-resync-hint.c b/drivers/md/md-resync-hint.c
+new file mode 100644
+index 000000000..415138296
+--- /dev/null
++++ b/drivers/md/md-resync-hint.c
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * fnnas: resync hints for md.
++ *
++ * A resync hint is a sector range [h_start, h_end) of the array.  Hints are
++ * kept in an interval-less rbtree sorted by h_start, overlapping or
++ * adjacent ranges are merged on insertion.
++ *  - mddev->resync_rh_tree: ranges reported as unused by the filesystem
++ *    (REQ_OP_UNUSED_HINT), resync can skip them.
++ *  - mddev->resync_sh_tree: ranges that resync skipped.
++ */
++#include <linux/slab.h>
++#include <linux/rbtree.h>
++#include "md.h"
++
++#define MD_RESYNC_HINT_MAX_COUNT	300000
++
++static struct kmem_cache *md_resync_hint_cache;
++
++int md_resync_hint_add(struct md_resync_hint_tree *tree, sector_t h_start,
++		       sector_t h_end, gfp_t gfp_mask)
++{
++	struct rb_node **link = &tree->root.rb_root.rb_node, *parent = NULL;
++	struct md_resync_hint *hint;
++	bool leftmost = true;
++
++	while (*link) {
++		parent = *link;
++		hint = rb_entry(parent, struct md_resync_hint, node);
++		if (h_start < hint->h_start) {
++			link = &parent->rb_left;
++		} else if (h_start <= hint->h_start || h_start <= hint->h_end) {
++			hint->h_end = max(hint->h_end, h_end);
++			return 0;
++		} else {
++			link = &parent->rb_right;
++			leftmost = false;
++		}
++	}
++
++	if (tree->count == tree->max_count)
++		return -ENOMEM;
++
++	hint = kmem_cache_zalloc(md_resync_hint_cache, gfp_mask);
++	if (!hint)
++		return -ENOMEM;
++
++	tree->count++;
++	hint->h_start = h_start;
++	hint->h_end = h_end;
++	rb_link_node(&hint->node, parent, link);
++	rb_insert_color_cached(&hint->node, &tree->root, leftmost);
++	return 0;
++}
++
++void md_resync_hint_remove(struct md_resync_hint_tree *tree,
++			   struct md_resync_hint *hint)
++{
++	rb_erase_cached(&hint->node, &tree->root);
++	tree->count--;
++}
++
++void md_resync_hint_free(struct md_resync_hint *hint)
++{
++	kmem_cache_free(md_resync_hint_cache, hint);
++}
++
++struct md_resync_hint *md_resync_hint_first(struct md_resync_hint_tree *tree)
++{
++	return rb_entry_safe(rb_first_cached(&tree->root),
++			     struct md_resync_hint, node);
++}
++
++void md_resync_hint_tree_init(struct md_resync_hint_tree *tree)
++{
++	tree->root = RB_ROOT_CACHED;
++	tree->count = 0;
++	tree->max_count = MD_RESYNC_HINT_MAX_COUNT;
++}
++
++void md_resync_hint_tree_clear(struct md_resync_hint_tree *tree)
++{
++	struct md_resync_hint *hint, *next;
++
++	rbtree_postorder_for_each_entry_safe(hint, next, &tree->root.rb_root,
++					     node)
++		md_resync_hint_free(hint);
++
++	tree->root = RB_ROOT_CACHED;
++	tree->count = 0;
++}
++
++int __init md_resync_hint_init(void)
++{
++	md_resync_hint_cache = kmem_cache_create("md_resync_hint",
++						 sizeof(struct md_resync_hint),
++						 0, 0, NULL);
++	return md_resync_hint_cache ? 0 : -ENOMEM;
++}
++
++void md_resync_hint_exit(void)
++{
++	kmem_cache_destroy(md_resync_hint_cache);
++}
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 25d33ab62..34f9baee7 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -101,6 +101,274 @@ static void mddev_detach(struct mddev *mddev);
+ static void export_rdev(struct md_rdev *rdev);
+ static void md_wakeup_thread_directly(struct md_thread __rcu **thread);
+ 
++/* fnnas: bios ending with this end_io are discards the member disk can't do */
++static void md_end_clone_discard_unsupported(struct bio *bio);
++
++void md_mark_discard_unsupported(struct bio *bio)
++{
++	bio->bi_end_io = md_end_clone_discard_unsupported;
++}
++EXPORT_SYMBOL_GPL(md_mark_discard_unsupported);
++
++/*
++ * fnnas: MD_HAS_WRITE_ZEROES is set if all working member disks unmap on
++ * write zeroes, MD_NO_DISCARD is set if none of them supports discard.
++ */
++void md_update_rdev_capabilities(struct mddev *mddev)
++{
++	struct md_rdev *rdev;
++	bool write_zeroes = true;
++	bool discard = false;
++
++	rdev_for_each(rdev, mddev) {
++		if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
++			continue;
++
++		write_zeroes &= bdev_write_zeroes_unmap_sectors(rdev->bdev) ==
++				UINT_MAX;
++		discard |= !!bdev_max_discard_sectors(rdev->bdev);
++	}
++
++	if (write_zeroes)
++		set_bit(MD_HAS_WRITE_ZEROES, &mddev->flags);
++	else
++		clear_bit(MD_HAS_WRITE_ZEROES, &mddev->flags);
++
++	if (discard)
++		clear_bit(MD_NO_DISCARD, &mddev->flags);
++	else
++		set_bit(MD_NO_DISCARD, &mddev->flags);
++}
++EXPORT_SYMBOL_GPL(md_update_rdev_capabilities);
++
++static sector_t md_status_max_sectors(struct mddev *mddev)
++{
++	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) ||
++	    test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
++		return mddev->resync_max_sectors;
++	else
++		return mddev->dev_sectors;
++}
++
++static sector_t md_status_resync(struct mddev *mddev, sector_t max_sectors)
++{
++	sector_t resync, res;
++
++	resync = mddev->curr_resync;
++	if (resync < MD_RESYNC_ACTIVE) {
++		if (test_bit(MD_RECOVERY_DONE, &mddev->recovery))
++			/* Still cleaning up */
++			resync = max_sectors;
++	} else if (resync > max_sectors) {
++		resync = max_sectors;
++	} else {
++		res = atomic_read(&mddev->recovery_active);
++		/*
++		 * Resync has started, but the subtraction has overflowed or
++		 * yielded one of the special values. Force it to active to
++		 * ensure the status reports an active resync.
++		 */
++		if (resync < res || resync - res < MD_RESYNC_ACTIVE)
++			resync = MD_RESYNC_ACTIVE;
++		else
++			resync -= res;
++	}
++
++	return resync;
++}
++
++/*
++ * fnnas: estimated seconds to finish the sync, the remaining sectors are
++ * reported by llbitmap if possible (only dirty bits need to be synced).
++ *
++ * dt: time from mark until now
++ * db: blocks written from mark until now
++ * rt: remaining time
++ *
++ * We scale the divisor (db) by 32 to avoid losing precision near the end of
++ * resync when the number of remaining sectors is close to 'db'.  We then
++ * divide rt by 32 after multiplying by db to compensate.  The '+1' avoids
++ * division by zero if db is very small.
++ */
++static sector_t md_sync_finish_time_secs(struct mddev *mddev, sector_t resync,
++					 sector_t max_sectors, long *speed)
++{
++	unsigned long dt, db = 0;
++	sector_t rt, curr_mark_cnt, resync_mark_cnt;
++	int recovery_active;
++
++	dt = ((jiffies - mddev->resync_mark) / HZ);
++	if (!dt) dt++;
++
++	curr_mark_cnt = mddev->curr_mark_cnt;
++	recovery_active = atomic_read(&mddev->recovery_active);
++	resync_mark_cnt = mddev->resync_mark_cnt;
++
++	if (curr_mark_cnt >= (recovery_active + resync_mark_cnt))
++		db = curr_mark_cnt - (recovery_active + resync_mark_cnt);
++
++	if (speed)
++		*speed = db/2/dt;
++
++	/* number of remaining sectors */
++	rt = md_llbitmap_sync_remaining(mddev, resync, max_sectors);
++	rt = div64_u64(rt, db/32+1);
++	rt *= dt;
++	rt >>= 5;
++
++	return rt;
++}
++
++/* fnnas: user requested resync (sync_action=repair) is running */
++static bool md_is_requested_resyncing(struct mddev *mddev)
++{
++	return test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
++	       !test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
++	       test_bit(MD_RECOVERY_SYNC, &mddev->recovery) &&
++	       test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) &&
++	       !test_bit(MD_RECOVERY_CHECK, &mddev->recovery);
++}
++
++/*
++ * fnnas: recovery of a member disk is running, and it's not a replacement,
++ * hence data that the filesystem doesn't use can be skipped.
++ */
++static bool md_is_rebuilding(struct mddev *mddev)
++{
++	struct md_rdev *rdev;
++	bool ret = false;
++
++	if (test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) &&
++	    !test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery) &&
++	    !test_bit(MD_RECOVERY_SYNC, &mddev->recovery))
++		ret = test_bit(MD_RECOVERY_RECOVER, &mddev->recovery);
++
++	rcu_read_lock();
++	rdev_for_each_rcu(rdev, mddev) {
++		if (rdev->raid_disk >= 0 &&
++		    test_bit(WantReplacement, &rdev->flags)) {
++			ret = false;
++			break;
++		}
++	}
++	rcu_read_unlock();
++
++	return ret;
++}
++
++/*
++ * fnnas: called by personality sync_request() while rebuilding, if the
++ * unused ranges reported by the filesystem (mddev->resync_rh_tree) cover
++ * @sector_nr, return the number of sectors that can be skipped.  Ranges
++ * that are synced instead are recorded in mddev->resync_sh_tree, so that the
++ * following requested resync only needs to sync the skipped ranges.
++ */
++sector_t md_speedup_resync(struct mddev *mddev, sector_t sector_nr)
++{
++	struct md_resync_hint *hint;
++	sector_t last, skipped;
++	sector_t h_start = 0, h_end = 0;
++	sector_t start = 0, end = 0;
++
++	if (WARN_ON(!mddev->pers))
++		return 0;
++
++	last = mddev->last_resync_start;
++	if (!md_is_rebuilding(mddev) ||
++	    !mddev->pers->align_chunk_addr_virt_to_dev)
++		return 0;
++
++	if (!mutex_trylock(&mddev->resync_rh_mutex))
++		return 0;
++
++	hint = md_resync_hint_first(&mddev->resync_rh_tree);
++	while (hint) {
++		mddev->pers->align_chunk_addr_virt_to_dev(mddev, hint->h_start,
++							  0, &start, NULL);
++		if (sector_nr < start)
++			break;
++
++		h_start = hint->h_start;
++		do {
++			h_end = max(h_end, hint->h_end);
++			md_resync_hint_remove(&mddev->resync_rh_tree, hint);
++			md_resync_hint_free(hint);
++			hint = md_resync_hint_first(&mddev->resync_rh_tree);
++		} while (hint && hint->h_start <= h_end);
++	}
++	mutex_unlock(&mddev->resync_rh_mutex);
++
++	mddev->pers->align_chunk_addr_virt_to_dev(mddev, h_start, h_end,
++						  &start, &end);
++	if (max(start, sector_nr) >= end)
++		return 0;
++
++	skipped = end - sector_nr;
++	mddev->resync_rh_skipped_sectors += skipped;
++	if (mddev->enable_requested_resync_hints && last < sector_nr) {
++		if (md_resync_hint_add(&mddev->resync_sh_tree, last, sector_nr,
++				       GFP_KERNEL))
++			pr_err("%s: failed to add requested resync hint\n",
++			       mdname(mddev));
++		mddev->last_resync_start = end;
++	}
++
++	return skipped;
++}
++EXPORT_SYMBOL(md_speedup_resync);
++
++/*
++ * fnnas: called by personality sync_request() while requested resync, ranges
++ * in mddev->resync_sh_tree are synced by previous rebuilding, skip them.
++ */
++sector_t md_speedup_requested_resync(struct mddev *mddev, sector_t sector_nr)
++{
++	struct md_resync_hint *hint;
++	sector_t h_end = 0;
++
++	if (WARN_ON(!mddev->pers))
++		return 0;
++
++	if (!md_is_requested_resyncing(mddev) ||
++	    !mddev->enable_requested_resync_hints ||
++	    mddev->resync_max_sectors != mddev->dev_sectors)
++		return 0;
++
++	hint = md_resync_hint_first(&mddev->resync_sh_tree);
++	if (!hint)
++		return 0;
++
++	while (hint && sector_nr >= hint->h_start) {
++		h_end = hint->h_end;
++		md_resync_hint_remove(&mddev->resync_sh_tree, hint);
++		md_resync_hint_free(hint);
++		hint = md_resync_hint_first(&mddev->resync_sh_tree);
++	}
++
++	if (sector_nr >= h_end)
++		return 0;
++
++	return h_end - sector_nr;
++}
++EXPORT_SYMBOL(md_speedup_requested_resync);
++
++bool md_sb_pending(struct mddev *mddev)
++{
++	return test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags) &&
++	       !md_dfr_started(mddev);
++}
++EXPORT_SYMBOL_GPL(md_sb_pending);
++
++void md_report_failure(struct mddev *mddev, enum md_failure failure)
++{
++	if (WARN_ON(failure >= NR_MD_FAILURES))
++		return;
++
++	set_bit(failure, &mddev->failures);
++	sysfs_notify_dirent_safe(mddev->sysfs_failures);
++}
++EXPORT_SYMBOL(md_report_failure);
++
+ /*
+  * Default number of read corrections we'll attempt on an rdev
+  * before ejecting it from the array. We divide the read error
+@@ -342,6 +610,10 @@ static int start_readonly;
+ static bool create_on_open = true;
+ static bool legacy_async_del_gendisk = true;
+ static bool check_new_feature = true;
++/* fnnas: skip unused (REQ_OP_UNUSED_HINT) ranges while rebuilding */
++static int enable_fast_resync = 1;
++/* fnnas: unused hints smaller than 1MiB are ignored */
++#define MD_RESYNC_HINT_MIN_SECTORS	2048
+ 
+ /*
+  * We have a system wide 'event count' that is incremented
+@@ -395,6 +667,96 @@ static bool is_suspended(struct mddev *mddev, struct bio *bio)
+ 	return true;
+ }
+ 
++static void md_clone_bio(struct mddev *mddev, struct bio **bio,
++			 sector_t offset, unsigned long sectors);
++static bool md_handle_discard_range(struct mddev *mddev, struct bio *bio,
++				    sector_t array_start, sector_t array_end,
++				    blk_opf_t opf);
++
++static inline bool md_level_is_raid456(int level)
++{
++	return level == 4 || level == 5 || level == 6;
++}
++
++/*
++ * fnnas: with llbitmap and MD_FAST_DISCARD, discard is not passed to the
++ * personality, md discards the member disks directly and llbitmap records
++ * the discarded ranges (no resync is needed for them).
++ */
++static inline bool md_can_fast_discard(struct mddev *mddev)
++{
++	return !mddev_is_dm(mddev) && mddev->pers &&
++	       mddev->pers->map_sector &&
++	       mddev->bitmap_id == ID_LLBITMAP &&
++	       test_bit(MD_FAST_DISCARD, &mddev->flags);
++}
++
++/* Return true if the discard bio is handled. */
++static bool md_fast_discard(struct mddev *mddev, struct bio *bio)
++{
++	sector_t start, end;
++	bool ret;
++
++	if ((bio->bi_opf & REQ_PREFLUSH) && md_flush_request(mddev, bio))
++		return true;
++
++	if (!bio_sectors(bio))
++		goto endio;
++
++	/* reshape is not supported */
++	if ((md_level_is_raid456(mddev->level) || mddev->level == 10) &&
++	    mddev->reshape_position != MaxSector)
++		goto endio;
++
++	md_write_start(mddev, bio);
++	if (md_level_is_raid456(mddev->level)) {
++		/*
++		 * Only full stripes can be discarded, and parity is kept
++		 * consistent by write zeroes to all member disks.
++		 */
++		unsigned int stripe_sectors =
++			bdev_get_queue(bio->bi_bdev)->limits.chunk_sectors;
++
++		if (WARN_ON(!stripe_sectors)) {
++			bio_io_error(bio);
++			goto end_write;
++		}
++
++		start = roundup(bio->bi_iter.bi_sector, stripe_sectors);
++		end = rounddown(bio_end_sector(bio), stripe_sectors);
++		if (start >= end) {
++			bio_endio(bio);
++			goto end_write;
++		}
++
++		if (!test_bit(MD_HAS_WRITE_ZEROES, &mddev->flags)) {
++			percpu_ref_get(&mddev->active_io);
++			md_clone_bio(mddev, &bio, start, end - start);
++			md_mark_discard_unsupported(bio);
++			bio->bi_status = BLK_STS_NOTSUPP;
++			bio_endio(bio);
++			goto end_write;
++		}
++
++		if (!md_handle_discard_range(mddev, bio, start, end,
++					     REQ_OP_WRITE_ZEROES))
++			bio_endio(bio);
++		goto end_write;
++	}
++
++	ret = md_handle_discard_range(mddev, bio, bio->bi_iter.bi_sector,
++				      bio_end_sector(bio), REQ_OP_DISCARD);
++	md_write_end(mddev);
++	return ret;
++
++end_write:
++	md_write_end(mddev);
++	return true;
++endio:
++	bio_endio(bio);
++	return true;
++}
++
+ bool md_handle_request(struct mddev *mddev, struct bio *bio)
+ {
+ check_suspended:
+@@ -430,6 +792,10 @@ bool md_handle_request(struct mddev *mddev, struct bio *bio)
+ 		percpu_ref_put(&mddev->active_io);
+ 		return true;
+ 	}
++	if (bio_op(bio) == REQ_OP_DISCARD && md_can_fast_discard(mddev) &&
++	    md_fast_discard(mddev, bio))
++		goto out;
++
+ 	if (!mddev->pers->make_request(mddev, bio)) {
+ 		percpu_ref_put(&mddev->active_io);
+ 		if (!mddev->gendisk && mddev->pers->prepare_suspend)
+@@ -437,6 +803,7 @@ bool md_handle_request(struct mddev *mddev, struct bio *bio)
+ 		goto check_suspended;
+ 	}
+ 
++out:
+ 	percpu_ref_put(&mddev->active_io);
+ 	return true;
+ }
+@@ -468,6 +835,38 @@ static void md_submit_bio(struct bio *bio)
+ 		return;
+ 	}
+ 
++	/*
++	 * fnnas: the filesystem reports that this range is unused, while a
++	 * member disk is rebuilding, remember it so that md_do_sync() can
++	 * skip it (see md_speedup_resync()).
++	 */
++	if (bio_op(bio) == REQ_OP_UNUSED_HINT) {
++		sector_t start = bio->bi_iter.bi_sector;
++		unsigned int nr = bio_sectors(bio);
++		sector_t dev_start = 0;
++
++		if (enable_fast_resync && nr >= MD_RESYNC_HINT_MIN_SECTORS &&
++		    md_is_rebuilding(mddev) &&
++		    mddev->pers->align_chunk_addr_virt_to_dev) {
++			sector_t end = start + nr;
++
++			mddev->pers->align_chunk_addr_virt_to_dev(mddev, end, 0,
++								  &dev_start,
++								  NULL);
++			if (dev_start >= mddev->curr_resync) {
++				mutex_lock(&mddev->resync_rh_mutex);
++				if (mddev->allow_fast_resync &&
++				    md_resync_hint_add(&mddev->resync_rh_tree,
++						       start, end, GFP_KERNEL))
++					pr_err("%s: failed to add hint.\n",
++					       mdname(mddev));
++				mutex_unlock(&mddev->resync_rh_mutex);
++			}
++		}
++		bio_endio(bio);
++		return;
++	}
++
+ 	/* bio could be mergeable after passing to underlayer */
+ 	bio->bi_opf &= ~REQ_NOMERGE;
+ 
+@@ -5498,6 +5897,55 @@ degraded_show(struct mddev *mddev, char *page)
+ }
+ static struct md_sysfs_entry md_degraded = __ATTR_RO(degraded);
+ 
++/* fnnas: number of hints in requested resync tree and skipped sync tree */
++static ssize_t
++hints_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "r %lu s %lu\n", mddev->resync_rh_tree.count,
++		       mddev->resync_sh_tree.count);
++}
++
++static struct md_sysfs_entry md_hints = __ATTR_RO(hints);
++
++static ssize_t
++enable_requested_resync_hints_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "%d\n", mddev->enable_requested_resync_hints);
++}
++
++static ssize_t
++enable_requested_resync_hints_store(struct mddev *mddev, const char *buf,
++				    size_t len)
++{
++	struct md_rdev *rdev;
++	bool enable = false;
++	int ret;
++
++	ret = kstrtobool(buf, &enable);
++	if (ret)
++		return ret;
++
++	if (mddev->sync_thread ||
++	    test_bit(MD_RECOVERY_RUNNING, &mddev->recovery))
++		return -EBUSY;
++
++	if (!enable) {
++		md_resync_hint_tree_clear(&mddev->resync_sh_tree);
++		rcu_read_lock();
++		rdev_for_each_rcu(rdev, mddev)
++			clear_bit(NonFullInsync, &rdev->flags);
++		rcu_read_unlock();
++	}
++
++	mddev->enable_requested_resync_hints = enable;
++	return len;
++}
++
++static struct md_sysfs_entry md_enable_requested_resync_hints =
++__ATTR(enable_requested_resync_hints, S_IRUGO|S_IWUSR,
++       enable_requested_resync_hints_show,
++       enable_requested_resync_hints_store);
++
+ static ssize_t
+ sync_force_parallel_show(struct mddev *mddev, char *page)
+ {
+@@ -5543,6 +5991,27 @@ sync_speed_show(struct mddev *mddev, char *page)
+ 
+ static struct md_sysfs_entry md_sync_speed = __ATTR_RO(sync_speed);
+ 
++static ssize_t
++sync_finish_time_show(struct mddev *mddev, char *page)
++{
++	sector_t max_sectors, resync;
++
++	if (!test_bit(MD_RECOVERY_RUNNING, &mddev->recovery) ||
++	    mddev->curr_resync == MD_RESYNC_YIELDED ||
++	    mddev->curr_resync == MD_RESYNC_DELAYED)
++		return sprintf(page, "0\n");
++
++	max_sectors = md_status_max_sectors(mddev);
++	resync = md_status_resync(mddev, max_sectors);
++	if (resync < MD_RESYNC_ACTIVE)
++		return sprintf(page, "0\n");
++
++	return sprintf(page, "%llu\n",
++		       md_sync_finish_time_secs(mddev, resync, max_sectors, NULL));
++}
++
++static struct md_sysfs_entry md_sync_finish_time = __ATTR_RO(sync_finish_time);
++
+ static ssize_t
+ sync_completed_show(struct mddev *mddev, char *page)
+ {
+@@ -5555,12 +6024,7 @@ sync_completed_show(struct mddev *mddev, char *page)
+ 	    mddev->curr_resync == MD_RESYNC_DELAYED)
+ 		return sprintf(page, "delayed\n");
+ 
+-	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) ||
+-	    test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
+-		max_sectors = mddev->resync_max_sectors;
+-	else
+-		max_sectors = mddev->dev_sectors;
+-
++	max_sectors = md_status_max_sectors(mddev);
+ 	resync = mddev->curr_resync_completed;
+ 	return sprintf(page, "%llu / %llu\n", resync, max_sectors);
+ }
+@@ -6079,6 +6543,88 @@ lbs_store(struct mddev *mddev, const char *buf, size_t len)
+ static struct md_sysfs_entry md_logical_block_size =
+ __ATTR(logical_block_size, 0644, lbs_show, lbs_store);
+ 
++static ssize_t
++array_sectors_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "%llu\n", (unsigned long long)mddev->array_sectors);
++}
++
++static struct md_sysfs_entry md_array_sectors =
++__ATTR(array_sectors, S_IRUGO|S_IWUSR, array_sectors_show, NULL);
++
++static ssize_t
++max_disks_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "%d\n", mddev->max_disks);
++}
++
++static struct md_sysfs_entry md_max_disks =
++__ATTR(max_disks, S_IRUGO|S_IWUSR, max_disks_show, NULL);
++
++static ssize_t
++utime_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "%lld\n", mddev->utime);
++}
++
++static struct md_sysfs_entry md_utime =
++__ATTR(utime, S_IRUGO|S_IWUSR, utime_show, NULL);
++
++static ssize_t
++ctime_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "%lld\n", mddev->ctime);
++}
++
++static struct md_sysfs_entry md_ctime =
++__ATTR(ctime, S_IRUGO|S_IWUSR, ctime_show, NULL);
++
++static ssize_t
++dev_events_show(struct mddev *mddev, char *page)
++{
++	return sprintf(page, "%llu\n", mddev->events);
++}
++
++static struct md_sysfs_entry md_events =
++__ATTR(events, S_IRUGO|S_IWUSR, dev_events_show, NULL);
++
++/* fnnas: failures(enum md_failure) happened, write 0 to clear */
++static ssize_t
++failures_show(struct mddev *mddev, char *page)
++{
++	ssize_t len = 0;
++
++	if (!mddev->failures)
++		return sprintf(page, "0\n");
++
++	if (test_bit(MD_FAILURE_RESYNC, &mddev->failures))
++		len += sprintf(page + len, "resync");
++
++	len += sprintf(page + len, "\n");
++	return len;
++}
++
++static ssize_t
++failures_store(struct mddev *mddev, const char *buf, size_t len)
++{
++	unsigned int n = 0;
++	int ret;
++
++	ret = kstrtouint(buf, 10, &n);
++	if (ret)
++		return ret;
++
++	if (n)
++		return -EINVAL;
++
++	mddev->failures = 0;
++	sysfs_notify_dirent_safe(mddev->sysfs_failures);
++	return len;
++}
++
++static struct md_sysfs_entry md_failures =
++__ATTR(failures, S_IRUGO|S_IWUSR, failures_show, failures_store);
++
+ static struct attribute *md_default_attrs[] = {
+ 	&md_level.attr,
+ 	&md_new_level.attr,
+@@ -6101,6 +6647,12 @@ static struct attribute *md_default_attrs[] = {
+ 	&md_fail_last_dev.attr,
+ 	&md_serialize_policy.attr,
+ 	&md_logical_block_size.attr,
++	&md_array_sectors.attr,
++	&md_max_disks.attr,
++	&md_utime.attr,
++	&md_ctime.attr,
++	&md_events.attr,
++	&md_failures.attr,
+ 	NULL,
+ };
+ 
+@@ -6116,6 +6668,7 @@ static struct attribute *md_redundancy_attrs[] = {
+ 	&md_sync_max.attr,
+ 	&md_sync_io_depth.attr,
+ 	&md_sync_speed.attr,
++	&md_sync_finish_time.attr,
+ 	&md_sync_force_parallel.attr,
+ 	&md_sync_completed.attr,
+ 	&md_min_sync.attr,
+@@ -6124,6 +6677,8 @@ static struct attribute *md_redundancy_attrs[] = {
+ 	&md_suspend_hi.attr,
+ 	&md_bitmap.attr,
+ 	&md_degraded.attr,
++	&md_hints.attr,
++	&md_enable_requested_resync_hints.attr,
+ 	NULL,
+ };
+ static const struct attribute_group md_redundancy_group = {
+@@ -6133,6 +6688,9 @@ static const struct attribute_group md_redundancy_group = {
+ 
+ static const struct attribute_group *md_attr_groups[] = {
+ 	&md_default_group,
++#ifdef CONFIG_MD_DEGRADATION_FREE_RECOVER
++	&md_dfr_group,
++#endif
+ 	NULL,
+ };
+ 
+@@ -8880,36 +9438,13 @@ static void status_personalities(struct seq_file *seq)
+ static int status_resync(struct seq_file *seq, struct mddev *mddev)
+ {
+ 	sector_t max_sectors, resync, res;
+-	unsigned long dt, db = 0;
+-	sector_t rt, curr_mark_cnt, resync_mark_cnt;
+-	int scale, recovery_active;
++	sector_t rt;
++	long speed;
++	int scale;
+ 	unsigned int per_milli;
+ 
+-	if (test_bit(MD_RECOVERY_SYNC, &mddev->recovery) ||
+-	    test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
+-		max_sectors = mddev->resync_max_sectors;
+-	else
+-		max_sectors = mddev->dev_sectors;
+-
+-	resync = mddev->curr_resync;
+-	if (resync < MD_RESYNC_ACTIVE) {
+-		if (test_bit(MD_RECOVERY_DONE, &mddev->recovery))
+-			/* Still cleaning up */
+-			resync = max_sectors;
+-	} else if (resync > max_sectors) {
+-		resync = max_sectors;
+-	} else {
+-		res = atomic_read(&mddev->recovery_active);
+-		/*
+-		 * Resync has started, but the subtraction has overflowed or
+-		 * yielded one of the special values. Force it to active to
+-		 * ensure the status reports an active resync.
+-		 */
+-		if (resync < res || resync - res < MD_RESYNC_ACTIVE)
+-			resync = MD_RESYNC_ACTIVE;
+-		else
+-			resync -= res;
+-	}
++	max_sectors = md_status_max_sectors(mddev);
++	resync = md_status_resync(mddev, max_sectors);
+ 
+ 	if (resync == MD_RESYNC_NONE) {
+ 		if (test_bit(MD_RESYNCING_REMOTE, &mddev->recovery)) {
+@@ -8976,42 +9511,12 @@ static int status_resync(struct seq_file *seq, struct mddev *mddev)
+ 		   (unsigned long long) resync/2,
+ 		   (unsigned long long) max_sectors/2);
+ 
+-	/*
+-	 * dt: time from mark until now
+-	 * db: blocks written from mark until now
+-	 * rt: remaining time
+-	 *
+-	 * rt is a sector_t, which is always 64bit now. We are keeping
+-	 * the original algorithm, but it is not really necessary.
+-	 *
+-	 * Original algorithm:
+-	 *   So we divide before multiply in case it is 32bit and close
+-	 *   to the limit.
+-	 *   We scale the divisor (db) by 32 to avoid losing precision
+-	 *   near the end of resync when the number of remaining sectors
+-	 *   is close to 'db'.
+-	 *   We then divide rt by 32 after multiplying by db to compensate.
+-	 *   The '+1' avoids division by zero if db is very small.
+-	 */
+-	dt = ((jiffies - mddev->resync_mark) / HZ);
+-	if (!dt) dt++;
+-
+-	curr_mark_cnt = mddev->curr_mark_cnt;
+-	recovery_active = atomic_read(&mddev->recovery_active);
+-	resync_mark_cnt = mddev->resync_mark_cnt;
+-
+-	if (curr_mark_cnt >= (recovery_active + resync_mark_cnt))
+-		db = curr_mark_cnt - (recovery_active + resync_mark_cnt);
+-
+-	rt = max_sectors - resync;    /* number of remaining sectors */
+-	rt = div64_u64(rt, db/32+1);
+-	rt *= dt;
+-	rt >>= 5;
++	rt = md_sync_finish_time_secs(mddev, resync, max_sectors, &speed);
+ 
+ 	seq_printf(seq, " finish=%lu.%lumin", (unsigned long)rt / 60,
+ 		   ((unsigned long)rt % 60)/6);
+ 
+-	seq_printf(seq, " speed=%ldK/sec", db/2/dt);
++	seq_printf(seq, " speed=%ldK/sec", speed);
+ 	return 1;
+ }
+ 
+@@ -9319,9 +9824,12 @@ EXPORT_SYMBOL(md_done_sync);
+ 
+ void md_sync_error(struct mddev *mddev)
+ {
++	if (mddev->last_sync_action == ACTION_RESYNC)
++		md_report_failure(mddev, MD_FAILURE_RESYNC);
++
+ 	// stop recovery, signal do_sync ....
+-	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 	set_bit(MD_RECOVERY_ERROR, &mddev->recovery);
++	set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+ 	md_wakeup_thread(mddev->thread);
+ }
+ EXPORT_SYMBOL(md_sync_error);
+@@ -9371,8 +9879,7 @@ void md_write_start(struct mddev *mddev, struct bio *bi)
+ 		sysfs_notify_dirent_safe(mddev->sysfs_state);
+ 	if (!test_bit(MD_HAS_SUPERBLOCK, &mddev->flags))
+ 		return;
+-	wait_event(mddev->sb_wait,
+-		   !test_bit(MD_SB_CHANGE_PENDING, &mddev->sb_flags));
++	wait_event(mddev->sb_wait, !md_sb_pending(mddev));
+ }
+ EXPORT_SYMBOL(md_write_start);
+ 
+@@ -9466,34 +9973,39 @@ struct bio *mddev_bio_split_at_reshape_offset(struct mddev *mddev,
+ }
+ EXPORT_SYMBOL_GPL(mddev_bio_split_at_reshape_offset);
+ 
++static void md_bitmap_prepare_range(struct mddev *mddev, sector_t *offset,
++				    unsigned long *sectors, bool discard)
++{
++	mddev->bitmap_ops->prepare_range(mddev, offset, sectors, discard);
++}
++
+ static void md_bitmap_start(struct mddev *mddev,
+ 			    struct md_io_clone *md_io_clone)
+ {
+-	md_bitmap_fn *fn = unlikely(md_io_clone->rw == STAT_DISCARD) ?
+-			   mddev->bitmap_ops->start_discard :
++	bool discard = md_io_clone->rw == STAT_DISCARD;
++	md_bitmap_fn *fn = discard ? mddev->bitmap_ops->start_discard :
+ 			   mddev->bitmap_ops->start_write;
+ 
+-	if (mddev->pers->bitmap_sector)
+-		mddev->pers->bitmap_sector(mddev, &md_io_clone->offset,
+-					   &md_io_clone->sectors);
+-
++	md_bitmap_prepare_range(mddev, &md_io_clone->offset,
++				&md_io_clone->sectors, discard);
+ 	if (!md_io_clone->sectors)
+ 		return;
+ 	fn(mddev, md_io_clone->offset, md_io_clone->sectors);
+ }
+ 
+-static void md_bitmap_end(struct mddev *mddev, struct md_io_clone *md_io_clone)
++static void md_bitmap_end(struct mddev *mddev, struct md_io_clone *md_io_clone,
++			  enum md_bitmap_discard_result result)
+ {
+ 	if (unlikely(md_io_clone->rw == STAT_DISCARD))
+ 		mddev->bitmap_ops->end_discard(mddev, md_io_clone->offset,
+-					       md_io_clone->sectors,
+-					       MD_BITMAP_DISCARD_SUCCESS);
++					       md_io_clone->sectors, result);
+ 	else
+ 		mddev->bitmap_ops->end_write(mddev, md_io_clone->offset,
+ 					     md_io_clone->sectors);
+ }
+ 
+-static void md_end_clone_io(struct bio *bio)
++static void md_end_clone_io_result(struct bio *bio,
++				   enum md_bitmap_discard_result result)
+ {
+ 	struct md_io_clone *md_io_clone = bio->bi_private;
+ 	struct bio *orig_bio = md_io_clone->orig_bio;
+@@ -9501,7 +10013,7 @@ static void md_end_clone_io(struct bio *bio)
+ 
+ 	if (bio_data_dir(orig_bio) == WRITE && md_io_clone->sectors &&
+ 	    md_bitmap_enabled(mddev, false))
+-		md_bitmap_end(mddev, md_io_clone);
++		md_bitmap_end(mddev, md_io_clone, result);
+ 
+ 	if (bio->bi_status && !orig_bio->bi_status)
+ 		orig_bio->bi_status = bio->bi_status;
+@@ -9509,12 +10021,26 @@ static void md_end_clone_io(struct bio *bio)
+ 	if (md_io_clone->start_time)
+ 		bio_end_io_acct(orig_bio, md_io_clone->start_time);
+ 
++	/* fnnas: bio to an offline rdev may be held by dfr and retried */
++	if (!md_dfr_end_clone_io(md_io_clone, bio))
++		bio_endio(orig_bio);
+ 	bio_put(bio);
+-	bio_endio(orig_bio);
+ 	percpu_ref_put(&mddev->active_io);
+ }
+ 
+-static void md_clone_bio(struct mddev *mddev, struct bio **bio)
++static void md_end_clone_io(struct bio *bio)
++{
++	md_end_clone_io_result(bio, bio->bi_status ? MD_BITMAP_DISCARD_FAILED :
++						     MD_BITMAP_DISCARD_SUCCESS);
++}
++
++static void md_end_clone_discard_unsupported(struct bio *bio)
++{
++	md_end_clone_io_result(bio, MD_BITMAP_DISCARD_UNSUPPORTED);
++}
++
++static void md_clone_bio(struct mddev *mddev, struct bio **bio,
++			 sector_t offset, unsigned long sectors)
+ {
+ 	struct block_device *bdev = (*bio)->bi_bdev;
+ 	struct md_io_clone *md_io_clone;
+@@ -9530,14 +10056,16 @@ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
+ 	else
+ 		md_io_clone->start_time = 0;
+ 
+-	if (bio_data_dir(*bio) == WRITE && bio_sectors(*bio) &&
++	if (bio_data_dir(*bio) == WRITE && sectors &&
+ 	    md_bitmap_enabled(mddev, false)) {
+-		md_io_clone->offset = (*bio)->bi_iter.bi_sector;
+-		md_io_clone->sectors = bio_sectors(*bio);
++		md_io_clone->offset = offset;
++		md_io_clone->sectors = sectors;
+ 		md_io_clone->rw = op_stat_group(bio_op(*bio));
+ 		md_bitmap_start(mddev, md_io_clone);
+ 	}
+ 
++	md_io_clone->dfr_bio = false;
++	md_io_clone->rdev = NULL;
+ 	clone->bi_end_io = md_end_clone_io;
+ 	clone->bi_private = md_io_clone;
+ 	*bio = clone;
+@@ -9545,8 +10073,11 @@ static void md_clone_bio(struct mddev *mddev, struct bio **bio)
+ 
+ void md_account_bio(struct mddev *mddev, struct bio **bio)
+ {
++	sector_t offset = (*bio)->bi_iter.bi_sector;
++	unsigned int sectors = bio_sectors(*bio);
++
+ 	percpu_ref_get(&mddev->active_io);
+-	md_clone_bio(mddev, bio);
++	md_clone_bio(mddev, bio, offset, sectors);
+ }
+ EXPORT_SYMBOL_GPL(md_account_bio);
+ 
+@@ -9556,8 +10087,9 @@ void md_free_cloned_bio(struct bio *bio)
+ 	struct bio *orig_bio = md_io_clone->orig_bio;
+ 	struct mddev *mddev = md_io_clone->mddev;
+ 
+-	if (bio_data_dir(orig_bio) == WRITE && md_bitmap_enabled(mddev, false))
+-		md_bitmap_end(mddev, md_io_clone);
++	if (bio_data_dir(orig_bio) == WRITE && md_io_clone->sectors &&
++	    md_bitmap_enabled(mddev, false))
++		md_bitmap_end(mddev, md_io_clone, MD_BITMAP_DISCARD_FAILED);
+ 
+ 	if (bio->bi_status && !orig_bio->bi_status)
+ 		orig_bio->bi_status = bio->bi_status;
+@@ -9570,6 +10102,93 @@ void md_free_cloned_bio(struct bio *bio)
+ }
+ EXPORT_SYMBOL_GPL(md_free_cloned_bio);
+ 
++/* fnnas: end_io of the discard bio to a member disk */
++static void md_end_discard_io(struct bio *bio)
++{
++	struct md_io_clone *md_io_clone = bio->bi_private;
++	struct bio *orig_bio = md_io_clone->orig_bio;
++
++	if (bio->bi_status && !orig_bio->bi_status)
++		orig_bio->bi_status = bio->bi_status;
++
++	rdev_dec_pending(md_io_clone->rdev, md_io_clone->mddev);
++	md_write_end(md_io_clone->mddev);
++	bio_put(bio);
++	bio_endio(orig_bio);
++}
++
++/*
++ * fnnas: discard (or write zeroes) the array range [array_start, array_end)
++ * on all working member disks directly, the range is converted by
++ * pers->map_sector(), and llbitmap tracks the discarded range.
++ *
++ * Return true if the bio is handled.
++ */
++static bool md_handle_discard_range(struct mddev *mddev, struct bio *bio,
++				    sector_t array_start, sector_t array_end,
++				    blk_opf_t opf)
++{
++	struct md_rdev *rdev;
++	bool submitted = false;
++
++	percpu_ref_get(&mddev->active_io);
++	md_clone_bio(mddev, &bio, array_start, array_end - array_start);
++
++	if (opf == REQ_OP_DISCARD && test_bit(MD_NO_DISCARD, &mddev->flags)) {
++		bio->bi_status = BLK_STS_NOTSUPP;
++		bio_endio(bio);
++		return true;
++	}
++
++	rdev_for_each(rdev, mddev) {
++		struct md_io_clone *md_io_clone;
++		struct bio *discard_bio;
++		sector_t dev_start, dev_end;
++
++		if (rdev->raid_disk < 0 || test_bit(Faulty, &rdev->flags))
++			continue;
++
++		dev_start = mddev->pers->map_sector(mddev, rdev, array_start);
++		dev_end = mddev->pers->map_sector(mddev, rdev, array_end);
++		if (dev_start >= dev_end || dev_end == MaxSector)
++			continue;
++
++		if (opf == REQ_OP_DISCARD &&
++		    !bdev_max_discard_sectors(rdev->bdev)) {
++			submitted = true;
++			continue;
++		}
++
++		discard_bio = bio_alloc_bioset(rdev->bdev, 0, opf, GFP_NOIO,
++					       &mddev->io_clone_set);
++		md_io_clone = container_of(discard_bio, struct md_io_clone,
++					   bio_clone);
++		md_io_clone->rdev = rdev;
++		md_io_clone->mddev = mddev;
++		md_io_clone->orig_bio = bio;
++		discard_bio->bi_private = md_io_clone;
++		discard_bio->bi_end_io = md_end_discard_io;
++		discard_bio->bi_iter.bi_sector = dev_start;
++		discard_bio->bi_iter.bi_size = (dev_end - dev_start) << 9;
++
++		atomic_inc(&rdev->nr_pending);
++		md_write_inc(mddev, discard_bio);
++		bio_inc_remaining(bio);
++		bio_clone_blkg_association(discard_bio, bio);
++		mddev_trace_remap(mddev, discard_bio, array_start);
++		submit_bio_noacct(discard_bio);
++		submitted = true;
++	}
++
++	if (submitted) {
++		bio_endio(bio);
++		return true;
++	}
++
++	md_free_cloned_bio(bio);
++	return false;
++}
++
+ /* md_allow_write(mddev)
+  * Calling this ensures that the array is marked 'active' so that writes
+  * may proceed without blocking.  It is important to call this before
+@@ -11135,6 +11754,7 @@ module_param_call(new_array, add_named_array, NULL, NULL, S_IWUSR);
+ module_param(create_on_open, bool, S_IRUSR|S_IWUSR);
+ module_param(legacy_async_del_gendisk, bool, 0600);
+ module_param(check_new_feature, bool, 0600);
++module_param(enable_fast_resync, int, 0600);
+ 
+ MODULE_LICENSE("GPL");
+ MODULE_DESCRIPTION("MD RAID framework");

@@ -1,0 +1,114 @@
+From 64a6a6209a0aea15a79fae538ff80f008d060ac7 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:38:16 +0700
+Subject: [PATCH 044/110] =?UTF-8?q?btrfs:=20=E9=A3=9E=E7=89=9B=E5=B8=A6?=
+ =?UTF-8?q?=E7=9A=84=203=20=E4=B8=AA=207.0.10=20stable=20=E4=BF=AE?=
+ =?UTF-8?q?=E5=A4=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+逐函数比对, 飞牛有 7.0.10 里的这 3 处, 没有同版本的 inode_need_compress/
+compress_file_range、relocation remap、btrfs_verify_dev_items 修复:
+- disk-io.c btrfs_destroy_marked_extents: 结束时 btrfs_extent_io_tree_release(dirty_pages)
+- transaction.c btrfs_write_and_wait_transaction: 相应去掉重复的 release
+- reflink.c clone_copy_inline_extent: 复制到 EOF 之后先更新 i_size, 避免 flushoncommit 死锁
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/disk-io.c     |  1 +
+ fs/btrfs/reflink.c     | 45 ++++++++++++++++++++++++++++++++++++++++++
+ fs/btrfs/transaction.c |  9 ++++-----
+ 3 files changed, 50 insertions(+), 5 deletions(-)
+
+diff --git a/fs/btrfs/disk-io.c b/fs/btrfs/disk-io.c
+index 1b0eb246b..37ca4ef87 100644
+--- a/fs/btrfs/disk-io.c
++++ b/fs/btrfs/disk-io.c
+@@ -4709,6 +4709,7 @@ static void btrfs_destroy_marked_extents(struct btrfs_fs_info *fs_info,
+ 			free_extent_buffer_stale(eb);
+ 		}
+ 	}
++	btrfs_extent_io_tree_release(dirty_pages);
+ }
+ 
+ static void btrfs_destroy_pinned_extent(struct btrfs_fs_info *fs_info,
+diff --git a/fs/btrfs/reflink.c b/fs/btrfs/reflink.c
+index 314cb95ba..55d8d238e 100644
+--- a/fs/btrfs/reflink.c
++++ b/fs/btrfs/reflink.c
+@@ -322,6 +322,51 @@ static int clone_copy_inline_extent(struct btrfs_inode *inode,
+ 
+ 	ret = copy_inline_to_page(inode, new_key->offset,
+ 				  inline_data, size, datal, comp_type);
++
++	/*
++	 * If we copied the inline extent data to a page/folio beyond the i_size
++	 * of the destination inode, then we need to increase the i_size before
++	 * we start a transaction to update the inode item. This is to prevent a
++	 * deadlock when the flushoncommit mount option is used, which happens
++	 * like this:
++	 *
++	 * 1) Task A clones an inline extent from inode X to an offset of inode
++	 *    Y that is beyond Y's current i_size. This means we copied the
++	 *    inline extent's data to a folio of inode Y that is beyond its EOF,
++	 *    using the call above to copy_inline_to_page();
++	 *
++	 * 2) Task B starts a transaction commit and calls
++	 *    btrfs_start_delalloc_flush() to flush delalloc;
++	 *
++	 * 3) The delalloc flushing sees the new dirty folio of inode Y and when
++	 *    it attempts to flush it, it ends up at extent_writepage() and sees
++	 *    that the offset of the folio is beyond the i_size of inode Y, so
++	 *    it attempts to invalidate the folio by calling folio_invalidate(),
++	 *    which ends up at btrfs' folio invalidate callback -
++	 *    btrfs_invalidate_folio(). There it tries to lock the folio's range
++	 *    in inode Y's extent io tree, but it blocks since it's currently
++	 *    locked by task A - during reflink we lock the inodes and the
++	 *    source and destination ranges after flushing all delalloc and
++	 *    waiting for ordered extent completion - after that we don't expect
++	 *    to have dirty folios in the ranges, the exception is if we have to
++	 *    copy an inline extent's data (because the destination offset is
++	 *    not zero);
++	 *
++	 * 4) Task A then does the 'goto out' below and attempts to start a
++	 *    transaction to update the inode item, and then it's blocked since
++	 *    the current transaction is in the TRANS_STATE_COMMIT_START state.
++	 *    Therefore task A has to wait for the current transaction to become
++	 *    unblocked (its state >= TRANS_STATE_UNBLOCKED).
++	 *
++	 * This leads to a deadlock - the task committing the transaction
++	 * waiting for the delalloc flushing which is blocked during folio
++	 * invalidation on the inode's extent lock and the reflink task waiting
++	 * for the current transaction to be unblocked so that it can start a
++	 * a new one to update the inode item (while holding the extent lock).
++	 */
++	if (ret == 0 && new_key->offset + datal > i_size_read(&inode->vfs_inode))
++		i_size_write(&inode->vfs_inode, new_key->offset + datal);
++
+ 	goto out;
+ }
+ 
+diff --git a/fs/btrfs/transaction.c b/fs/btrfs/transaction.c
+index 8dd77c431..ec3c15fc7 100644
+--- a/fs/btrfs/transaction.c
++++ b/fs/btrfs/transaction.c
+@@ -1275,14 +1275,13 @@ static int btrfs_write_and_wait_transaction(struct btrfs_trans_handle *trans)
+ 	blk_finish_plug(&plug);
+ 	ret2 = btrfs_wait_extents(fs_info, dirty_pages);
+ 
+-	btrfs_extent_io_tree_release(&trans->transaction->dirty_pages);
+-
+ 	if (ret)
+ 		return ret;
+-	else if (ret2)
++	if (ret2)
+ 		return ret2;
+-	else
+-		return 0;
++
++	btrfs_extent_io_tree_release(&trans->transaction->dirty_pages);
++	return 0;
+ }
+ 
+ /*

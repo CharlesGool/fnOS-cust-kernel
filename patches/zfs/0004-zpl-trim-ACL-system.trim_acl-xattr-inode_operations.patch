@@ -1,0 +1,325 @@
+From 07c91975b19b2f13abb5a015d2c6c27e030e48ec Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 13:08:00 +0700
+Subject: [PATCH 4/8] =?UTF-8?q?zpl:=20trim=20ACL=20=E5=AD=98=E5=8F=96(syst?=
+ =?UTF-8?q?em.trim=5Facl=20xattr=20+=20inode=5Foperations=20=E5=9B=9E?=
+ =?UTF-8?q?=E8=B0=83)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+飞牛内核(include/linux/trim_acl.h, fs/trim_acl.c)给 inode_operations
+加了 get_trim_acl/set_trim_acl, 这里由 ZFS 实现:
+
+- zpl_xattr.c: trim ACL 以 trim_acl_to_disk() 的格式存在
+  "system.trim_acl" xattr 里(走 zpl_xattr_get/zpl_xattr_set, 所以
+  dir/SA 两种 xattr 存储都可以), 读出后 set_cached_trim_acl() 缓存
+  到 inode。新增 zfs_get_trim_acl/zfs_set_trim_acl(全局, 给 inode
+  回调用)和 xattr handler zfs_xattr_trimacl_access_handler
+  (get/set, 没有 list, zpl_xattr_handler() 按全名匹配)。
+  trim_nop_mnt_idmap 是飞牛二进制里存在但没人引用的全局变量, 照留。
+- zpl.h: 引入 linux/trim_acl.h 并声明上面几个符号。
+- zpl_inode.c: 普通文件/目录/特殊文件的 inode_operations 挂上
+  get_trim_acl/set_trim_acl(符号链接没有); zpl_setattr 改 mode 时,
+  trimacl 数据集(IS_TRIMACL)调用内核 trim_acl_chmod() 而不是
+  zpl_chmod_acl()。
+- zfs_znode_os.c: zfs_rezget() 里在上游清 POSIX ACL 缓存(上一个
+  提交 b00191f3fa)之后再清 trim ACL 缓存。上游修复在同一函数,
+  所以先单独打了上游提交。
+
+行号(VERIFY/kmem_alloc 的 __LINE__)按飞牛 zfs.ko 对齐。
+来源: 飞牛私有改动。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/os/linux/zfs/sys/zpl.h     |   7 ++
+ module/os/linux/zfs/zfs_znode_os.c |   6 ++
+ module/os/linux/zfs/zpl_inode.c    |  20 +++-
+ module/os/linux/zfs/zpl_xattr.c    | 155 +++++++++++++++++++++++++++++
+ 4 files changed, 186 insertions(+), 2 deletions(-)
+
+diff --git a/include/os/linux/zfs/sys/zpl.h b/include/os/linux/zfs/sys/zpl.h
+index 8994aab..5f7b809 100644
+--- a/include/os/linux/zfs/sys/zpl.h
++++ b/include/os/linux/zfs/sys/zpl.h
+@@ -102,6 +102,13 @@ zpl_chmod_acl(struct inode *ip)
+ 
+ extern xattr_handler_t *zpl_xattr_handlers[];
+ 
++/* fnOS: trim ACL (zpl_xattr.c) */
++#include <linux/trim_acl.h>
++extern struct xattr_handler zfs_xattr_trimacl_access_handler;
++extern struct trim_acl *zfs_get_trim_acl(struct mnt_idmap *, struct inode *);
++extern int zfs_set_trim_acl(struct mnt_idmap *, struct inode *,
++    struct trim_acl *);
++
+ /* zpl_ctldir.c */
+ extern const struct file_operations zpl_fops_root;
+ extern const struct inode_operations zpl_ops_root;
+diff --git a/module/os/linux/zfs/zfs_znode_os.c b/module/os/linux/zfs/zfs_znode_os.c
+index dd6bd21..7b4f54c 100644
+--- a/module/os/linux/zfs/zfs_znode_os.c
++++ b/module/os/linux/zfs/zfs_znode_os.c
+@@ -64,6 +64,9 @@
+ #include <linux/posix_acl.h>
+ #endif
+ 
++/* fnOS: trim ACL */
++#include <linux/trim_acl.h>
++
+ #include "zfs_prop.h"
+ #include "zfs_comutil.h"
+ 
+@@ -1203,6 +1206,9 @@ zfs_rezget(znode_t *zp)
+ 	forget_cached_acl(ZTOI(zp), ACL_TYPE_DEFAULT);
+ #endif
+ 
++	/* fnOS: the cached trim ACL can be stale as well. */
++	forget_cached_trim_acl(ZTOI(zp));
++
+ 	rw_enter(&zp->z_xattr_lock, RW_WRITER);
+ 	if (zp->z_xattr_cached) {
+ 		nvlist_free(zp->z_xattr_cached);
+diff --git a/module/os/linux/zfs/zpl_inode.c b/module/os/linux/zfs/zpl_inode.c
+index e4e15c8..9aa51ae 100644
+--- a/module/os/linux/zfs/zpl_inode.c
++++ b/module/os/linux/zfs/zpl_inode.c
+@@ -630,8 +630,18 @@ zpl_setattr(struct dentry *dentry, struct iattr *ia)
+ #else
+ 	error = -zfs_setattr(ITOZ(ip), vap, 0, cr, zfs_init_idmap);
+ #endif
+-	if (!error && (ia->ia_valid & ATTR_MODE))
+-		error = zpl_chmod_acl(ip);
++	if (!error && (ia->ia_valid & ATTR_MODE)) {
++		/*
++		 * fnOS: on trimacl datasets chmod rewrites the trim ACL
++		 * instead of the POSIX ACL (trim_acl_chmod() is in the
++		 * kernel, fs/trim_acl.c).
++		 */
++		if (IS_TRIMACL(dentry)) {
++			error = trim_acl_chmod(user_ns, dentry, ip->i_mode);
++		} else {
++			error = zpl_chmod_acl(ip);
++		}
++	}
+ 
+ 	spl_fstrans_unmark(cookie);
+ 	kmem_free(vap, sizeof (vattr_t));
+@@ -850,6 +860,8 @@ const struct inode_operations zpl_inode_operations = {
+ 	.get_acl	= zpl_get_acl,
+ #endif /* HAVE_GET_INODE_ACL */
+ #endif /* CONFIG_FS_POSIX_ACL */
++	.get_trim_acl	= zfs_get_trim_acl,
++	.set_trim_acl	= zfs_set_trim_acl,
+ };
+ 
+ const struct inode_operations zpl_dir_inode_operations = {
+@@ -880,6 +892,8 @@ const struct inode_operations zpl_dir_inode_operations = {
+ 	.get_acl	= zpl_get_acl,
+ #endif /* HAVE_GET_INODE_ACL */
+ #endif /* CONFIG_FS_POSIX_ACL */
++	.get_trim_acl	= zfs_get_trim_acl,
++	.set_trim_acl	= zfs_set_trim_acl,
+ };
+ 
+ const struct inode_operations zpl_symlink_inode_operations = {
+@@ -901,4 +915,6 @@ const struct inode_operations zpl_special_inode_operations = {
+ 	.get_acl	= zpl_get_acl,
+ #endif /* HAVE_GET_INODE_ACL */
+ #endif /* CONFIG_FS_POSIX_ACL */
++	.get_trim_acl	= zfs_get_trim_acl,
++	.set_trim_acl	= zfs_set_trim_acl,
+ };
+diff --git a/module/os/linux/zfs/zpl_xattr.c b/module/os/linux/zfs/zpl_xattr.c
+index d93282d..33e9ee1 100644
+--- a/module/os/linux/zfs/zpl_xattr.c
++++ b/module/os/linux/zfs/zpl_xattr.c
+@@ -85,6 +85,12 @@
+ #include <sys/vfs.h>
+ #include <sys/zpl.h>
+ #include <linux/vfs_compat.h>
++#include <linux/trim_acl.h>
++
++static int zfs_xattr_trim_acl_get(const struct xattr_handler *, struct dentry *,
++    struct inode *, const char *, void *, size_t);
++static int zfs_xattr_trim_acl_set(const struct xattr_handler *, zidmap_t *,
++    struct dentry *, struct inode *, const char *, const void *, size_t, int);
+ 
+ enum xattr_permission {
+ 	XAPERM_DENY,
+@@ -1385,6 +1391,12 @@ static xattr_handler_t zpl_xattr_acl_default_handler = {
+ 
+ #endif /* CONFIG_FS_POSIX_ACL */
+ 
++struct xattr_handler zfs_xattr_trimacl_access_handler = {
++	.name	= TRIM_ACL_XATTR_ACCESS,
++	.get	= zfs_xattr_trim_acl_get,
++	.set	= zfs_xattr_trim_acl_set,
++};
++
+ xattr_handler_t *zpl_xattr_handlers[] = {
+ 	&zpl_xattr_security_handler,
+ 	&zpl_xattr_trusted_handler,
+@@ -1393,6 +1405,7 @@ xattr_handler_t *zpl_xattr_handlers[] = {
+ 	&zpl_xattr_acl_access_handler,
+ 	&zpl_xattr_acl_default_handler,
+ #endif /* CONFIG_FS_POSIX_ACL */
++	&zfs_xattr_trimacl_access_handler,	/* fnOS: system.trim_acl */
+ 	NULL
+ };
+ 
+@@ -1420,6 +1433,8 @@ zpl_xattr_handler(const char *name)
+ 	    sizeof (XATTR_NAME_POSIX_ACL_DEFAULT)) == 0)
+ 		return (&zpl_xattr_acl_default_handler);
+ #endif /* CONFIG_FS_POSIX_ACL */
++	if (strcmp(name, TRIM_ACL_XATTR_ACCESS) == 0)
++		return (&zfs_xattr_trimacl_access_handler);
+ 
+ 	return (NULL);
+ }
+@@ -1553,5 +1568,145 @@ zpl_posix_acl_release_impl(struct posix_acl *acl)
+ }
+ #endif
+ 
++/*
++ * fnOS: trim ACL support.
++ *
++ * The trim ACL is kept in the "system.trim_acl" xattr in the on-disk
++ * format produced by trim_acl_to_disk() and cached in inode->i_trim_acl.
++ * Permission checks are done by the kernel (fs/trim_acl.c) through
++ * inode_operations.get_trim_acl / set_trim_acl.
++ */
++zidmap_t trim_nop_mnt_idmap = {
++	.count	= REFCOUNT_INIT(1),
++};
++
++static struct trim_acl *
++__zfs_get_trim_acl(struct inode *ip)
++{
++	struct trim_acl *acl;
++	char *value = NULL;
++	int size;
++
++	size = zpl_xattr_get(ip, TRIM_ACL_XATTR_ACCESS, NULL, 0);
++	if (size > 0) {
++		value = kzalloc(size, GFP_NOFS);
++		if (value == NULL) {
++			acl = ERR_PTR(-ENOMEM);
++			goto out;
++		}
++		size = zpl_xattr_get(ip, TRIM_ACL_XATTR_ACCESS, value, size);
++	}
++
++	if (size > 0)
++		acl = trim_acl_from_disk(value, size);
++	else if (size == -ENODATA || size == -ENOENT || size == 0)
++		acl = NULL;
++	else
++		acl = ERR_PTR(size);
++out:
++	kfree(value);
++
++	if (!IS_ERR(acl))
++		set_cached_trim_acl(ip, acl);
++
++	return (acl);
++}
++
++struct trim_acl *
++zfs_get_trim_acl(struct mnt_idmap *idmap, struct inode *ip)
++{
++	struct trim_acl *acl;
++
++	acl = get_cached_trim_acl(ip);
++	if (!is_uncached_trim_acl(acl))
++		return (acl);
++
++	return (__zfs_get_trim_acl(ip));
++}
++
++static int
++__zfs_set_trim_acl(struct inode *ip, struct trim_acl *acl)
++{
++	void *value = NULL;
++	size_t size = 0;
++	int error;
++
++	if (acl) {
++		error = trim_acl_valid(acl);
++		if (error < 0)
++			return (error);
++
++		value = trim_acl_to_disk(acl, &size);
++		if (IS_ERR(value))
++			return (PTR_ERR(value));
++	}
++
++	error = zpl_xattr_set(ip, TRIM_ACL_XATTR_ACCESS, value, size, 0);
++	kfree(value);
++
++	if (!error)
++		set_cached_trim_acl(ip, acl);
++
++	return (error);
++}
++
++int
++zfs_set_trim_acl(struct mnt_idmap *idmap, struct inode *ip,
++    struct trim_acl *acl)
++{
++	if (ip == NULL)
++		return (-EINVAL);
++
++	return (__zfs_set_trim_acl(ip, acl));
++}
++
++static int
++zfs_xattr_trim_acl_get(const struct xattr_handler *handler,
++    struct dentry *dentry, struct inode *inode, const char *name,
++    void *buffer, size_t size)
++{
++	struct trim_acl *acl;
++	int error;
++
++	acl = zfs_get_trim_acl(NULL, d_inode(dentry));
++	if (IS_ERR(acl))
++		return (PTR_ERR(acl));
++	if (acl == NULL)
++		return (-ENODATA);
++
++	error = trim_acl_to_xattr(acl, buffer, size);
++	trim_acl_release(acl);
++
++	return (error);
++}
++
++static int
++zfs_xattr_trim_acl_set(const struct xattr_handler *handler, zidmap_t *idmap,
++    struct dentry *dentry, struct inode *inode, const char *name,
++    const void *value, size_t size, int flags)
++{
++	struct trim_acl *acl;
++	int error;
++
++	if (value) {
++		acl = trim_acl_from_xattr(value, size);
++		if (IS_ERR(acl))
++			return (PTR_ERR(acl));
++		else if (acl) {
++			error = trim_acl_valid(acl);
++			if (error) {
++				trim_acl_release(acl);
++				return (error);
++			}
++		}
++	} else {
++		acl = NULL;
++	}
++	error = __zfs_set_trim_acl(dentry->d_inode, acl);
++	trim_acl_release(acl);
++
++	return (error);
++}
++
+ ZFS_MODULE_PARAM(zfs, zfs_, xattr_compat, INT, ZMOD_RW,
+ 	"Use legacy ZFS xattr naming for writing new user namespace xattrs");

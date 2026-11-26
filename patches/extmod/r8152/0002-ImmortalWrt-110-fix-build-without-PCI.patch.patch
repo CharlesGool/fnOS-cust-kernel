@@ -1,0 +1,30 @@
+From 4fa150a626d190b4787133158ef2392fd2dd4e3b Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:21:35 +0000
+Subject: [PATCH 2/2] =?UTF-8?q?=E5=BA=94=E7=94=A8=20ImmortalWrt=20?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=81=20110-fix-build-without-PCI.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来源: immortalwrt/immortalwrt package/kernel/r8152/patches/110-fix-build-without-PCI.patch
+(飞牛的 r8152.ko 带有该补丁的行为, 见笔记 step14-extmod-net.md)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ r8152.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/r8152.c b/r8152.c
+index 402ed33..1fd8101 100644
+--- a/r8152.c
++++ b/r8152.c
+@@ -33567,7 +33567,7 @@ static int rtl_hc_support_sg(struct usb_device *udev)
+ 		goto out;
+ 	}
+ 
+-	if (hc_dev->bus != &pci_bus_type)
++	if (!dev_is_pci(hc_dev))
+ 		goto out;
+ 
+ 	pdev = to_pci_dev(hc_dev);

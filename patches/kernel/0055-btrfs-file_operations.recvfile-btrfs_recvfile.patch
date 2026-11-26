@@ -1,0 +1,420 @@
+From bc0cd58d20fd23e4c20636ebdfc66cdf90919ebf Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:38:23 +0700
+Subject: [PATCH 055/110] =?UTF-8?q?btrfs:=20=E8=BF=98=E5=8E=9F=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E7=A7=81=E6=9C=89=20file=5Foperations.recvfile=20?=
+ =?UTF-8?q?=E5=AE=9E=E7=8E=B0=20(btrfs=5Frecvfile)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+只动 fs/btrfs/file.c 里 recvfile 相关的部分: 新增 btrfs_recvfile_ctx /
+btrfs_recvfile_reservation / btrfs_recvfile_batch (布局按飞牛 BTF) 和
+btrfs_recvfile / btrfs_recvfile_one_batch / btrfs_recvfile_release_ctx /
+btrfs_recvfile_finish_reservation, btrfs_file_operations 加 .recvfile。
+
+做法同 copy_one_range(): 每批最多 256K / 65 页, 对每段先 reserve_space,
+prepare_one_folio, 不是 uptodate 的 folio 先读进来 (短收时不能留旧数据),
+lock_and_cleanup_extent_if_need, 超出 folio 的预留缩回; 然后一次
+sock_recvmsg(MSG_WAITALL, sk_rcvtimeo 临时 64 秒) 收进这些页, 按实际收到的
+字节 btrfs_dirty_folio, 多余预留释放。btrfs_recvfile 外层: shutdown -> -EIO,
+FS_ERROR -> -EROFS, btrfs_write_check, 每累计 256K 做一次 balance_dirty_pages,
+结束后 pagecache_isize_extended 和 last_sub_trans。
+
+依赖 work-btrfs (上游 7.0 btrfs) 的 btrfs_is_shutdown()、folio_next_pos();
+本树用 d88f9e312 临时桩编译。
+模块比对: btrfs_recvfile_release_ctx 一致; 其余三个只差代码块排布和
+btrfs_fs_info 字段偏移 (sectorsize 0xd58/0xdf8、fs_error/fs_state, 属
+work-btrfs 的结构体), 调用和常量相同。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/file.c | 361 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 361 insertions(+)
+
+diff --git a/fs/btrfs/file.c b/fs/btrfs/file.c
+index a4cb9d3cf..6d71bcf08 100644
+--- a/fs/btrfs/file.c
++++ b/fs/btrfs/file.c
+@@ -18,6 +18,9 @@
+ #include <linux/uio.h>
+ #include <linux/iversion.h>
+ #include <linux/fsverity.h>
++#include <linux/net.h>
++#include <linux/bvec.h>
++#include <net/sock.h>
+ #include "ctree.h"
+ #include "direct-io.h"
+ #include "disk-io.h"
+@@ -1400,6 +1403,363 @@ ssize_t btrfs_buffered_write(struct kiocb *iocb, struct iov_iter *iter)
+ 	return num_written ? num_written : ret;
+ }
+ 
++/*
++ * recvfile: receive data from a socket straight into the page cache.
++ *
++ * A batch prepares up to BTRFS_RECVFILE_MAX_PAGES pages worth of locked,
++ * uptodate folios with their space reserved, receives into them with one
++ * sock_recvmsg() call and then dirties what was actually received.
++ */
++#define BTRFS_RECVFILE_BATCH_BYTES	SZ_256K
++#define BTRFS_RECVFILE_MAX_PAGES	65
++#define BTRFS_RECVFILE_RCVTIMEO		(64 * HZ)
++
++struct btrfs_recvfile_ctx {
++	struct folio *folio;
++	struct extent_state *cached_state;
++	u64 start;
++	u64 lockstart;
++	u64 lockend;
++	size_t write_bytes;
++	bool extents_locked;
++};
++
++struct btrfs_recvfile_reservation {
++	struct extent_changeset *data_reserved;
++	u64 start;
++	u64 reserved_start;
++	u64 reserved_len;
++	size_t write_bytes;
++	bool only_release_metadata;
++};
++
++struct btrfs_recvfile_batch {
++	struct btrfs_recvfile_ctx ctxs[BTRFS_RECVFILE_MAX_PAGES];
++	struct btrfs_recvfile_reservation resvs[BTRFS_RECVFILE_MAX_PAGES];
++	struct bio_vec bvecs[BTRFS_RECVFILE_MAX_PAGES];
++};
++
++/* Unlock the extent range and drop the folio, @copied bytes were written. */
++static void btrfs_recvfile_release_ctx(struct btrfs_inode *inode,
++				       struct btrfs_recvfile_ctx *ctx,
++				       size_t copied)
++{
++	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++
++	if (ctx->extents_locked)
++		btrfs_unlock_extent(&inode->io_tree, ctx->lockstart,
++				    ctx->lockend, &ctx->cached_state);
++	else
++		btrfs_free_extent_state(ctx->cached_state);
++
++	if (ctx->folio)
++		btrfs_drop_folio(fs_info, ctx->folio, ctx->start, copied);
++}
++
++/* Release the part of the reservation beyond the @copied bytes. */
++static void btrfs_recvfile_finish_reservation(struct btrfs_inode *inode,
++					      struct btrfs_recvfile_reservation *resv,
++					      size_t copied)
++{
++	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	const u64 start = resv->start;
++	const u64 reserved_start = resv->reserved_start;
++	u64 reserved_len = resv->reserved_len;
++
++	if (copied) {
++		if (copied < resv->write_bytes) {
++			const u64 new_len = round_up(start + copied - reserved_start,
++						     fs_info->sectorsize);
++
++			shrink_reserved_space(inode, resv->data_reserved,
++					      reserved_start, reserved_len,
++					      new_len, resv->only_release_metadata);
++			reserved_len = new_len;
++			resv->reserved_len = new_len;
++		}
++		btrfs_delalloc_release_extents(inode, reserved_len);
++		if (resv->only_release_metadata)
++			btrfs_check_nocow_unlock(inode);
++	} else {
++		btrfs_delalloc_release_extents(inode, reserved_len);
++		release_space(inode, resv->data_reserved, resv->reserved_start,
++			      resv->reserved_len, resv->only_release_metadata);
++	}
++	extent_changeset_free(resv->data_reserved);
++}
++
++/* Get a locked, uptodate folio for @ctx and lock its extent range. */
++static int btrfs_recvfile_prepare_ctx(struct btrfs_inode *inode,
++				      struct btrfs_recvfile_ctx *ctx)
++{
++	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	int ret;
++
++again:
++	ret = prepare_one_folio(&inode->vfs_inode, &ctx->folio, ctx->start,
++				ctx->write_bytes, false);
++	if (ret)
++		return ret;
++
++	/* A short receive must not leave stale data in the folio. */
++	if (!folio_test_uptodate(ctx->folio)) {
++		ret = prepare_uptodate_folio(&inode->vfs_inode, ctx->folio,
++					     ctx->start, 1);
++		if (ret) {
++			/* The folio is already unlocked. */
++			folio_put(ctx->folio);
++			ctx->folio = NULL;
++			if (ret == -EAGAIN)
++				goto again;
++			return ret;
++		}
++	}
++
++	ret = lock_and_cleanup_extent_if_need(inode, ctx->folio, ctx->start,
++					      ctx->write_bytes, &ctx->lockstart,
++					      &ctx->lockend, false,
++					      &ctx->cached_state);
++	if (ret < 0) {
++		if (ret == -EAGAIN) {
++			ctx->folio = NULL;
++			goto again;
++		}
++		btrfs_drop_folio(fs_info, ctx->folio, ctx->start, 0);
++		ctx->folio = NULL;
++		return ret;
++	}
++	ctx->extents_locked = ret > 0;
++	return 0;
++}
++
++static int btrfs_recvfile_one_batch(struct btrfs_inode *inode,
++				    struct socket *sock, loff_t pos,
++				    size_t count,
++				    struct btrfs_recvfile_batch *batch,
++				    size_t *received)
++{
++	struct btrfs_fs_info *fs_info = inode->root->fs_info;
++	size_t batch_len = min_t(size_t, count, BTRFS_RECVFILE_BATCH_BYTES);
++	struct msghdr msg = {};
++	size_t done = 0, total = 0, remaining;
++	int nr_pages = 0, nr_bvecs = 0, nr = 0, i;
++	long rcvtimeo;
++	int ret = 0;
++
++	*received = 0;
++
++	while (nr_pages < BTRFS_RECVFILE_MAX_PAGES && done < batch_len) {
++		struct btrfs_recvfile_ctx *ctx = &batch->ctxs[nr];
++		struct btrfs_recvfile_reservation *resv = &batch->resvs[nr];
++		const u64 start = pos + done;
++		const size_t page_off = offset_in_page(start);
++		size_t max_folio_size, write_bytes, wanted;
++
++		memset(resv, 0, sizeof(*resv));
++		resv->start = start;
++		resv->reserved_start = round_down(start, fs_info->sectorsize);
++		resv->write_bytes = min_t(size_t,
++				BTRFS_RECVFILE_MAX_PAGES * PAGE_SIZE -
++				(nr_pages * PAGE_SIZE + page_off),
++				batch_len - done);
++		ret = reserve_space(inode, &resv->data_reserved, start,
++				    &resv->write_bytes, false,
++				    &resv->only_release_metadata);
++		if (ret < 0)
++			goto out_release;
++		resv->reserved_len = ret;
++
++		max_folio_size = mapping_max_folio_size(inode->vfs_inode.i_mapping);
++		memset(ctx, 0, sizeof(*ctx));
++		ctx->start = start;
++		ctx->write_bytes = min(max_folio_size - (start & (max_folio_size - 1)),
++				       resv->write_bytes);
++
++		ret = btrfs_recvfile_prepare_ctx(inode, ctx);
++		if (ret < 0) {
++			btrfs_recvfile_finish_reservation(inode, resv, 0);
++			goto out_release;
++		}
++
++		/*
++		 * The reserved range goes beyond the current folio, shrink the
++		 * reserved space to the folio boundary.
++		 */
++		if (resv->reserved_start + resv->reserved_len > folio_next_pos(ctx->folio)) {
++			const u64 last_block = folio_next_pos(ctx->folio);
++
++			shrink_reserved_space(inode, resv->data_reserved,
++					      resv->reserved_start,
++					      resv->reserved_len,
++					      last_block - resv->reserved_start,
++					      resv->only_release_metadata);
++			resv->reserved_len = last_block - resv->reserved_start;
++			resv->write_bytes = min_t(size_t, resv->write_bytes,
++						  last_block - start);
++		}
++
++		wanted = ctx->write_bytes;
++		write_bytes = min(wanted, resv->write_bytes);
++		if (WARN_ON_ONCE(!write_bytes))
++			goto out_ctx;
++		ctx->write_bytes = write_bytes;
++
++		nr_pages += DIV_ROUND_UP(page_off + write_bytes, PAGE_SIZE);
++		if (WARN_ON_ONCE(nr_pages > BTRFS_RECVFILE_MAX_PAGES))
++			goto out_ctx;
++
++		done += write_bytes;
++		nr++;
++		if (write_bytes < wanted)
++			break;
++	}
++
++	if (WARN_ON_ONCE(!nr))
++		return -EIO;
++
++	for (i = 0; i < nr; i++) {
++		struct btrfs_recvfile_ctx *ctx = &batch->ctxs[i];
++		size_t off = offset_in_folio(ctx->folio, ctx->start);
++		size_t cur = 0;
++
++		while (cur < ctx->write_bytes) {
++			size_t poff = (off + cur) & ~PAGE_MASK;
++			size_t len = min(PAGE_SIZE - poff, ctx->write_bytes - cur);
++
++			bvec_set_page(&batch->bvecs[nr_bvecs++],
++				      folio_page(ctx->folio, (off + cur) >> PAGE_SHIFT),
++				      len, poff);
++			cur += len;
++		}
++	}
++
++	iov_iter_bvec(&msg.msg_iter, ITER_DEST, batch->bvecs, nr_bvecs, done);
++	rcvtimeo = sock->sk->sk_rcvtimeo;
++	sock->sk->sk_rcvtimeo = BTRFS_RECVFILE_RCVTIMEO;
++	ret = sock_recvmsg(sock, &msg, MSG_WAITALL);
++	sock->sk->sk_rcvtimeo = rcvtimeo;
++	if (ret < 0)
++		goto out_release;
++	*received = ret;
++	if (!ret)
++		goto out_release;
++
++	remaining = ret;
++	for (i = 0; i < nr; i++) {
++		struct btrfs_recvfile_ctx *ctx = &batch->ctxs[i];
++		struct btrfs_recvfile_reservation *resv = &batch->resvs[i];
++		size_t copied = min(ctx->write_bytes, remaining);
++
++		ret = btrfs_dirty_folio(inode, ctx->folio, ctx->start, copied,
++					&ctx->cached_state,
++					resv->only_release_metadata);
++		if (ret) {
++			btrfs_recvfile_release_ctx(inode, ctx, 0);
++			btrfs_recvfile_finish_reservation(inode, resv, 0);
++			i++;
++			break;
++		}
++		btrfs_recvfile_release_ctx(inode, ctx, copied);
++		btrfs_recvfile_finish_reservation(inode, resv, copied);
++		total += copied;
++		remaining -= copied;
++		if (!remaining) {
++			i++;
++			break;
++		}
++	}
++	/* Nothing was received for the rest. */
++	for (; i < nr; i++) {
++		btrfs_recvfile_release_ctx(inode, &batch->ctxs[i], 0);
++		btrfs_recvfile_finish_reservation(inode, &batch->resvs[i], 0);
++	}
++	return total ? total : ret;
++
++out_ctx:
++	btrfs_recvfile_release_ctx(inode, &batch->ctxs[nr], 0);
++	btrfs_recvfile_finish_reservation(inode, &batch->resvs[nr], 0);
++	ret = -EIO;
++out_release:
++	for (i = 0; i < nr; i++) {
++		btrfs_recvfile_release_ctx(inode, &batch->ctxs[i], 0);
++		btrfs_recvfile_finish_reservation(inode, &batch->resvs[i], 0);
++	}
++	return ret;
++}
++
++static ssize_t btrfs_recvfile(struct file *file, struct socket *sock,
++			      loff_t *ppos, size_t count,
++			      struct recvfile_io_stats *stats)
++{
++	struct inode *inode = file_inode(file);
++	struct btrfs_fs_info *fs_info = inode_to_fs_info(inode);
++	struct btrfs_recvfile_batch *batch;
++	size_t received, total_received = 0, written = 0, dirtied = 0;
++	struct kiocb kiocb;
++	loff_t old_isize;
++	ssize_t ret;
++
++	if (btrfs_is_shutdown(fs_info))
++		return -EIO;
++	if (BTRFS_FS_ERROR(fs_info))
++		return -EROFS;
++
++	init_sync_kiocb(&kiocb, file);
++	kiocb.ki_pos = *ppos;
++	old_isize = i_size_read(inode);
++
++	ret = btrfs_write_check(&kiocb, count);
++	if (ret < 0)
++		return ret;
++
++	batch = kzalloc(sizeof(*batch), GFP_NOFS);
++	if (!batch)
++		return -ENOMEM;
++
++	if (!count) {
++		kfree(batch);
++		goto out_stats;
++	}
++
++	do {
++		ret = btrfs_recvfile_one_batch(BTRFS_I(inode), sock, *ppos,
++					       count, batch, &received);
++		total_received += received;
++		if (ret <= 0)
++			break;
++
++		dirtied += ret;
++		written += ret;
++		count -= ret;
++		*ppos += ret;
++		kiocb.ki_pos += ret;
++		if (dirtied >= BTRFS_RECVFILE_BATCH_BYTES) {
++			balance_dirty_pages_ratelimited_flags(inode->i_mapping, 0);
++			dirtied = 0;
++		}
++		cond_resched();
++		/* Short receive, the peer has no more data for now. */
++		if (ret < received)
++			break;
++	} while (count);
++	if (ret > 0)
++		ret = 0;
++	kfree(batch);
++
++	if (written) {
++		if (dirtied)
++			balance_dirty_pages_ratelimited_flags(inode->i_mapping, 0);
++		pagecache_isize_extended(inode, old_isize, kiocb.ki_pos);
++		btrfs_set_inode_last_sub_trans(BTRFS_I(inode));
++	}
++out_stats:
++	if (stats) {
++		stats->received = total_received;
++		stats->written = written;
++	}
++	return written ? written : ret;
++}
++
+ static ssize_t btrfs_encoded_write(struct kiocb *iocb, struct iov_iter *from,
+ 			const struct btrfs_ioctl_encoded_io_args *encoded)
+ {
+@@ -3853,6 +4213,7 @@ const struct file_operations btrfs_file_operations = {
+ 	.splice_read	= btrfs_file_splice_read,
+ 	.write_iter	= btrfs_file_write_iter,
+ 	.splice_write	= iter_file_splice_write,
++	.recvfile	= btrfs_recvfile,
+ 	.mmap_prepare	= btrfs_file_mmap_prepare,
+ 	.open		= btrfs_file_open,
+ 	.release	= btrfs_release_file,

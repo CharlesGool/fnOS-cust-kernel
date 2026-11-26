@@ -1,0 +1,64 @@
+From 27a0a342317da813e9bb3e4bc1c179b990360e47 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:48:42 +0000
+Subject: [PATCH 088/110] =?UTF-8?q?md/raid10:=20raid=5Fend=5Fbio=5Fio/raid?=
+ =?UTF-8?q?=5Fend=5Fdiscard=5Fbio=20=E5=85=88=E9=87=8A=E6=94=BE=20r10bio?=
+ =?UTF-8?q?=20=E5=86=8D=E7=BB=93=E6=9D=9F=20master=20bio(=E4=B8=8A?=
+ =?UTF-8?q?=E6=B8=B8=20124)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+上游 fe8d6b018746 原样移植(配合 123 的 reshape 换池, 避免旧几何的 r10bio 被放回新池)。
+飞牛 raid_end_bio_io 里 free_r10bio 在 bio_endio 之前, 现与飞牛一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid10.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index d067fa135..3f8497509 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -331,20 +331,24 @@ static void raid_end_bio_io(struct r10bio *r10_bio)
+ {
+ 	struct bio *bio = r10_bio->master_bio;
+ 	struct r10conf *conf = r10_bio->mddev->private;
++	bool returned = true;
+ 
+ 	if (!test_and_set_bit(R10BIO_Returned, &r10_bio->state)) {
+ 		if (!test_bit(R10BIO_Uptodate, &r10_bio->state))
+ 			bio->bi_status = BLK_STS_IOERR;
+-		bio_endio(bio);
++		returned = false;
+ 	}
+ 
++	free_r10bio(r10_bio);
++
++	if (!returned)
++		bio_endio(bio);
++
+ 	/*
+ 	 * Wake up any possible resync thread that waits for the device
+ 	 * to go idle.
+ 	 */
+ 	allow_barrier(conf);
+-
+-	free_r10bio(r10_bio);
+ }
+ 
+ /*
+@@ -1532,9 +1536,11 @@ static void raid_end_discard_bio(struct r10bio *r10bio)
+ 			free_r10bio(r10bio);
+ 			r10bio = first_r10bio;
+ 		} else {
++			struct bio *master_bio = r10bio->master_bio;
++
+ 			md_write_end(r10bio->mddev);
+-			bio_endio(r10bio->master_bio);
+ 			free_r10bio(r10bio);
++			bio_endio(master_bio);
+ 			break;
+ 		}
+ 	}

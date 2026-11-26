@@ -1,0 +1,45 @@
+From 771fe30245595bcea79f5f9a270df45645a2cf70 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:11:56 +0000
+Subject: [PATCH 15/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-usbc1-?=
+ =?UTF-8?q?controller-wifi-rate-of-sun60iw2p1.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/Makefile | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/Makefile b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/Makefile
+index 405d00c..9c8315b 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/Makefile
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/Makefile
+@@ -74,7 +74,11 @@ CONFIG_VHT_FOR_OLD_KERNEL = n
+ CONFIG_COEX = y
+ CONFIG_ALIGN_8BYTES = y
+ CONFIG_TXRX_THREAD_PRIO = y
++ifdef CONFIG_ARCH_SUN60IW2P1
++CONFIG_USB_ALIGN_DATA = n
++else
+ CONFIG_USB_ALIGN_DATA = y
++endif
+ CONFIG_RX_TASKLET = n
+ CONFIG_TX_TASKLET = n
+ CONFIG_RX_NETIF_RECV_SKB = y
+@@ -87,8 +91,11 @@ CONFIG_WOWLAN ?= n
+ #DCDW support tx aggr, D80 support both
+ CONFIG_USB_RX_AGGR = n
+ CONFIG_USB_TX_AGGR = n
+-
++ifdef CONFIG_ARCH_SUN60IW2P1
++CONFIG_USB_NO_TRANS_DMA_MAP = y
++else
+ CONFIG_USB_NO_TRANS_DMA_MAP = n
++endif
+ CONFIG_GPIO_WAKEUP = n
+ CONFIG_CREATE_TRACE_POINTS = n
+ CONFIG_SUPPORT_REALTIME_CHANGE_MAC = y

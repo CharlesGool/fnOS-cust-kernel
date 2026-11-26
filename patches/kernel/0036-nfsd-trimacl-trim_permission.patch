@@ -1,0 +1,128 @@
+From 247e9515eb22c8f7abcec63c6b0b04f961c7fb4d Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:32:47 +0700
+Subject: [PATCH 036/110] =?UTF-8?q?nfsd:=20trimacl=20=E5=8D=B7=E7=9A=84?=
+ =?UTF-8?q?=E6=9D=83=E9=99=90=E5=88=A4=E6=96=AD=E6=94=B9=E8=B5=B0=20trim?=
+ =?UTF-8?q?=5Fpermission=20(=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- nfsd_permission: 卷 (SB_TRIMACL) 上 OWNER_OVERRIDE 且是属主直接放行;
+  请求含 EXEC/WRITE/SATTR/TRUNC 时直接返回 0 (不在 nfsd 层查, 靠 VFS 的 trimacl 钩子);
+  只读请求用 trim_permission(dentry, MAY_READ) 判断; "可执行即可读" 的重试也改走 trim_permission。
+- nfsd_acceptable (subtree_check): 父目录在 trimacl 卷上时用 trim_permission(parent, MAY_EXEC)。
+- fh_getattr: 返回给客户端的 mode 一律或上 0777 (所有文件系统都这样, 不只 trimacl 卷)。
+
+比对: fh_getattr、nfsd_acceptable 一致; nfsd_permission ≈ (只差寄存器/块排列)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/nfsd/nfsfh.c | 16 ++++++++++++++--
+ fs/nfsd/vfs.c   | 27 +++++++++++++++++++++++++--
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/fs/nfsd/nfsfh.c b/fs/nfsd/nfsfh.c
+index 3ab4b1b6e..cb1b6bc9a 100644
+--- a/fs/nfsd/nfsfh.c
++++ b/fs/nfsd/nfsfh.c
+@@ -11,6 +11,7 @@
+ #include <linux/exportfs.h>
+ 
+ #include <linux/sunrpc/svcauth_gss.h>
++#include <linux/trim_acl.h>
+ #include "nfsd.h"
+ #include "vfs.h"
+ #include "auth.h"
+@@ -40,6 +41,11 @@ static int nfsd_acceptable(void *expv, struct dentry *dentry)
+ 		/* make sure parents give x permission to user */
+ 		int err;
+ 		parent = dget_parent(tdentry);
++		// shasure - trimacl -->
++		if (IS_TRIMACL(parent))
++			err = trim_permission(&nop_mnt_idmap, parent, MAY_EXEC);
++		else
++		// <--
+ 		err = inode_permission(&nop_mnt_idmap,
+ 				       d_inode(parent), MAY_EXEC);
+ 		if (err < 0) {
+@@ -700,6 +706,7 @@ __be32 fh_getattr(const struct svc_fh *fhp, struct kstat *stat)
+ 	};
+ 	struct inode *inode = d_inode(p.dentry);
+ 	u32 request_mask = STATX_BASIC_STATS;
++	__be32 err;
+ 
+ 	if (S_ISREG(inode->i_mode))
+ 		request_mask |= (STATX_DIOALIGN | STATX_DIO_READ_ALIGN);
+@@ -707,8 +714,13 @@ __be32 fh_getattr(const struct svc_fh *fhp, struct kstat *stat)
+ 	if (fhp->fh_maxsize == NFS4_FHSIZE)
+ 		request_mask |= (STATX_BTIME | STATX_CHANGE_COOKIE);
+ 
+-	return nfserrno(vfs_getattr(&p, stat, request_mask,
+-				    AT_STATX_SYNC_AS_STAT));
++	err = nfserrno(vfs_getattr(&p, stat, request_mask,
++				   AT_STATX_SYNC_AS_STAT));
++	// shasure - trimacl -->
++	/* 客户端一律看到 rwxrwxrwx, 真正的权限由服务端 trimacl 判断 */
++	stat->mode |= 0777;
++	// <--
++	return err;
+ }
+ 
+ /**
+diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
+index 7094902ca..7e30d2147 100644
+--- a/fs/nfsd/vfs.c
++++ b/fs/nfsd/vfs.c
+@@ -31,6 +31,7 @@
+ #include <linux/exportfs.h>
+ #include <linux/writeback.h>
+ #include <linux/security.h>
++#include <linux/trim_acl.h>
+ #include <linux/sunrpc/xdr.h>
+ 
+ #include "xdr3.h"
+@@ -2638,6 +2639,23 @@ nfsd_permission(struct svc_cred *cred, struct svc_export *exp,
+ 	 * We must trust the client to do permission checking - using "ACCESS"
+ 	 * with NFSv3.
+ 	 */
++	// shasure - trimacl -->
++	if (IS_TRIMACL(dentry)) {
++		int mask;
++
++		if ((acc & NFSD_MAY_OWNER_OVERRIDE) && IS_TRIMACL_OWNER(dentry))
++			return 0;
++		mask = acc & MAY_EXEC;
++		if (acc & (NFSD_MAY_WRITE | NFSD_MAY_TRUNC))
++			mask |= MAY_WRITE;
++		if (acc & NFSD_MAY_READ)
++			mask |= MAY_READ;
++		/* 写/执行/改属性/截断不在这里查, 交给 VFS 的 trimacl 钩子 */
++		if (acc & (NFSD_MAY_EXEC | NFSD_MAY_WRITE | NFSD_MAY_SATTR | NFSD_MAY_TRUNC))
++			return 0;
++		err = trim_permission(&nop_mnt_idmap, dentry, mask);
++	} else {
++	// <--
+ 	if ((acc & NFSD_MAY_OWNER_OVERRIDE) &&
+ 	    uid_eq(inode->i_uid, current_fsuid()))
+ 		return 0;
+@@ -2645,12 +2663,17 @@ nfsd_permission(struct svc_cred *cred, struct svc_export *exp,
+ 	/* This assumes  NFSD_MAY_{READ,WRITE,EXEC} == MAY_{READ,WRITE,EXEC} */
+ 	err = inode_permission(&nop_mnt_idmap, inode,
+ 			       acc & (MAY_READ | MAY_WRITE | MAY_EXEC));
++	}
+ 
+ 	/* Allow read access to binaries even when mode 111 */
+ 	if (err == -EACCES && S_ISREG(inode->i_mode) &&
+ 	     (((acc & NFSD_MAY_MASK) == NFSD_MAY_READ) &&
+-	      (acc & (NFSD_MAY_OWNER_OVERRIDE | NFSD_MAY_READ_IF_EXEC))))
+-		err = inode_permission(&nop_mnt_idmap, inode, MAY_EXEC);
++	      (acc & (NFSD_MAY_OWNER_OVERRIDE | NFSD_MAY_READ_IF_EXEC)))) {
++		if (IS_TRIMACL(dentry))
++			err = trim_permission(&nop_mnt_idmap, dentry, MAY_EXEC);
++		else
++			err = inode_permission(&nop_mnt_idmap, inode, MAY_EXEC);
++	}
+ 
+ 	return err? nfserrno(err) : 0;
+ }

@@ -1,0 +1,119 @@
+From dbb23c1c27bf41e4e0fec2f5c8d9f9d02c03adfc Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 07:10:26 +0000
+Subject: [PATCH 096/110] =?UTF-8?q?md/raid5:=20release=5Fstripe=5Fplug=20?=
+ =?UTF-8?q?=E5=85=88=20check=5Fplugged=E3=80=81reshape=20=E8=B7=B3?=
+ =?UTF-8?q?=E8=BF=87=20llbitmap=20=E7=A9=BA=E5=8C=BA=E3=80=81run/spare=5Fa?=
+ =?UTF-8?q?ctive/check=5Freshape=20=E8=A1=A5=E9=A3=9E=E7=89=9B=E7=A7=81?=
+ =?UTF-8?q?=E6=9C=89=E5=88=A4=E6=96=AD?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- raid5_run: flush_plug_threshold=128, allow_fast_resync, 按 journal/ppl/log 设 MD_FAST_DISCARD
+- spare_active: allow_fast_resync 时置 NonFullInsync
+- reshape_request: 向前 reshape 时问 bitmap_ops->reshape_can_skip
+- check_reshape: new_chunk_sectors 为 0 返回 -EINVAL
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid5.c | 38 +++++++++++++++++++++++++++++++++++---
+ 1 file changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 4440d021c..86d167abf 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -6018,13 +6018,15 @@ static void raid5_unplug(struct blk_plug_cb *blk_cb, bool from_schedule)
+ static void release_stripe_plug(struct mddev *mddev,
+ 				struct stripe_head *sh)
+ {
++	struct blk_plug_cb *blk_cb = blk_check_plugged(
++		raid5_unplug, mddev,
++		sizeof(struct raid5_plug_cb));
+ 	struct r5conf *conf = sh->raid_conf;
+ 	int threshold = mddev->flush_plug_threshold;
+ 	int chunk_sectors = sh->generation == conf->generation - 1 ?
+ 		conf->prev_chunk_sectors : conf->chunk_sectors;
+ 	int chunk_stripes = chunk_sectors >> RAID5_STRIPE_SHIFT(conf);
+ 	sector_t offset = sh->sector % (unsigned int)chunk_sectors;
+-	struct blk_plug_cb *blk_cb;
+ 	struct raid5_plug_cb *cb;
+ 
+ 	/*
+@@ -6032,8 +6034,6 @@ static void release_stripe_plug(struct mddev *mddev,
+ 	 * handled, but try not to split a chunk across two flushes.
+ 	 */
+ 	for (;;) {
+-		blk_cb = blk_check_plugged(raid5_unplug, mddev,
+-					   sizeof(struct raid5_plug_cb));
+ 		if (!blk_cb) {
+ 			raid5_release_stripe(sh);
+ 			return;
+@@ -6053,6 +6053,8 @@ static void release_stripe_plug(struct mddev *mddev,
+ 		    (offset && cb->pending_cnt < threshold + chunk_stripes))
+ 			break;
+ 		blk_flush_plug(current->plug, false);
++		blk_cb = blk_check_plugged(raid5_unplug, mddev,
++					   sizeof(struct raid5_plug_cb));
+ 	}
+ 
+ 	if (!test_and_set_bit(STRIPE_ON_UNPLUG_LIST, &sh->state)) {
+@@ -6834,6 +6836,26 @@ static sector_t reshape_request(struct mddev *mddev, sector_t sector_nr, int *sk
+ 		sysfs_notify_dirent_safe(mddev->sysfs_completed);
+ 	}
+ 
++	/* fnnas: llbitmap knows this range holds no data, no need to copy it */
++	if (!mddev->reshape_backwards && md_bitmap_enabled(mddev, false) &&
++	    mddev->bitmap_ops->reshape_can_skip) {
++		sector_t progress = conf->reshape_progress +
++				    reshape_sectors * new_data_disks;
++
++		if (mddev->bitmap_ops->reshape_can_skip(mddev,
++							conf->reshape_progress,
++							progress)) {
++			spin_lock_irq(&conf->device_lock);
++			conf->reshape_progress = progress;
++			spin_unlock_irq(&conf->device_lock);
++			wake_up(&conf->wait_for_reshape);
++			*skipped = 1;
++			sector_nr += reshape_sectors;
++			retn = reshape_sectors;
++			goto finish;
++		}
++	}
++
+ 	INIT_LIST_HEAD(&stripes);
+ 	for (i = 0; i < reshape_sectors; i += RAID5_STRIPE_SECTORS(conf)) {
+ 		int j;
+@@ -8981,6 +9003,8 @@ static int raid5_run(struct mddev *mddev)
+ 	}
+ 
+ 	conf->min_offset_diff = min_offset_diff;
++	mddev->flush_plug_threshold = 128;
++	mddev->allow_fast_resync = true;
+ 	rcu_assign_pointer(mddev->thread, conf->thread);
+ 	rcu_assign_pointer(conf->thread, NULL);
+ 	mddev->private = conf;
+@@ -9102,6 +9126,12 @@ static int raid5_run(struct mddev *mddev)
+ 	if (ret)
+ 		goto abort;
+ 
++	/* fnnas: md discards the member disks directly, not with journal or ppl */
++	if (journal_dev || test_bit(MD_HAS_PPL, &mddev->flags) || conf->log)
++		clear_bit(MD_FAST_DISCARD, &mddev->flags);
++	else
++		set_bit(MD_FAST_DISCARD, &mddev->flags);
++
+ 	return 0;
+ abort:
+ 	md_unregister_thread(mddev, &mddev->thread);
+@@ -9196,6 +9226,8 @@ static int raid5_spare_active(struct mddev *mddev)
+ 			   !test_bit(Faulty, &rdev->flags) &&
+ 			   !test_and_set_bit(In_sync, &rdev->flags)) {
+ 			count++;
++			if (mddev->allow_fast_resync)
++				set_bit(NonFullInsync, &rdev->flags);
+ 			sysfs_notify_dirent_safe(rdev->sysfs_state);
+ 		}
+ 	}

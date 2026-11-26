@@ -1,0 +1,4 @@
+.env
+.local/
+releases/
+__pycache__/

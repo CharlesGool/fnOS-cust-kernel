@@ -1,0 +1,105 @@
+From 62e4e349953f5a82f740824d09d73b88f2f15c9f Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 23:21:35 +0000
+Subject: [PATCH 2/4] =?UTF-8?q?=E5=BA=94=E7=94=A8=20ImmortalWrt=20?=
+ =?UTF-8?q?=E8=A1=A5=E4=B8=81=20110-r8168-print-link-speed-and-duplex-mode?=
+ =?UTF-8?q?.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来源: immortalwrt/immortalwrt package/kernel/r8168/patches/110-r8168-print-link-speed-and-duplex-mode.patch
+(飞牛的 r8168.ko 带有该补丁的行为, 见笔记 step14-extmod-net.md)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/r8168.h   |  2 ++
+ src/r8168_n.c | 46 +++++++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/src/r8168.h b/src/r8168.h
+index 3e05209..29ca9a6 100755
+--- a/src/r8168.h
++++ b/src/r8168.h
+@@ -1480,6 +1480,8 @@ enum RTL8168_register_content {
+         LinkStatus = 0x02,
+         FullDup = 0x01,
+ 
++#define RTL8168_FULL_DUPLEX_MASK (_1000bpsF | FullDup)
++
+         /* DBG_reg */
+         Fix_Nak_1 = (1 << 4),
+         Fix_Nak_2 = (1 << 3),
+diff --git a/src/r8168_n.c b/src/r8168_n.c
+index de8570e..247f76a 100755
+--- a/src/r8168_n.c
++++ b/src/r8168_n.c
+@@ -43,6 +43,7 @@
+ #include <linux/module.h>
+ #include <linux/version.h>
+ #include <linux/pci.h>
++#include <linux/phy.h>
+ #include <linux/netdevice.h>
+ #include <linux/etherdevice.h>
+ #include <linux/delay.h>
+@@ -5527,6 +5528,38 @@ rtl8168_link_down_patch(struct net_device *dev)
+ #endif
+ }
+ 
++static unsigned int rtl8168_phy_duplex(u8 status)
++{
++        unsigned int duplex = DUPLEX_UNKNOWN;
++
++        if (status & LinkStatus) {
++                if (status & RTL8168_FULL_DUPLEX_MASK)
++                        duplex = DUPLEX_FULL;
++                else
++                        duplex = DUPLEX_HALF;
++        }
++
++        return duplex;
++}
++
++static int rtl8168_phy_speed(struct rtl8168_private *tp, u8 status)
++{
++        int speed = SPEED_UNKNOWN;
++
++        if (status & LinkStatus) {
++                if (status & _1000bpsF)
++                        speed = SPEED_1000;
++                else if (status & _100bps)
++                        speed = SPEED_100;
++                else if (status & _10bps)
++                        speed = SPEED_10;
++                else if (tp->enable_giga_lite)
++                        speed = SPEED_1000;
++        }
++
++        return speed;
++}
++
+ static void
+ rtl8168_check_link_status(struct net_device *dev)
+ {
+@@ -5546,11 +5579,18 @@ rtl8168_check_link_status(struct net_device *dev)
+                 if (link_status_on) {
+                         rtl8168_link_on_patch(dev);
+ 
+-                        if (netif_msg_ifup(tp))
+-                                printk(KERN_INFO PFX "%s: link up\n", dev->name);
++                        if (netif_msg_ifup(tp)) {
++                                const u8 phy_status = RTL_R8(tp, PHYstatus);
++                                const unsigned int phy_duplex = rtl8168_phy_duplex(phy_status);
++                                const int phy_speed = rtl8168_phy_speed(tp, phy_status);
++                                printk(KERN_INFO PFX "%s: Link is Up - %s/%s\n",
++                                       dev->name,
++                                       phy_speed_to_str(phy_speed),
++                                       phy_duplex_to_str(phy_duplex));
++                        }
+                 } else {
+                         if (netif_msg_ifdown(tp))
+-                                printk(KERN_INFO PFX "%s: link down\n", dev->name);
++                                printk(KERN_INFO PFX "%s: Link is Down\n", dev->name);
+ 
+                         rtl8168_link_down_patch(dev);
+                 }

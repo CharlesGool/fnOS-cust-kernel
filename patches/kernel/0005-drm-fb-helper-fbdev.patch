@@ -1,0 +1,299 @@
+From e30a91ac17067f5bad02b0c08a038bb6614c7f84 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 09:59:57 +0700
+Subject: [PATCH 005/110] =?UTF-8?q?drm/fb-helper:=20=E8=BF=98=E5=8E=9F?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=20fbdev=20=E6=8E=A7=E5=88=B6=E5=8F=B0?=
+ =?UTF-8?q?=E6=81=A2=E5=A4=8D=E8=A1=A5=E4=B8=81?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- drm_client_modeset_dpms_locked(): 拆出不取 master 的 DPMS 版本并导出
+- 无 DRM master 且所有 CRTC 都关着时, 允许 fbdev 强制恢复/热插拔, 并做一次 DPMS 关-开重训练
+- 新增 refresh_work: 模式设置后解除 fb 黑屏、刷新 fbcon 并 flush 脏区
+- 初始配置/热插拔后发 KOBJ_CHANGE uevent
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/gpu/drm/drm_client_modeset.c |  19 ++++-
+ drivers/gpu/drm/drm_fb_helper.c      | 121 +++++++++++++++++++++++++--
+ include/drm/drm_client.h             |   1 +
+ include/drm/drm_fb_helper.h          |   2 +
+ 4 files changed, 133 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_client_modeset.c b/drivers/gpu/drm/drm_client_modeset.c
+index eaf71c9ec..ca6e3106a 100644
+--- a/drivers/gpu/drm/drm_client_modeset.c
++++ b/drivers/gpu/drm/drm_client_modeset.c
+@@ -1273,14 +1273,11 @@ static void drm_client_modeset_dpms_legacy(struct drm_client_dev *client, int dp
+  * Returns:
+  * Zero on success or negative error code on failure.
+  */
+-int drm_client_modeset_dpms(struct drm_client_dev *client, int mode)
++int drm_client_modeset_dpms_locked(struct drm_client_dev *client, int mode)
+ {
+ 	struct drm_device *dev = client->dev;
+ 	int ret = 0;
+ 
+-	if (!drm_master_internal_acquire(dev))
+-		return -EBUSY;
+-
+ 	mutex_lock(&client->modeset_mutex);
+ 	if (drm_drv_uses_atomic_modeset(dev))
+ 		ret = drm_client_modeset_commit_atomic(client, mode == DRM_MODE_DPMS_ON, false);
+@@ -1288,6 +1285,20 @@ int drm_client_modeset_dpms(struct drm_client_dev *client, int mode)
+ 		drm_client_modeset_dpms_legacy(client, mode);
+ 	mutex_unlock(&client->modeset_mutex);
+ 
++	return ret;
++}
++EXPORT_SYMBOL(drm_client_modeset_dpms_locked);
++
++int drm_client_modeset_dpms(struct drm_client_dev *client, int mode)
++{
++	struct drm_device *dev = client->dev;
++	int ret;
++
++	if (!drm_master_internal_acquire(dev))
++		return -EBUSY;
++
++	ret = drm_client_modeset_dpms_locked(client, mode);
++
+ 	drm_master_internal_release(dev);
+ 
+ 	return ret;
+diff --git a/drivers/gpu/drm/drm_fb_helper.c b/drivers/gpu/drm/drm_fb_helper.c
+index 3599423b7..273399fd6 100644
+--- a/drivers/gpu/drm/drm_fb_helper.c
++++ b/drivers/gpu/drm/drm_fb_helper.c
+@@ -30,6 +30,7 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/console.h>
++#include <linux/fbcon.h>
+ #include <linux/export.h>
+ #include <linux/sysrq.h>
+ 
+@@ -211,6 +212,40 @@ int drm_fb_helper_debug_leave(struct fb_info *info)
+ }
+ EXPORT_SYMBOL(drm_fb_helper_debug_leave);
+ 
++static void drm_fb_helper_retrain(struct drm_fb_helper *fb_helper)
++{
++	int ret;
++
++	ret = drm_client_modeset_dpms_locked(&fb_helper->client, DRM_MODE_DPMS_OFF);
++	if (ret) {
++		drm_dbg_kms(fb_helper->dev, "failed to turn fbdev DPMS off: %d\n", ret);
++		return;
++	}
++
++	ret = drm_client_modeset_dpms_locked(&fb_helper->client, DRM_MODE_DPMS_ON);
++	if (ret)
++		drm_dbg_kms(fb_helper->dev, "failed to turn fbdev DPMS on: %d\n", ret);
++}
++
++static bool drm_fb_helper_all_crtcs_inactive(struct drm_device *dev)
++{
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_crtc *crtc;
++	bool inactive = true;
++	int ret;
++
++	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
++	drm_for_each_crtc(crtc, dev) {
++		if (crtc->state ? crtc->state->active : crtc->enabled) {
++			inactive = false;
++			break;
++		}
++	}
++	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
++
++	return ret ? false : inactive;
++}
++
+ static int
+ __drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper,
+ 					    bool force)
+@@ -234,6 +269,13 @@ __drm_fb_helper_restore_fbdev_mode_unlocked(struct drm_fb_helper *fb_helper,
+ 		ret = drm_client_modeset_commit_locked(&fb_helper->client);
+ 	} else {
+ 		ret = drm_client_modeset_commit(&fb_helper->client);
++		if (ret == -EBUSY && drm_fb_helper_all_crtcs_inactive(fb_helper->dev)) {
++			drm_dbg_kms(fb_helper->dev,
++				    "forcing fbdev restore while all CRTCs are inactive\n");
++			ret = drm_client_modeset_commit_locked(&fb_helper->client);
++			if (!ret)
++				drm_fb_helper_retrain(fb_helper);
++		}
+ 	}
+ 
+ 	do_delayed = fb_helper->delayed_hotplug;
+@@ -402,6 +444,49 @@ static void drm_fb_helper_damage_work(struct work_struct *work)
+ 	drm_fb_helper_fb_dirty(helper);
+ }
+ 
++static void drm_fb_helper_flush_console(struct drm_fb_helper *helper)
++{
++	struct fb_info *info = helper->info;
++	struct drm_clip_rect clip;
++	int ret;
++
++	if (!info || !helper->funcs->fb_dirty)
++		return;
++
++	clip.x1 = 0;
++	clip.y1 = 0;
++	clip.x2 = info->var.xres;
++	clip.y2 = info->var.yres;
++
++	ret = helper->funcs->fb_dirty(helper, &clip);
++	if (ret)
++		drm_dbg_kms(helper->dev, "failed to flush fbdev console: %d\n", ret);
++}
++
++static void drm_fb_helper_refresh_console_work(struct work_struct *work)
++{
++	struct drm_fb_helper *helper = container_of(work, struct drm_fb_helper,
++						    refresh_work);
++	struct fb_info *info = helper->info;
++	int ret = 0;
++
++	if (!info)
++		return;
++
++	console_lock();
++	if (info->fbops->fb_blank && info->blank)
++		ret = fb_blank(info, FB_BLANK_UNBLANK);
++	mutex_lock(&info->lock);
++	fbcon_update_vcs(info, true);
++	mutex_unlock(&info->lock);
++	console_unlock();
++
++	if (ret)
++		drm_dbg_kms(helper->dev, "failed to refresh fbdev console: %d\n", ret);
++
++	drm_fb_helper_flush_console(helper);
++}
++
+ /**
+  * drm_fb_helper_prepare - setup a drm_fb_helper structure
+  * @dev: DRM device
+@@ -434,6 +519,7 @@ void drm_fb_helper_prepare(struct drm_device *dev, struct drm_fb_helper *helper,
+ 	spin_lock_init(&helper->damage_lock);
+ 	INIT_WORK(&helper->resume_work, drm_fb_helper_resume_worker);
+ 	INIT_WORK(&helper->damage_work, drm_fb_helper_damage_work);
++	INIT_WORK(&helper->refresh_work, drm_fb_helper_refresh_console_work);
+ 	helper->damage_clip.x1 = helper->damage_clip.y1 = ~0;
+ 	mutex_init(&helper->lock);
+ 	helper->funcs = funcs;
+@@ -562,6 +648,7 @@ void drm_fb_helper_fini(struct drm_fb_helper *fb_helper)
+ 	if (!drm_fbdev_emulation)
+ 		return;
+ 
++	cancel_work_sync(&fb_helper->refresh_work);
+ 	cancel_work_sync(&fb_helper->resume_work);
+ 	cancel_work_sync(&fb_helper->damage_work);
+ 
+@@ -1785,6 +1872,7 @@ __drm_fb_helper_initial_config_and_unlock(struct drm_fb_helper *fb_helper)
+ 	struct drm_device *dev = fb_helper->dev;
+ 	struct fb_info *info;
+ 	unsigned int width, height;
++	bool was_deferred;
+ 	int ret;
+ 
+ 	width = dev->mode_config.max_width;
+@@ -1810,6 +1898,7 @@ __drm_fb_helper_initial_config_and_unlock(struct drm_fb_helper *fb_helper)
+ 	}
+ 	drm_setup_crtcs_fb(fb_helper);
+ 
++	was_deferred = fb_helper->deferred_setup;
+ 	fb_helper->deferred_setup = false;
+ 
+ 	info->var.pixclock = 0;
+@@ -1826,6 +1915,15 @@ __drm_fb_helper_initial_config_and_unlock(struct drm_fb_helper *fb_helper)
+ 	drm_info(dev, "fb%d: %s frame buffer device\n",
+ 		 info->node, info->fix.id);
+ 
++	if (was_deferred) {
++		drm_fb_helper_set_par(info);
++		drm_fb_helper_retrain(fb_helper);
++	}
++
++	schedule_work(&fb_helper->refresh_work);
++	if (fb_helper->info && fb_helper->info->device)
++		kobject_uevent(&fb_helper->info->device->kobj, KOBJ_CHANGE);
++
+ 	mutex_lock(&kernel_fb_helper_lock);
+ 	if (list_empty(&kernel_fb_helper_list))
+ 		register_sysrq_key('v', &sysrq_drm_fb_helper_restore_op);
+@@ -1928,13 +2026,15 @@ int drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper)
+ 		return err;
+ 	}
+ 
+-	if (!fb_helper->fb || !drm_master_internal_acquire(fb_helper->dev)) {
+-		fb_helper->delayed_hotplug = true;
+-		mutex_unlock(&fb_helper->lock);
+-		return err;
+-	}
++	if (!fb_helper->fb)
++		goto delayed;
+ 
+-	drm_master_internal_release(fb_helper->dev);
++	if (!drm_master_internal_acquire(fb_helper->dev)) {
++		if (!drm_fb_helper_all_crtcs_inactive(fb_helper->dev))
++			goto delayed;
++	} else {
++		drm_master_internal_release(fb_helper->dev);
++	}
+ 
+ 	drm_dbg_kms(fb_helper->dev, "\n");
+ 
+@@ -1944,6 +2044,15 @@ int drm_fb_helper_hotplug_event(struct drm_fb_helper *fb_helper)
+ 
+ 	drm_fb_helper_set_par(fb_helper->info);
+ 
++	schedule_work(&fb_helper->refresh_work);
++	if (fb_helper->info && fb_helper->info->device)
++		kobject_uevent(&fb_helper->info->device->kobj, KOBJ_CHANGE);
++
+ 	return 0;
++
++delayed:
++	fb_helper->delayed_hotplug = true;
++	mutex_unlock(&fb_helper->lock);
++	return err;
+ }
+ EXPORT_SYMBOL(drm_fb_helper_hotplug_event);
+diff --git a/include/drm/drm_client.h b/include/drm/drm_client.h
+index bf9783c97..26613cbfe 100644
+--- a/include/drm/drm_client.h
++++ b/include/drm/drm_client.h
+@@ -203,6 +203,7 @@ bool drm_client_rotation(struct drm_mode_set *modeset, unsigned int *rotation);
+ int drm_client_modeset_check(struct drm_client_dev *client);
+ int drm_client_modeset_commit_locked(struct drm_client_dev *client);
+ int drm_client_modeset_commit(struct drm_client_dev *client);
++int drm_client_modeset_dpms_locked(struct drm_client_dev *client, int mode);
+ int drm_client_modeset_dpms(struct drm_client_dev *client, int mode);
+ 
+ /**
+diff --git a/include/drm/drm_fb_helper.h b/include/drm/drm_fb_helper.h
+index dd9a18f8d..d8650406d 100644
+--- a/include/drm/drm_fb_helper.h
++++ b/include/drm/drm_fb_helper.h
+@@ -123,6 +123,7 @@ struct drm_fb_helper_funcs {
+  * @damage_lock: spinlock protecting @damage_clip
+  * @damage_work: worker used to flush the framebuffer
+  * @resume_work: worker used during resume if the console lock is already taken
++ * @refresh_work: worker used to refresh the fbdev console after a modeset
+  *
+  * This is the main structure used by the fbdev helpers. Drivers supporting
+  * fbdev emulation should embedded this into their overall driver structure.
+@@ -153,6 +154,7 @@ struct drm_fb_helper {
+ 	spinlock_t damage_lock;
+ 	struct work_struct damage_work;
+ 	struct work_struct resume_work;
++	struct work_struct refresh_work;
+ 
+ 	/**
+ 	 * @lock:

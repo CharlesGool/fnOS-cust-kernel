@@ -1,0 +1,56 @@
+From 0afc8bd3adccba9e2c43b6a4ee3b4ffbfac8ebb6 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:27:48 +0000
+Subject: [PATCH 090/110] =?UTF-8?q?md.h:=20=E5=A3=B0=E6=98=8E=20raid456=20?=
+ =?UTF-8?q?=E8=B0=83=E7=94=A8=E7=9A=84=20md.c=20=E6=96=B0=E5=87=BD?=
+ =?UTF-8?q?=E6=95=B0(=E9=A3=9E=E7=89=9B=E5=8E=9F=E5=9E=8B)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+只加声明, 实现在 md.c 子任务(work-md)里。原型取自飞牛 vmlinux BTF(btfproto.py):
+- 上游 7.x 已有: md_sync_error、mddev_bio_split_at_reshape_offset(159)
+- 飞牛私有: md_sb_pending、md_update_rdev_capabilities、md_mark_discard_unsupported、
+  md_llbitmap_sync_target、md_speedup_resync、md_speedup_requested_resync、
+  md_dfr_started、md_dfr_set_sync_takeover、md_rdev_in_dfr、md_start_dfr、md_stop_dfr、
+  stripe_start_dfr、stripe_end_dfr、stripe_end_bio(DFR = degradation free recover)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/md.h | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 7a2842803..25ad097ae 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -1070,6 +1070,29 @@ extern void mddev_destroy_serial_pool(struct mddev *mddev,
+ struct md_rdev *md_find_rdev_nr_rcu(struct mddev *mddev, int nr);
+ struct md_rdev *md_find_rdev_rcu(struct mddev *mddev, dev_t dev);
+ 
++/* md.c helpers used by raid456 (fnnas) */
++extern void md_sync_error(struct mddev *mddev);
++struct bio *mddev_bio_split_at_reshape_offset(struct mddev *mddev,
++					      struct bio *bio,
++					      unsigned int *max_sectors,
++					      struct bio_set *bs);
++extern bool md_sb_pending(struct mddev *mddev);
++extern void md_update_rdev_capabilities(struct mddev *mddev);
++extern void md_mark_discard_unsupported(struct bio *bio);
++extern int md_llbitmap_sync_target(struct mddev *mddev, sector_t offset);
++extern sector_t md_speedup_resync(struct mddev *mddev, sector_t sector_nr);
++extern sector_t md_speedup_requested_resync(struct mddev *mddev,
++					    sector_t sector_nr);
++extern bool md_dfr_started(struct mddev *mddev);
++extern void md_dfr_set_sync_takeover(struct mddev *mddev);
++extern bool md_rdev_in_dfr(struct mddev *mddev, struct md_rdev *rdev);
++extern bool md_start_dfr(struct md_rdev *rdev, struct bio *bio);
++extern void md_stop_dfr(struct md_rdev *rdev);
++struct stripe_head;
++extern bool stripe_start_dfr(struct md_rdev *rdev, struct stripe_head *sh);
++extern void stripe_end_dfr(struct stripe_head *sh);
++extern void stripe_end_bio(struct stripe_head *sh, struct bio *bio);
++
+ static inline bool is_rdev_broken(struct md_rdev *rdev)
+ {
+ 	return !disk_live(rdev->bdev->bd_disk);

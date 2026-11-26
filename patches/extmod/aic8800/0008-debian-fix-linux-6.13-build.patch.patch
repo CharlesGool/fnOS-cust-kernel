@@ -1,0 +1,142 @@
+From 09c751a6764bb2e977bb4cbc01aaec642ff89362 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:11:08 +0000
+Subject: [PATCH 08/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-linux-?=
+ =?UTF-8?q?6.13-build.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../driver/aic8800/aic8800_fdrv/rwnx_main.c       | 11 +++++++++++
+ .../driver/aic8800/aic8800_bsp/aic_bsp_driver.c   |  4 ++++
+ .../driver/aic8800/aic8800_fdrv/rwnx_main.c       | 15 +++++++++++++++
+ .../driver/aic8800/aic8800_fdrv/rwnx_platform.c   |  4 ++++
+ 4 files changed, 34 insertions(+)
+
+diff --git a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+index e563d98..2a0c9c7 100644
+--- a/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/src/PCIE/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -3684,6 +3684,9 @@ static int rwnx_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *dev)
+  * configured at firmware level.
+  */
+ static int rwnx_cfg80211_set_monitor_channel(struct wiphy *wiphy,
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION (6, 13, 0)) || (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 101))
++											 struct net_device *dev,
++#endif
+ 											 struct cfg80211_chan_def *chandef)
+ {
+ 	struct rwnx_hw *rwnx_hw = wiphy_priv(wiphy);
+@@ -3738,7 +3741,11 @@ static int rwnx_cfg80211_set_monitor_channel(struct wiphy *wiphy,
+ 
+ int rwnx_cfg80211_set_monitor_channel_(struct wiphy *wiphy,
+                                              struct cfg80211_chan_def *chandef){
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION (6, 13, 0)) || (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 101))
++    return rwnx_cfg80211_set_monitor_channel(wiphy, NULL, chandef);
++#else
+     return rwnx_cfg80211_set_monitor_channel(wiphy, chandef);
++#endif
+ }
+ 
+ /**
+@@ -4149,7 +4156,11 @@ static int rwnx_cfg80211_get_channel(struct wiphy *wiphy,
+ 
+ 	if (rwnx_vif->vif_index == rwnx_hw->monitor_vif) {
+ 		//retrieve channel from firmware
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION (6, 13, 0)) || (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 101))
++		rwnx_cfg80211_set_monitor_channel(wiphy, NULL, NULL);
++#else
+ 		rwnx_cfg80211_set_monitor_channel(wiphy, NULL);
++#endif
+ 	}
+ 
+ 	//Check if channel context is valid
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
+index f723a22..138c8d3 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_bsp/aic_bsp_driver.c
+@@ -476,8 +476,12 @@ void rwnx_rx_handle_msg(struct aic_sdio_dev *sdiodev, struct ipc_e2a_msg *msg)
+ }
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
++#else
+ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+ #endif
++#endif
+ 
+ #define MD5(x) x[0],x[1],x[2],x[3],x[4],x[5],x[6],x[7],x[8],x[9],x[10],x[11],x[12],x[13],x[14],x[15]
+ #define MD5PINRT "file md5:%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\r\n"
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+index 9742add..db8852e 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_main.c
+@@ -3601,6 +3601,9 @@ static int rwnx_cfg80211_stop_ap(struct wiphy *wiphy, struct net_device *dev)
+  * configured at firmware level.
+  */
+ static int rwnx_cfg80211_set_monitor_channel(struct wiphy *wiphy,
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION (6, 13, 0)) || (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 101))
++											 struct net_device *dev,
++#endif
+ 											 struct cfg80211_chan_def *chandef)
+ {
+ 	struct rwnx_hw *rwnx_hw = wiphy_priv(wiphy);
+@@ -3655,7 +3658,11 @@ static int rwnx_cfg80211_set_monitor_channel(struct wiphy *wiphy,
+ 
+ int rwnx_cfg80211_set_monitor_channel_(struct wiphy *wiphy,
+                                              struct cfg80211_chan_def *chandef){
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION (6, 13, 0)) || (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 101))
++    return rwnx_cfg80211_set_monitor_channel(wiphy, NULL, chandef);
++#else
+     return rwnx_cfg80211_set_monitor_channel(wiphy, chandef);
++#endif
+ }
+ 
+ 
+@@ -4074,7 +4081,11 @@ static int rwnx_cfg80211_get_channel(struct wiphy *wiphy,
+ 
+ 	if (rwnx_vif->vif_index == rwnx_hw->monitor_vif) {
+ 		//retrieve channel from firmware
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION (6, 13, 0)) || (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 101))
++		rwnx_cfg80211_set_monitor_channel(wiphy, NULL, NULL);
++#else
+ 		rwnx_cfg80211_set_monitor_channel(wiphy, NULL);
++#endif
+ 	}
+ 
+ 	//Check if channel context is valid
+@@ -6460,8 +6471,12 @@ static void __exit rwnx_mod_exit(void)
+ 
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
++#else
+ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+ #endif
++#endif
+ 
+ module_init(rwnx_mod_init);
+ module_exit(rwnx_mod_exit);
+diff --git a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_platform.c b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_platform.c
+index cc1b479..64d97a3 100644
+--- a/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_platform.c
++++ b/src/SDIO/driver_fw/driver/aic8800/aic8800_fdrv/rwnx_platform.c
+@@ -548,8 +548,12 @@ static int rwnx_plat_tl4_fw_upload(struct rwnx_plat *rwnx_plat, u8 *fw_addr,
+ #endif
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
++#else
+ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+ #endif
++#endif
+ 
+ #if 0
+ /**

@@ -1,0 +1,93 @@
+From 445f81e90adb9682f50b0edce4b2e0d7038cf0e3 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:51:20 +0700
+Subject: [PATCH 039/110] =?UTF-8?q?ext4:=20trimacl=20/=20notrimacl=20?=
+ =?UTF-8?q?=E6=8C=82=E8=BD=BD=E9=80=89=E9=A1=B9=20(=E9=A3=9E=E7=89=9B?=
+ =?UTF-8?q?=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+新增挂载选项 trimacl / notrimacl (EXT4_MOUNT_TRIMACL = 0x00002, Opt_trimacl=72,
+Opt_notrimacl=73, 参数表放在 acl 之后, mount_opts 表放在 nouid32 之前)。
+- 挂载: 选项开启时置 SB_TRIMACL 和 SB_POSIXACL
+- remount: 关掉选项时清 SB_TRIMACL, 开启时置 SB_TRIMACL|SB_POSIXACL
+源码形态按飞牛反汇编 (ext4_fill_super / ext4_reconfigure) 还原;
+ext4_param_specs / ext4_mount_opts 两张表与飞牛逐项一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/ext4/ext4.h  |  1 +
+ fs/ext4/super.c | 19 +++++++++++++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 9c67a2c28..97a754640 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -1211,6 +1211,7 @@ struct ext4_inode_info {
+  * Mount flags set via mount options or defaults
+  */
+ #define EXT4_MOUNT_NO_MBCACHE		0x00001 /* Do not use mbcache */
++#define EXT4_MOUNT_TRIMACL		0x00002 /* shasure - trimacl: 卷启用 trim acl */
+ #define EXT4_MOUNT_GRPID		0x00004	/* Create files with directory's group */
+ #define EXT4_MOUNT_DEBUG		0x00008	/* Some debugging messages */
+ #define EXT4_MOUNT_ERRORS_CONT		0x00010	/* Continue on errors */
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 613b04b64..c0a08908c 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -1680,6 +1680,7 @@ enum {
+ 	Opt_max_dir_size_kb, Opt_nojournal_checksum, Opt_nombcache,
+ 	Opt_no_prefetch_block_bitmaps, Opt_mb_optimize_scan,
+ 	Opt_errors, Opt_data, Opt_data_err, Opt_jqfmt, Opt_dax_type,
++	Opt_trimacl, Opt_notrimacl,
+ #ifdef CONFIG_EXT4_DEBUG
+ 	Opt_fc_debug_max_replay, Opt_fc_debug_force
+ #endif
+@@ -1743,6 +1744,8 @@ static const struct fs_parameter_spec ext4_param_specs[] = {
+ 	fsparam_flag	("orlov",		Opt_removed),
+ 	fsparam_flag	("user_xattr",		Opt_user_xattr),
+ 	fsparam_flag	("acl",			Opt_acl),
++	fsparam_flag	("trimacl",		Opt_trimacl),
++	fsparam_flag	("notrimacl",		Opt_notrimacl),
+ 	fsparam_flag	("norecovery",		Opt_noload),
+ 	fsparam_flag	("noload",		Opt_noload),
+ 	fsparam_flag	("bh",			Opt_removed),
+@@ -1892,6 +1895,8 @@ static const struct mount_opts {
+ #else
+ 	{Opt_acl, 0, MOPT_NOSUPPORT},
+ #endif
++	{Opt_trimacl, EXT4_MOUNT_TRIMACL, MOPT_SET},
++	{Opt_notrimacl, EXT4_MOUNT_TRIMACL, MOPT_CLEAR},
+ 	{Opt_nouid32, EXT4_MOUNT_NO_UID32, MOPT_SET},
+ 	{Opt_debug, EXT4_MOUNT_DEBUG, MOPT_SET},
+ 	{Opt_quota, EXT4_MOUNT_QUOTA | EXT4_MOUNT_USRQUOTA, MOPT_SET | MOPT_Q},
+@@ -5349,6 +5354,12 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
+ 
+ 	sb->s_flags = (sb->s_flags & ~SB_POSIXACL) |
+ 		(test_opt(sb, POSIX_ACL) ? SB_POSIXACL : 0);
++	// shasure - trimacl -->
++	if (test_opt(sb, TRIMACL)) {
++		sb->s_flags |= SB_TRIMACL;
++		sb->s_flags |= SB_POSIXACL;
++	}
++	// <--
+ 
+ 	/* HSM events are allowed by default. */
+ 	sb->s_iflags |= SB_I_ALLOW_HSM;
+@@ -6605,6 +6616,14 @@ static int __ext4_remount(struct fs_context *fc, struct super_block *sb)
+ 
+ 	sb->s_flags = (sb->s_flags & ~SB_POSIXACL) |
+ 		(test_opt(sb, POSIX_ACL) ? SB_POSIXACL : 0);
++	// shasure - trimacl -->
++	if ((sb->s_flags & SB_TRIMACL) && !test_opt(sb, TRIMACL)) {
++		sb->s_flags &= ~SB_TRIMACL;
++	} else if (test_opt(sb, TRIMACL)) {
++		sb->s_flags |= SB_TRIMACL;
++		sb->s_flags |= SB_POSIXACL;
++	}
++	// <--
+ 
+ 	es = sbi->s_es;
+ 

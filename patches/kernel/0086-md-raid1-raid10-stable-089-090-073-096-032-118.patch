@@ -1,0 +1,328 @@
+From 715457421e813009844c4184438f87e94d46b3c6 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 06:47:45 +0000
+Subject: [PATCH 086/110] =?UTF-8?q?md/raid1,raid10:=20=E6=8C=89=E9=A3=9E?=
+ =?UTF-8?q?=E7=89=9B=E5=AE=9E=E9=99=85=E5=8F=96=E8=88=8D=20stable/?=
+ =?UTF-8?q?=E4=B8=8A=E6=B8=B8=E8=A1=A5=E4=B8=81(=E5=8E=BB=E6=8E=89=20089/0?=
+ =?UTF-8?q?90/073/096,=20=E5=8A=A0=20032/118)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+逐函数比对后修正 ceea415d9 一次性取 6.18.65 的结果:
+- 去掉飞牛没有的 stable 修复:
+  089/090 md_cloned_bio(raid1_read_request 仍用 r1_bio 判断 gfp/统计,
+  raid10_read_request 保留 io_accounting 参数);
+  073 BLK_STS_INVAL(raid1_should_handle_error 只判 REQ_RAHEAD, 即 116 去掉 NOWAIT 后、
+  073 之前的写法);
+  raid1 的 096 writes_pending 修复(raid1_write_request 仍是 void, make_request 不调 md_write_end)。
+- 上游 032 2a5d4549a28d(md_done_sync 去掉 ok 参数 + md_sync_error)的 raid1/raid10 部分。
+  飞牛没取 031, end_sync_write 仍把 uptodate 传给 put_sync_write_buf(下一提交私有改动要用)。
+- 上游 118 86d801e895b8 的早期版本(raid1 原子写): set_limits 设 chunk_sectors =
+  BARRIER_UNIT_SECTOR_SIZE; 原子写时 write_behind 超 BIO_MAX_VECS 页就关掉; 去掉循环里
+  坏块 REQ_ATOMIC 直接失败; 需要拆分时 bi_status = BLK_STS_IOERR 走 err_handle。
+  飞牛没有 099(nr_pending 仍在坏块检查前加), 所以按 6.18.18 的错误处理结构写。
+不在飞牛里的(比对确认): 031、033、034、080、091、092、099、105、112、120。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/md/raid1-10.c |  6 +----
+ drivers/md/raid1.c    | 53 +++++++++++++++++--------------------------
+ drivers/md/raid10.c   | 39 +++++++++++++------------------
+ 3 files changed, 38 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/md/raid1-10.c b/drivers/md/raid1-10.c
+index 3b0e23069..98458957d 100644
+--- a/drivers/md/raid1-10.c
++++ b/drivers/md/raid1-10.c
+@@ -292,12 +292,8 @@ static inline bool raid1_should_read_first(struct mddev *mddev,
+ /*
+  * bio with REQ_RAHEAD can fail at anytime, before such IO is submitted to the
+  * underlying disks, hence don't record badblocks or retry in this case.
+- *
+- * BLK_STS_INVAL means the bio was not valid for the underlying device. This
+- * is a user error, not a device failure, so retrying or recording bad blocks
+- * would be wrong.
+  */
+ static inline bool raid1_should_handle_error(struct bio *bio)
+ {
+-	return !(bio->bi_opf & REQ_RAHEAD) && bio->bi_status != BLK_STS_INVAL;
++	return !(bio->bi_opf & REQ_RAHEAD);
+ }
+diff --git a/drivers/md/raid1.c b/drivers/md/raid1.c
+index f8d2347c7..c479db199 100644
+--- a/drivers/md/raid1.c
++++ b/drivers/md/raid1.c
+@@ -1303,18 +1303,11 @@ static void raid1_read_request(struct mddev *mddev, struct bio *bio,
+ 	bool r1bio_existed = !!r1_bio;
+ 
+ 	/*
+-	 * An md cloned bio indicates we are in the error path.
+-	 * This is more reliable than checking r1_bio, which might
+-	 * be NULL even in the error path if a failed bio was split.
+-	 */
+-	bool err_path = md_cloned_bio(mddev, bio);
+-
+-	/*
+-	 * If we are in the error path, we are blocking the raid1d
+-	 * thread so there is a tiny risk of deadlock.  So ask for
++	 * If r1_bio is set, we are blocking the raid1d thread
++	 * so there is a tiny risk of deadlock.  So ask for
+ 	 * emergency memory if needed.
+ 	 */
+-	gfp_t gfp = err_path ? (GFP_NOIO | __GFP_HIGH) : GFP_NOIO;
++	gfp_t gfp = r1_bio ? (GFP_NOIO | __GFP_HIGH) : GFP_NOIO;
+ 
+ 	/*
+ 	 * Still need barrier for READ in case that whole
+@@ -1374,7 +1367,7 @@ static void raid1_read_request(struct mddev *mddev, struct bio *bio,
+ 	}
+ 
+ 	r1_bio->read_disk = rdisk;
+-	if (likely(!md_cloned_bio(mddev, bio))) {
++	if (!r1bio_existed) {
+ 		md_account_bio(mddev, &bio);
+ 		r1_bio->master_bio = bio;
+ 	}
+@@ -1451,7 +1444,7 @@ static void raid1_start_write_behind(struct mddev *mddev, struct r1bio *r1_bio,
+ 
+ }
+ 
+-static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
++static void raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 				int max_write_sectors)
+ {
+ 	struct r1conf *conf = mddev->private;
+@@ -1461,6 +1454,7 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 	int first_clone;
+ 	int max_sectors;
+ 	bool write_behind = false;
++	bool atomic = bio->bi_opf & REQ_ATOMIC;
+ 	bool is_discard = (bio_op(bio) == REQ_OP_DISCARD);
+ 	sector_t sector = bio->bi_iter.bi_sector;
+ 
+@@ -1515,6 +1509,8 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 		 */
+ 		if (!is_discard && rdev && test_bit(WriteMostly, &rdev->flags))
+ 			write_behind = true;
++		if (atomic && max_sectors > BIO_MAX_VECS * (PAGE_SIZE >> 9))
++			write_behind = false;
+ 
+ 		r1_bio->bios[i] = NULL;
+ 		if (!rdev || test_bit(Faulty, &rdev->flags))
+@@ -1542,18 +1538,6 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 			if (is_bad) {
+ 				int good_sectors;
+ 
+-				/*
+-				 * We cannot atomically write this, so just
+-				 * error in that case. It could be possible to
+-				 * atomically write other mirrors, but the
+-				 * complexity of supporting that is not worth
+-				 * the benefit.
+-				 */
+-				if (bio->bi_opf & REQ_ATOMIC) {
+-					rdev_dec_pending(rdev, mddev);
+-					goto err_handle;
+-				}
+-
+ 				good_sectors = first_bad - r1_bio->sector;
+ 				if (good_sectors < max_sectors)
+ 					max_sectors = good_sectors;
+@@ -1572,6 +1556,12 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 		max_sectors = min_t(int, max_sectors,
+ 				    BIO_MAX_VECS * (PAGE_SIZE >> 9));
+ 	if (max_sectors < bio_sectors(bio)) {
++		/* atomic write can't be split, fail it */
++		if (atomic) {
++			bio->bi_status = BLK_STS_IOERR;
++			goto err_handle;
++		}
++
+ 		bio = bio_submit_split_bioset(bio, max_sectors,
+ 					      &conf->bio_split);
+ 		if (!bio) {
+@@ -1644,7 +1634,7 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 
+ 	/* In case raid1d snuck in to freeze_array */
+ 	wake_up_barrier(conf);
+-	return true;
++	return;
+ 
+ err_handle:
+ 	for (k = 0; k < i; k++) {
+@@ -1655,7 +1645,6 @@ static bool raid1_write_request(struct mddev *mddev, struct bio *bio,
+ 	}
+ 
+ 	raid_end_bio_io(r1_bio);
+-	return false;
+ }
+ 
+ static bool raid1_make_request(struct mddev *mddev, struct bio *bio)
+@@ -1680,8 +1669,7 @@ static bool raid1_make_request(struct mddev *mddev, struct bio *bio)
+ 		raid1_read_request(mddev, bio, sectors, NULL);
+ 	else {
+ 		md_write_start(mddev, bio);
+-		if (!raid1_write_request(mddev, bio, sectors))
+-			md_write_end(mddev);
++		raid1_write_request(mddev, bio, sectors);
+ 	}
+ 	return true;
+ }
+@@ -2045,7 +2033,7 @@ static void put_sync_write_buf(struct r1bio *r1_bio, int uptodate)
+ 			reschedule_retry(r1_bio);
+ 		else {
+ 			put_buf(r1_bio);
+-			md_done_sync(mddev, s, uptodate);
++			md_done_sync(mddev, s);
+ 		}
+ 	}
+ }
+@@ -2321,8 +2309,8 @@ static void sync_request_write(struct mddev *mddev, struct r1bio *r1_bio)
+ 		if (test_bit(MD_RECOVERY_REQUESTED, &mddev->recovery) ||
+ 		    !fix_sync_read_error(r1_bio)) {
+ 			conf->recovery_disabled = mddev->recovery_disabled;
+-			set_bit(MD_RECOVERY_INTR, &mddev->recovery);
+-			md_done_sync(mddev, r1_bio->sectors, 0);
++			md_done_sync(mddev, r1_bio->sectors);
++			md_sync_error(mddev);
+ 			put_buf(r1_bio);
+ 			return;
+ 		}
+@@ -2548,7 +2536,7 @@ static void handle_sync_write_finished(struct r1conf *conf, struct r1bio *r1_bio
+ 		}
+ 	}
+ 	put_buf(r1_bio);
+-	md_done_sync(conf->mddev, s, 1);
++	md_done_sync(conf->mddev, s);
+ }
+ 
+ static void handle_write_finished(struct r1conf *conf, struct r1bio *r1_bio)
+@@ -3185,6 +3173,7 @@ static int raid1_set_limits(struct mddev *mddev)
+ 	md_init_stacking_limits(&lim);
+ 	lim.max_write_zeroes_sectors = 0;
+ 	lim.max_hw_wzeroes_unmap_sectors = 0;
++	lim.chunk_sectors = BARRIER_UNIT_SECTOR_SIZE;
+ 	lim.logical_block_size = mddev->logical_block_size;
+ 	lim.features |= BLK_FEAT_ATOMIC_WRITES;
+ 	err = mddev_stack_rdev_limits(mddev, &lim, MDDEV_STACK_INTEGRITY);
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 5d7882490..d067fa135 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1139,7 +1139,7 @@ static void regular_request_wait(struct mddev *mddev, struct r10conf *conf,
+ }
+ 
+ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
+-				struct r10bio *r10_bio)
++				struct r10bio *r10_bio, bool io_accounting)
+ {
+ 	struct r10conf *conf = mddev->private;
+ 	struct bio *read_bio;
+@@ -1148,20 +1148,7 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
+ 	char b[BDEVNAME_SIZE];
+ 	int slot = r10_bio->read_slot;
+ 	struct md_rdev *err_rdev = NULL;
+-
+-	/*
+-	 * An md cloned bio indicates we are in the error path.
+-	 * This is more reliable than checking slot, which might
+-	 * be -1 even in the error path if a failed bio was split.
+-	 */
+-	bool err_path = md_cloned_bio(mddev, bio);
+-
+-	/*
+-	 * If we are in the error path, we are blocking the raid10d
+-	 * thread so there is a tiny risk of deadlock.  So ask for
+-	 * emergency memory if needed.
+-	 */
+-	gfp_t gfp = err_path ? (GFP_NOIO | __GFP_HIGH) : GFP_NOIO;
++	gfp_t gfp = GFP_NOIO;
+ 
+ 	if (slot >= 0 && r10_bio->devs[slot].rdev) {
+ 		/*
+@@ -1172,6 +1159,11 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
+ 		 * we lose the device name in error messages.
+ 		 */
+ 		int disk;
++		/*
++		 * As we are blocking raid10, it is a little safer to
++		 * use __GFP_HIGH.
++		 */
++		gfp = GFP_NOIO | __GFP_HIGH;
+ 
+ 		disk = r10_bio->devs[slot].devnum;
+ 		err_rdev = conf->mirrors[disk].rdev;
+@@ -1216,7 +1208,7 @@ static void raid10_read_request(struct mddev *mddev, struct bio *bio,
+ 	}
+ 	slot = r10_bio->read_slot;
+ 
+-	if (likely(!md_cloned_bio(mddev, bio))) {
++	if (io_accounting) {
+ 		md_account_bio(mddev, &bio);
+ 		r10_bio->master_bio = bio;
+ 	}
+@@ -1519,7 +1511,7 @@ static bool __make_request(struct mddev *mddev, struct bio *bio, int sectors)
+ 
+ 	ret = true;
+ 	if (bio_data_dir(bio) == READ)
+-		raid10_read_request(mddev, bio, r10_bio);
++		raid10_read_request(mddev, bio, r10_bio, true);
+ 	else
+ 		ret = raid10_write_request(mddev, bio, r10_bio);
+ 
+@@ -2256,7 +2248,7 @@ static void end_sync_request(struct r10bio *r10_bio)
+ 				reschedule_retry(r10_bio);
+ 			else
+ 				put_buf(r10_bio);
+-			md_done_sync(mddev, s, 1);
++			md_done_sync(mddev, s);
+ 			break;
+ 		} else {
+ 			struct r10bio *r10_bio2 = (struct r10bio *)r10_bio->master_bio;
+@@ -2432,7 +2424,7 @@ static void sync_request_write(struct mddev *mddev, struct r10bio *r10_bio)
+ 
+ done:
+ 	if (atomic_dec_and_test(&r10_bio->remaining)) {
+-		md_done_sync(mddev, r10_bio->sectors, 1);
++		md_done_sync(mddev, r10_bio->sectors);
+ 		put_buf(r10_bio);
+ 	}
+ }
+@@ -2844,7 +2836,7 @@ static void handle_read_error(struct mddev *mddev, struct r10bio *r10_bio)
+ 
+ 	rdev_dec_pending(rdev, mddev);
+ 	r10_bio->state = 0;
+-	raid10_read_request(mddev, r10_bio->master_bio, r10_bio);
++	raid10_read_request(mddev, r10_bio->master_bio, r10_bio, false);
+ 	/*
+ 	 * allow_barrier after re-submit to ensure no sync io
+ 	 * can be issued while regular io pending.
+@@ -3737,7 +3729,7 @@ static sector_t raid10_sync_request(struct mddev *mddev, sector_t sector_nr,
+ 		/* pretend they weren't skipped, it makes
+ 		 * no important difference in this case
+ 		 */
+-		md_done_sync(mddev, sectors_skipped, 1);
++		md_done_sync(mddev, sectors_skipped);
+ 
+ 	return sectors_skipped + nr_sectors;
+  giveup:
+@@ -4905,7 +4897,8 @@ static void reshape_request_write(struct mddev *mddev, struct r10bio *r10_bio)
+ 	if (!test_bit(R10BIO_Uptodate, &r10_bio->state))
+ 		if (handle_reshape_read_error(mddev, r10_bio) < 0) {
+ 			/* Reshape has been aborted */
+-			md_done_sync(mddev, r10_bio->sectors, 0);
++			md_done_sync(mddev, r10_bio->sectors);
++			md_sync_error(mddev);
+ 			return;
+ 		}
+ 
+@@ -5063,7 +5056,7 @@ static void end_reshape_request(struct r10bio *r10_bio)
+ {
+ 	if (!atomic_dec_and_test(&r10_bio->remaining))
+ 		return;
+-	md_done_sync(r10_bio->mddev, r10_bio->sectors, 1);
++	md_done_sync(r10_bio->mddev, r10_bio->sectors);
+ 	bio_put(r10_bio->master_bio);
+ 	put_buf(r10_bio);
+ }

@@ -1,0 +1,69 @@
+From 5f17e03d792b11e5b86246f7544d99ba645a0d14 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Wed, 25 Nov 2026 01:12:02 +0000
+Subject: [PATCH 21/28] =?UTF-8?q?debian=20=E8=A1=A5=E4=B8=81:=20fix-usb-su?=
+ =?UTF-8?q?spend-reboot-hang.patch?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+来自 radxa-pkg/aic8800 的 debian/patches(跳过固件路径相关补丁, 飞牛用 /lib/firmware/aic8800/{sdio,usb})
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../drivers/aic8800/aic8800_fdrv/aicwf_usb.c  | 28 -------------------
+ 1 file changed, 28 deletions(-)
+
+diff --git a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+index e677d06..b0faae6 100644
+--- a/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
++++ b/src/USB/driver_fw/drivers/aic8800/aic8800_fdrv/aicwf_usb.c
+@@ -297,18 +297,6 @@ static void aicwf_usb_rx_complete(struct urb *urb)
+         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+         if(urb->status < 0){
+             AICWFDBG(LOGDEBUG, "%s urb->status:%d \r\n", __func__, urb->status);
+-
+-            if(g_rwnx_plat->wait_disconnect_cb == false){
+-                g_rwnx_plat->wait_disconnect_cb = true;
+-                if(atomic_read(&aicwf_deinit_atomic) > 0){
+-                    atomic_set(&aicwf_deinit_atomic, 0);
+-                    down(&aicwf_deinit_sem);
+-                    AICWFDBG(LOGINFO, "%s need to wait for disconnect callback \r\n", __func__);
+-                }else{
+-                    g_rwnx_plat->wait_disconnect_cb = false;
+-                }
+-            }
+-
+             return;
+         }else{
+             //schedule_work(&usb_dev->rx_urb_work);
+@@ -385,18 +373,6 @@ static void aicwf_usb_rx_complete(struct urb *urb)
+         aicwf_usb_rx_buf_put(usb_dev, usb_buf);
+ 		if(urb->status < 0){
+ 			AICWFDBG(LOGDEBUG, "%s urb->status:%d \r\n", __func__, urb->status);
+-
+-			if(g_rwnx_plat->wait_disconnect_cb == false){
+-				g_rwnx_plat->wait_disconnect_cb = true;
+-				if(atomic_read(&aicwf_deinit_atomic) > 0){
+-					atomic_set(&aicwf_deinit_atomic, 0);
+-					down(&aicwf_deinit_sem);
+-					AICWFDBG(LOGINFO, "%s need to wait for disconnect callback \r\n", __func__);
+-				}else{
+-					g_rwnx_plat->wait_disconnect_cb = false;
+-				}
+-			}
+-
+ 			return;
+ 		}else{
+ 			//schedule_work(&usb_dev->rx_urb_work);
+@@ -1979,10 +1955,6 @@ static void aicwf_usb_bus_stop(struct device *dev)
+     if (usb_dev->state == USB_DOWN_ST)
+         return;
+ 
+-    if(g_rwnx_plat && g_rwnx_plat->wait_disconnect_cb == true){
+-        atomic_set(&aicwf_deinit_atomic, 1);
+-        up(&aicwf_deinit_sem);
+-    }
+     aicwf_usb_state_change(usb_dev, USB_DOWN_ST);
+     //aicwf_usb_cancel_all_urbs(usb_dev);//AIDEN
+ }

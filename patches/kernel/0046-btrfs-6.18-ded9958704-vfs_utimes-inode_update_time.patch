@@ -1,0 +1,41 @@
+From 03e8a0e35e617ed6cb2a05032e49d114decf6ef7 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:47:12 +0700
+Subject: [PATCH 046/110] =?UTF-8?q?btrfs:=20=E9=80=82=E9=85=8D=206.18:=20?=
+ =?UTF-8?q?=E5=9B=9E=E9=80=80=20ded9958704=20(vfs=5Futimes=20=E6=9C=AA?=
+ =?UTF-8?q?=E5=AF=BC=E5=87=BA,=20=E9=A3=9E=E7=89=9B=E7=94=A8=20inode=5Fupd?=
+ =?UTF-8?q?ate=5Ftime)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+btrfs_scratch_superblocks 改回 6.18/6.19 的写法。比对一致。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/btrfs/volumes.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/fs/btrfs/volumes.c b/fs/btrfs/volumes.c
+index 0e18ab04f..636c9695b 100644
+--- a/fs/btrfs/volumes.c
++++ b/fs/btrfs/volumes.c
+@@ -2119,11 +2119,14 @@ static int btrfs_add_dev_item(struct btrfs_trans_handle *trans,
+ static void update_dev_time(const char *device_path)
+ {
+ 	struct path path;
++	int ret;
+ 
+-	if (!kern_path(device_path, LOOKUP_FOLLOW, &path)) {
+-		vfs_utimes(&path, NULL);
+-		path_put(&path);
+-	}
++	ret = kern_path(device_path, LOOKUP_FOLLOW, &path);
++	if (ret)
++		return;
++
++	inode_update_time(d_inode(path.dentry), S_MTIME | S_CTIME | S_VERSION);
++	path_put(&path);
+ }
+ 
+ static int btrfs_rm_dev_item(struct btrfs_trans_handle *trans,

@@ -1,0 +1,231 @@
+From 035f8d1caa20f7116fbc6cc6e0fe46b5a8ca4873 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:51:21 +0700
+Subject: [PATCH 041/110] =?UTF-8?q?ext4:=20FIHINTUNUSED=20ioctl,=20?=
+ =?UTF-8?q?=E6=8A=8A=E7=A9=BA=E9=97=B2=E5=9D=97=E4=BD=9C=E4=B8=BA=20unused?=
+ =?UTF-8?q?=20hint=20=E5=8F=91=E7=BB=99=E5=9D=97=E8=AE=BE=E5=A4=87=20(?=
+ =?UTF-8?q?=E9=A3=9E=E7=89=9B=E7=A7=81=E6=9C=89)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ext4_trim_fs / ext4_trim_all_free / ext4_try_to_trim_range / ext4_trim_extent
+多一个 enum trim_act 参数 (TRIM_SEND_TRIM / TRIM_SEND_HINT, 定义在 fs.h)。
+- TRIM_SEND_HINT: 走 sb_hint_unused (blkdev_hint_unused) 和
+  trace_ext4_unused_hint_blocks, 不标记组已 trim, 不更新 s_last_trim_minblks
+- FIHINTUNUSED (_IOWR(x, 129, ...)): 要 CAP_SYS_ADMIN, 队列需有
+  QUEUE_FLAG_UNUSED_HINT; 读 fstrim_range 后发 hint, 成功时打
+  "total send %llu bytes hints" (结果不回写用户态)
+- FITRIM / discard work 传 TRIM_SEND_TRIM, 行为不变
+ext4_trim_fs 只差分支排列 (代码生成差异)。
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ fs/ext4/ext4.h    |  3 ++-
+ fs/ext4/ioctl.c   | 27 +++++++++++++++++++++++++-
+ fs/ext4/mballoc.c | 49 +++++++++++++++++++++++++++++++++++------------
+ 3 files changed, 65 insertions(+), 14 deletions(-)
+
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index d485a0ce7..aa6426f2c 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -3045,7 +3045,8 @@ extern int ext4_mb_add_groupinfo(struct super_block *sb,
+ 		ext4_group_t i, struct ext4_group_desc *desc);
+ extern int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
+ 				ext4_fsblk_t block, unsigned long count);
+-extern int ext4_trim_fs(struct super_block *, struct fstrim_range *);
++extern int ext4_trim_fs(struct super_block *, struct fstrim_range *,
++			enum trim_act act);
+ extern void ext4_process_freed_data(struct super_block *sb, tid_t commit_tid);
+ extern void ext4_mb_mark_bb(struct super_block *sb, ext4_fsblk_t block,
+ 			    int len, bool state);
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index be9055b08..9fc634c5e 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -1775,6 +1775,31 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		return err;
+ 	}
+ 
++	// shasure - unused hint -->
++	case FIHINTUNUSED:
++	{
++		struct request_queue *q = bdev_get_queue(sb->s_bdev);
++		struct fstrim_range range = {0};
++		int ret = 0;
++
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++
++		if (!blk_queue_unused_hint(q))
++			return -EOPNOTSUPP;
++
++		if (copy_from_user(&range, (struct fstrim_range __user *)arg,
++		    sizeof(range)))
++			return -EFAULT;
++
++		ret = ext4_trim_fs(sb, &range, TRIM_SEND_HINT);
++		if (!ret)
++			ext4_msg(sb, KERN_NOTICE, "total send %llu bytes hints",
++				 range.len);
++		return ret;
++	}
++	// <--
++
+ 	case FITRIM:
+ 	{
+ 		struct fstrim_range range;
+@@ -1797,7 +1822,7 @@ static long __ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		    sizeof(range)))
+ 			return -EFAULT;
+ 
+-		ret = ext4_trim_fs(sb, &range);
++		ret = ext4_trim_fs(sb, &range, TRIM_SEND_TRIM);
+ 		if (ret < 0)
+ 			return ret;
+ 
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index 71b8b47e2..9fec366ca 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -430,7 +430,8 @@ static int ext4_mb_scan_group(struct ext4_allocation_context *ac,
+ 
+ static int ext4_try_to_trim_range(struct super_block *sb,
+ 		struct ext4_buddy *e4b, ext4_grpblk_t start,
+-		ext4_grpblk_t max, ext4_grpblk_t minblocks);
++		ext4_grpblk_t max, ext4_grpblk_t minblocks,
++		enum trim_act act);
+ 
+ /*
+  * The algorithm using this percpu seq counter goes below:
+@@ -3674,7 +3675,8 @@ static void ext4_discard_work(struct work_struct *work)
+ 
+ 			ext4_lock_group(sb, grp);
+ 			ext4_try_to_trim_range(sb, &e4b, fd->efd_start_cluster,
+-						fd->efd_start_cluster + fd->efd_count - 1, 1);
++						fd->efd_start_cluster + fd->efd_count - 1, 1,
++						TRIM_SEND_TRIM);
+ 			ext4_unlock_group(sb, grp);
+ 		}
+ 		kmem_cache_free(ext4_free_data_cachep, fd);
+@@ -3967,6 +3969,21 @@ static inline int ext4_issue_discard(struct super_block *sb,
+ 	return sb_issue_discard(sb, discard_block, count, GFP_NOFS, 0);
+ }
+ 
++/* shasure - 把空闲块作为 unused hint 发给块设备 (FIHINTUNUSED) */
++static inline int ext4_issue_unused_hint(struct super_block *sb,
++		ext4_group_t block_group, ext4_grpblk_t cluster, int count)
++{
++	ext4_fsblk_t hint_block;
++
++	hint_block = (EXT4_C2B(EXT4_SB(sb), cluster) +
++		      ext4_group_first_block_no(sb, block_group));
++	count = EXT4_C2B(EXT4_SB(sb), count);
++	trace_ext4_unused_hint_blocks(sb,
++			(unsigned long long) hint_block, count);
++
++	return sb_hint_unused(sb, hint_block, count, GFP_NOFS);
++}
++
+ static void ext4_free_data_in_buddy(struct super_block *sb,
+ 				    struct ext4_free_data *entry)
+ {
+@@ -6871,7 +6888,8 @@ int ext4_group_add_blocks(handle_t *handle, struct super_block *sb,
+  * be called with under the group lock.
+  */
+ static int ext4_trim_extent(struct super_block *sb,
+-		int start, int count, struct ext4_buddy *e4b)
++		int start, int count, struct ext4_buddy *e4b,
++		enum trim_act act)
+ __releases(bitlock)
+ __acquires(bitlock)
+ {
+@@ -6893,7 +6911,10 @@ __acquires(bitlock)
+ 	 */
+ 	mb_mark_used(e4b, &ex);
+ 	ext4_unlock_group(sb, group);
+-	ret = ext4_issue_discard(sb, group, start, count);
++	if (act == TRIM_SEND_HINT)
++		ret = ext4_issue_unused_hint(sb, group, start, count);
++	else
++		ret = ext4_issue_discard(sb, group, start, count);
+ 	ext4_lock_group(sb, group);
+ 	mb_free_blocks(NULL, e4b, start, ex.fe_len);
+ 	return ret;
+@@ -6921,7 +6942,8 @@ static bool ext4_trim_interrupted(void)
+ 
+ static int ext4_try_to_trim_range(struct super_block *sb,
+ 		struct ext4_buddy *e4b, ext4_grpblk_t start,
+-		ext4_grpblk_t max, ext4_grpblk_t minblocks)
++		ext4_grpblk_t max, ext4_grpblk_t minblocks,
++		enum trim_act act)
+ __acquires(ext4_group_lock_ptr(sb, e4b->bd_group))
+ __releases(ext4_group_lock_ptr(sb, e4b->bd_group))
+ {
+@@ -6951,7 +6973,7 @@ __releases(ext4_group_lock_ptr(sb, e4b->bd_group))
+ 			set_trimmed = true;
+ 
+ 		if ((next - start) >= minblocks) {
+-			int ret = ext4_trim_extent(sb, start, next - start, e4b);
++			int ret = ext4_trim_extent(sb, start, next - start, e4b, act);
+ 
+ 			if (ret && ret != -EOPNOTSUPP)
+ 				return count;
+@@ -6973,7 +6995,8 @@ __releases(ext4_group_lock_ptr(sb, e4b->bd_group))
+ 			break;
+ 	}
+ 
+-	if (set_trimmed)
++	/* hint 不算真正 trim 过, 不标记 */
++	if (act == TRIM_SEND_TRIM && set_trimmed)
+ 		EXT4_MB_GRP_SET_TRIMMED(e4b->bd_info);
+ 
+ 	return count;
+@@ -6995,7 +7018,7 @@ __releases(ext4_group_lock_ptr(sb, e4b->bd_group))
+ static ext4_grpblk_t
+ ext4_trim_all_free(struct super_block *sb, ext4_group_t group,
+ 		   ext4_grpblk_t start, ext4_grpblk_t max,
+-		   ext4_grpblk_t minblocks)
++		   ext4_grpblk_t minblocks, enum trim_act act)
+ {
+ 	struct ext4_buddy e4b;
+ 	int ret;
+@@ -7013,7 +7036,8 @@ ext4_trim_all_free(struct super_block *sb, ext4_group_t group,
+ 
+ 	if (!EXT4_MB_GRP_WAS_TRIMMED(e4b.bd_info) ||
+ 	    minblocks < EXT4_SB(sb)->s_last_trim_minblks)
+-		ret = ext4_try_to_trim_range(sb, &e4b, start, max, minblocks);
++		ret = ext4_try_to_trim_range(sb, &e4b, start, max, minblocks,
++					     act);
+ 	else
+ 		ret = 0;
+ 
+@@ -7038,7 +7062,8 @@ ext4_trim_all_free(struct super_block *sb, ext4_group_t group,
+  * start to start+len. For each such a group ext4_trim_all_free function
+  * is invoked to trim all free space.
+  */
+-int ext4_trim_fs(struct super_block *sb, struct fstrim_range *range)
++int ext4_trim_fs(struct super_block *sb, struct fstrim_range *range,
++		 enum trim_act act)
+ {
+ 	unsigned int discard_granularity = bdev_discard_granularity(sb->s_bdev);
+ 	struct ext4_group_info *grp;
+@@ -7105,7 +7130,7 @@ int ext4_trim_fs(struct super_block *sb, struct fstrim_range *range)
+ 			end = last_cluster;
+ 		if (grp->bb_free >= minlen) {
+ 			cnt = ext4_trim_all_free(sb, group, first_cluster,
+-						 end, minlen);
++						 end, minlen, act);
+ 			if (cnt < 0) {
+ 				ret = cnt;
+ 				break;
+@@ -7120,7 +7145,7 @@ int ext4_trim_fs(struct super_block *sb, struct fstrim_range *range)
+ 		first_cluster = 0;
+ 	}
+ 
+-	if (!ret)
++	if (!ret && act != TRIM_SEND_HINT)
+ 		EXT4_SB(sb)->s_last_trim_minblks = minlen;
+ 
+ out:

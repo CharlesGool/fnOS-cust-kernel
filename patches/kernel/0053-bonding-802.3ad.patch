@@ -1,0 +1,83 @@
+From 04486c32147b1e7f1e1167d2f04a8714ee98a163 Mon Sep 17 00:00:00 2001
+From: kcmp <kcmp@localhost>
+Date: Tue, 24 Nov 2026 12:38:40 +0700
+Subject: [PATCH 053/110] =?UTF-8?q?bonding:=20=E5=A4=B4=E6=96=87=E4=BB=B6?=
+ =?UTF-8?q?=20=E2=80=94=20=E9=A3=9E=E7=89=9B=20802.3ad=20=E6=B7=B7?=
+ =?UTF-8?q?=E5=90=88=E9=80=9F=E7=8E=87=20/=20=E6=8C=89=E9=80=9F=E7=8E=87?=
+ =?UTF-8?q?=E5=8A=A0=E6=9D=83=E5=8F=91=E5=8C=85=E7=9A=84=E6=96=B0=E5=AD=97?=
+ =?UTF-8?q?=E6=AE=B5=E5=92=8C=E9=80=89=E9=A1=B9=E5=8F=B7?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+(公共头文件单独提交, 内容与飞牛 linux-headers 一致)
+- include/uapi/linux/if_link.h: IFLA_BOND_AD_MIXED_SPEED、IFLA_BOND_AD_PACKET_WRR
+  (接在 IFLA_BOND_BROADCAST_NEIGH 之后; 注意上游以后新增的 IFLA_BOND_* 会和它们撞号)
+- include/net/bond_options.h: BOND_OPT_AD_MIXED_SPEED、BOND_OPT_AD_PACKET_WRR
+- include/net/bonding.h: bond_params.ad_mixed_speed/ad_packet_wrr (u8),
+  slave.ad_wrr_current (s64, 平滑加权轮询的当前权值),
+  bonding.ad_wrr_lock (保护各 slave 的 ad_wrr_current)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/net/bond_options.h   | 2 ++
+ include/net/bonding.h        | 4 ++++
+ include/uapi/linux/if_link.h | 3 +++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/include/net/bond_options.h b/include/net/bond_options.h
+index 52b966e92..a9bc17449 100644
+--- a/include/net/bond_options.h
++++ b/include/net/bond_options.h
+@@ -79,6 +79,8 @@ enum {
+ 	BOND_OPT_COUPLED_CONTROL,
+ 	BOND_OPT_BROADCAST_NEIGH,
+ 	BOND_OPT_ACTOR_PORT_PRIO,
++	BOND_OPT_AD_MIXED_SPEED,
++	BOND_OPT_AD_PACKET_WRR,
+ 	BOND_OPT_LACP_STRICT,
+ 	BOND_OPT_LAST
+ };
+diff --git a/include/net/bonding.h b/include/net/bonding.h
+index 7583c321e..b97c33d7f 100644
+--- a/include/net/bonding.h
++++ b/include/net/bonding.h
+@@ -147,6 +147,8 @@ struct bond_params {
+ 	struct reciprocal_value reciprocal_packets_per_slave;
+ 	u16 ad_actor_sys_prio;
+ 	u16 ad_user_port_key;
++	u8 ad_mixed_speed;
++	u8 ad_packet_wrr;
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	struct in6_addr ns_targets[BOND_MAX_NS_TARGETS];
+ #endif
+@@ -189,6 +191,7 @@ struct slave {
+ 	struct delayed_work notify_work;
+ 	struct kobject kobj;
+ 	struct rtnl_link_stats64 slave_stats;
++	s64 ad_wrr_current; /* protected by bond->ad_wrr_lock */
+ };
+ 
+ static inline struct slave *to_slave(struct kobject *kobj)
+@@ -223,6 +226,7 @@ struct bonding {
+ 	struct   slave __rcu *primary_slave;
+ 	struct   bond_up_slave __rcu *usable_slaves;
+ 	struct   bond_up_slave __rcu *all_slaves;
++	spinlock_t ad_wrr_lock; /* protects per-slave smooth WRR credits */
+ 	bool     force_primary;
+ 	bool     notifier_ctx;
+ 	s32      slave_cnt; /* never change this value outside the attach/detach wrappers */
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 857b83a04..dd22fc1e1 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -1538,6 +1538,9 @@ enum {
+ 	IFLA_BOND_NS_IP6_TARGET,
+ 	IFLA_BOND_COUPLED_CONTROL,
+ 	IFLA_BOND_BROADCAST_NEIGH,
++	IFLA_BOND_AD_MIXED_SPEED,
++	IFLA_BOND_AD_PACKET_WRR,
++	/* 飞牛私有属性保持原编号(飞牛用户态依赖), 6.18.65 新增的 LACP_STRICT 排在后面 */
+ 	IFLA_BOND_LACP_STRICT,
+ 	__IFLA_BOND_MAX,
+ };
