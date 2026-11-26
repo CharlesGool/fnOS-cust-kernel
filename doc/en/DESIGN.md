@@ -42,19 +42,29 @@ Build flow:
 ```text
 linux-<upstream>.tar.xz + patches/kernel ─> kernel tree ─> bzImage, in-tree modules ─┐
 zfs-<version>.tar.gz + patches/zfs ─────> ZFS tree ─> spl.ko, zfs.ko ─────────────────┼─> pkg ─> linux-image-<version string>_<version>_amd64.deb
-extsrc/<directory> (= HEAD in MANIFEST.tsv) ──────> external modules ────────────────┘
+extsrc/<directory> (= commit in MANIFEST.tsv) ────> external modules ────────────────┘
 ```
 
-- `scripts/ck.sh` runs on the host. It downloads and verifies the upstream tarballs, syncs the repository into the workspace, and then runs the steps in `scripts/kwork/` inside the build container.
+- `scripts/ck.sh` runs on the host. It creates the build container, downloads and verifies the sources, syncs the repository into the workspace, and then runs the steps in `scripts/kwork/` inside the build container.
+- Sources, all in the dependency directory:
+
+  | Source | Origin | Verification |
+  | --- | --- | --- |
+  | Kernel | kernel.org tarball | `sha256sums.asc` signed by kernel.org |
+  | ZFS | OpenZFS GitHub Release | sha256 in `config/versions.conf` |
+  | External modules | Maintainer: a Git repository per directory; others: the external module source archive in this project's Release, with the commit recorded in `.ck-rev` after extraction | sha256 of the archive; before building, the commit is checked against `MANIFEST.tsv` |
+  | NVIDIA proprietary driver | Users download the `.run` from NVIDIA; only `kernel/` is extracted | sha256 of the `.run` and Git tree hash of the extracted directory |
+  | pahole | v1.31 tag on `git.kernel.org` | commit hash |
+
 - The workspace is under `ck/` in the dependency directory, not in the repository: `linux/`, `zfs/` (Git trees), `zfs-build/`, `extbuild/`, `extmod/`, `pkg/`, `out/`, `logs/`.
 
 Top-level directories:
 
 | Directory | Responsibility |
 | --- | --- |
-| `config/` | Kernel configuration `config-<version string>`, version number `VERSION`, version string suffix and ZFS version in `versions.conf` |
+| `config/` | Kernel configuration `config-<version string>`, version number `VERSION`, `versions.conf`: version string suffix, versions and sha256 values of the dependencies |
 | `patches/` | The only source of truth for sources: `kernel/` (with `series`), `zfs/`, `extmod/<directory>/`, and `MANIFEST.tsv`, which records the upstream baseline and HEAD of each external module |
-| `scripts/` | Host entry point `ck.sh`, package comparison `cmpdeb.sh` and `kocmp.py`, in-container steps in `kwork/` |
+| `scripts/` | Host entry point `ck.sh`, package comparison `cmpdeb.sh` and `kocmp.py`, in-container steps in `kwork/` (including container setup `container.sh` and NVIDIA driver extraction `nvidia-prop.sh`) |
 | `test/` | KVM regression test scripts in `kvm/` |
 | `third_party/` | License texts of the third-party components in the release package, one subdirectory per source |
 | `doc/` | Project documentation |
@@ -86,3 +96,4 @@ The kernel patches (`patches/kernel/`) are grouped by origin:
 6. btrfs follows upstream 7.0.x and mainline, not 6.18.y.
 7. When changing trimacl, nfsd, or trimafs2, the checks of the 4 NFS security fixes must not be weakened: `nfsd_permission` checks write and execute for trimacl, `fh_getattr` reports 0777 only for trimacl, trimafs2 handles must be under the bridge root, and only the internal second-level `nfs` directory counts as an NFS path.
 8. Do not unpack or build on an fnOS storage volume: trimacl changes the permissions of the extracted files.
+9. This project does not distribute the source of the NVIDIA proprietary driver: the external module source archive does not contain `nvidia-prop-work`, and users download it with `ck.sh fetch-nvidia`. Without it the build must still complete, only without `nvidia-gpu-proprietary`.

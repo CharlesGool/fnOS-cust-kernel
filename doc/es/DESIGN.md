@@ -42,19 +42,28 @@ Flujo de compilación:
 ```text
 linux-<upstream>.tar.xz + patches/kernel ─> árbol del kernel ─> bzImage, módulos del árbol ─┐
 zfs-<versión>.tar.gz + patches/zfs ─────> árbol de ZFS ─> spl.ko, zfs.ko ───────────────────┼─> pkg ─> linux-image-<cadena de versión>_<versión>_amd64.deb
-extsrc/<directorio> (= HEAD de MANIFEST.tsv) ──────> módulos externos ────────────────────┘
+extsrc/<directorio> (= commit de MANIFEST.tsv) ────> módulos externos ────────────────────┘
 ```
 
-- `scripts/ck.sh` se ejecuta en el host: descarga y verifica los paquetes de código fuente del upstream, sincroniza el repositorio con el área de trabajo y luego ejecuta los pasos de `scripts/kwork/` en el contenedor de compilación.
+- `scripts/ck.sh` se ejecuta en el host: crea el contenedor de compilación, descarga y verifica el código fuente, sincroniza el repositorio con el área de trabajo y luego ejecuta los pasos de `scripts/kwork/` en el contenedor de compilación.
+- Origen del código fuente, todo en el directorio de dependencias:
+
+  | Código fuente | Origen | Verificación |
+  | --- | --- | --- |
+  | Kernel | Paquete de código fuente de kernel.org | `sha256sums.asc` firmado por kernel.org |
+  | ZFS | GitHub Release de OpenZFS | sha256 de `config/versions.conf` |
+  | Módulos externos | Mantenedor: un repositorio de Git por directorio; los demás: el paquete de código fuente de los módulos externos de la Release de este proyecto, con el commit registrado en `.ck-rev` tras la extracción | sha256 del paquete; antes de compilar se comprueba el commit con `MANIFEST.tsv` |
+  | Controlador propietario de NVIDIA | Cada usuario descarga el `.run` de NVIDIA; solo se extrae `kernel/` | sha256 del `.run` y hash de árbol de Git del directorio extraído |
+  | pahole | Etiqueta v1.31 de `git.kernel.org` | hash del commit |
 - El área de trabajo está en `ck/` dentro del directorio de dependencias, no en el repositorio: `linux/`, `zfs/` (árboles de Git), `zfs-build/`, `extbuild/`, `extmod/`, `pkg/`, `out/`, `logs/`.
 
 Directorios de primer nivel:
 
 | Directorio | Función |
 | --- | --- |
-| `config/` | Configuración del kernel `config-<cadena de versión>`, número de versión `VERSION`, sufijo de la cadena de versión y versión de ZFS en `versions.conf` |
+| `config/` | Configuración del kernel `config-<cadena de versión>`, número de versión `VERSION`, `versions.conf`: sufijo de la cadena de versión, versiones y sha256 de las dependencias |
 | `patches/` | Única fuente del código: `kernel/` (con `series`), `zfs/`, `extmod/<directorio>/` y `MANIFEST.tsv`, que registra la base upstream y el HEAD de cada módulo externo |
-| `scripts/` | Punto de entrada en el host `ck.sh`, comparación de paquetes `cmpdeb.sh` y `kocmp.py`, pasos dentro del contenedor en `kwork/` |
+| `scripts/` | Punto de entrada en el host `ck.sh`, comparación de paquetes `cmpdeb.sh` y `kocmp.py`, pasos dentro del contenedor en `kwork/` (incluye la creación del contenedor `container.sh` y la extracción del controlador de NVIDIA `nvidia-prop.sh`) |
 | `test/` | Scripts de pruebas de regresión en KVM, en `kvm/` |
 | `third_party/` | Textos originales de las licencias de los componentes de terceros del paquete publicado, un subdirectorio por origen |
 | `doc/` | Documentación del proyecto |
@@ -86,3 +95,4 @@ Los parches del kernel (`patches/kernel/`) se dividen por origen:
 6. btrfs sigue al upstream 7.0.x y a la rama principal, no al 6.18.y.
 7. Al modificar trimacl, nfsd o trimafs2, no se deben debilitar las comprobaciones de las 4 correcciones de seguridad de NFS: `nfsd_permission` comprueba escritura y ejecución en trimacl, `fh_getattr` informa 0777 solo para trimacl, los identificadores de trimafs2 deben estar dentro de la raíz del puente, y solo el directorio `nfs` interno de segundo nivel cuenta como ruta NFS.
 8. No se debe descomprimir ni compilar en un volumen de almacenamiento de fnOS: trimacl cambia los permisos de los archivos extraídos.
+9. Este proyecto no distribuye el código fuente del controlador propietario de NVIDIA: el paquete de código fuente de los módulos externos no contiene `nvidia-prop-work`, y cada usuario lo descarga con `ck.sh fetch-nvidia`. Sin él, la compilación debe completarse igualmente, solo sin `nvidia-gpu-proprietary`.

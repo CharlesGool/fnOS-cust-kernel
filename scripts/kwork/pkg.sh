@@ -2,7 +2,7 @@
 # pkg.sh: 把编好的内核 + 模块 + ZFS + 外置模块打成 linux-image-$KREL_$VERSION_amd64.deb, 输出到 $W/out/
 # 布局同飞牛(见 doc/DESIGN.md 的设计约束): 外置模块不压缩、strip --strip-debug;
 # updates/trim/<名>/*.ko 进 /lib/modules; modules_trim/<名>/*.ko 放 /usr/lib/modules_trim/<内核版本>/;
-# updates/trim/alternatives -> /usr/lib/modules_trim/<内核版本>/alternatives(绝对路径), alternatives/nvidia-gpu 默认指闭源版
+# updates/trim/alternatives -> /usr/lib/modules_trim/<内核版本>/alternatives(绝对路径), alternatives/nvidia-gpu 默认指闭源版, 没编闭源版就指开源版
 . "$(dirname "$0")/common.sh"
 EXT=$W/extmod; P=$W/pkg; R=$P/root; OUT=$W/out
 [ "$(cat $L/include/config/kernel.release)" = $KREL ] || die "kernel.release 不是 $KREL"
@@ -18,7 +18,8 @@ MT=$R/usr/lib/modules_trim/$KREL
 mkdir -p $MT/alternatives
 for d in $EXT/updates/trim/*/; do n=$(basename $d); mkdir -p $R/lib/modules/$KREL/updates/trim/$n; for f in $d*.ko; do strip --strip-debug -o $R/lib/modules/$KREL/updates/trim/$n/$(basename $f) $f; done; done
 for d in $EXT/modules_trim/*/; do n=$(basename $d); mkdir -p $MT/$n; for f in $d*.ko; do strip --strip-debug -o $MT/$n/$(basename $f) $f; done; done
-ln -s ../nvidia-gpu-proprietary $MT/alternatives/nvidia-gpu
+NVD=nvidia-gpu-proprietary; [ -d $MT/$NVD ] || NVD=nvidia-gpu-open
+ln -s ../$NVD $MT/alternatives/nvidia-gpu
 ln -s /usr/lib/modules_trim/$KREL/alternatives $R/lib/modules/$KREL/updates/trim/alternatives
 depmod -b $R $KREL 2>&1 | grep -v 'alternatives' || true   # alternatives 是绝对链接, 打包根里解析不到, 无害
 REV=$(git -C $L rev-parse --short HEAD)
@@ -42,6 +43,6 @@ dpkg-deb --root-owner-group -Zxz -b $R $D >/dev/null
 { echo "version=$VERSION"; echo "kernel=$(git -C $L rev-parse HEAD) ($(git -C $L describe --tags))"
   echo "zfs=$(git -C $Z rev-parse HEAD) ($(git -C $Z describe --tags))"
   echo "gcc=$(gcc --version | head -1)"; echo "pahole=$(pahole --version)"; echo "built=$(date -u +%FT%TZ)"
-  echo "extmod:"; grep -v '^#' $REPO/patches/extmod/MANIFEST.tsv | awk -F'\t' '{print "  "$1" "$4}'
+  echo "extmod:"; grep -v '^#' $REPO/patches/extmod/MANIFEST.tsv | awk -F'\t' '{print "  "$1" "$4}'; echo "nvidia-gpu=$NVD"
   echo "sha256=$(sha256sum $D | cut -d' ' -f1)"; } > $OUT/BUILDINFO-$VERSION
 own $P $OUT; cat $OUT/BUILDINFO-$VERSION; echo "PKG-OK $D"

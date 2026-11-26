@@ -55,6 +55,8 @@ metadata:
 | 2026-11-26 | El repositorio se licencia bajo GPL-2.0-only | Aceptada | Los parches del kernel son obras derivadas de Linux. |
 | 2026-11-26 | Cada Release ofrece el deb y el código fuente completo (paquetes fuente del upstream y de los módulos externos) | Aceptada | Distribuir binarios obliga a cumplir la obligación de la GPL de ofrecer el código fuente. |
 | 2026-11-26 | No se publican las herramientas de la fase de ingeniería inversa, los registros de comparación ni los binarios de fnOS | Aceptada | La compilación no los necesita y contienen binarios y desensamblados de fnOS. |
+| 2026-11-26 | Este proyecto ya no distribuye el código fuente del controlador propietario de NVIDIA; cada usuario lo descarga de NVIDIA con `ck.sh fetch-nvidia` si lo necesita | Aceptada | La licencia de NVIDIA impone condiciones a la redistribución, por lo que es más claro que cada usuario la acepte. |
+| 2026-11-26 | Todas las descargas necesarias para compilar las realizan y verifican `ck.sh container` y `ck.sh fetch`, y el README las enumera de antemano | Aceptada | Cualquiera puede compilar por completo solo con este repositorio y descargas públicas. |
 
 ## Traspaso
 

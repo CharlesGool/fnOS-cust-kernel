@@ -37,9 +37,22 @@ Ejecución:
 
 Compilación:
 
-- Host Linux con Docker y unos 25 GB de espacio libre.
-- Contenedor de compilación: `debian:12`, con `bc binutils bison bpftool build-essential cmake cpio flex git kmod libdw-dev libelf-dev libssl-dev python3 rsync xz-utils zlib1g-dev zstd`; el compilador es `gcc (Debian 12.2.0-14+deb12u1) 12.2.0` (el mismo que el original de fnOS, no lo actualice) y `pahole` es la v1.31 compilada desde el código fuente. El directorio de dependencias se monta en el contenedor.
-- En el directorio de dependencias (`CK_DEPS_DIR`): el paquete de código fuente de OpenZFS 2.4.1 `dl-zfs-2.4.1/zfs-2.4.1.tar.gz` y el código fuente de los módulos externos `extsrc/<directorio>/` (cada uno es un repositorio de Git; las versiones están en [`patches/extmod/MANIFEST.tsv`](../../patches/extmod/MANIFEST.tsv) y también se pueden extraer del paquete de código fuente de la Release). El paquete de código fuente del kernel lo descarga `ck.sh fetch`.
+- Host Linux x86_64 con Docker y `curl`, con acceso a las direcciones de la tabla siguiente. El directorio de dependencias (`CK_DEPS_DIR`) necesita unos 30 GB de espacio libre y no puede estar en un volumen de almacenamiento de fnOS.
+- El contenedor de compilación lo crea `ck.sh container`: `debian:12` con las dependencias de compilación; el compilador es `gcc (Debian 12.2.0-14+deb12u1) 12.2.0` (el mismo que el original de fnOS) y `pahole` es la v1.31 compilada desde el código fuente.
+
+La compilación descarga lo siguiente, todo en el directorio de dependencias o en el contenedor de compilación, y lo verifica con los sha256 de `config/versions.conf` o con la firma de kernel.org:
+
+| Contenido | Origen | Tamaño | Comando |
+| --- | --- | --- | --- |
+| Imagen de Docker `debian:12` y unos 110 paquetes de Debian | Docker Hub, `deb.debian.org` | unos 180 MB | `ck.sh container` |
+| Código fuente de pahole v1.31 con el submódulo libbpf | `git.kernel.org`, GitHub | unos 10 MB | `ck.sh container` |
+| `linux-6.18.65.tar.xz` y su firma | `cdn.kernel.org` | 155 MB | `ck.sh fetch` |
+| `zfs-2.4.1.tar.gz` y su firma | GitHub Release de OpenZFS | 35 MB | `ck.sh fetch` |
+| Paquete de código fuente de los módulos externos `fnos-cust-kernel-6.18.65-3-extmod-src.tar.xz` | GitHub Release de este proyecto | 180 MB | `ck.sh fetch` |
+| Opcional: controlador propietario de NVIDIA `NVIDIA-Linux-x86_64-580.142.run` | `download.nvidia.com` | 380 MB | `ck.sh fetch-nvidia` |
+
+El controlador propietario de NVIDIA se distribuye bajo la licencia de software de NVIDIA. Este proyecto ya no distribuye su código fuente; cada usuario lo descarga tras leer la [licencia](../../third_party/nvidia-linux-driver/LICENSE). Sin él, la compilación omite `nvidia-gpu-proprietary`, el paquete solo contiene el controlador abierto de NVIDIA y `alternatives/nvidia-gpu` apunta a la versión abierta; el resto coincide con la versión publicada.
+
 - Pruebas: host con soporte de KVM, con `qemu-system-x86_64`, OVMF y `sshpass`.
 
 ## Instalación
@@ -61,15 +74,30 @@ Tras el arranque, `uname -r` debe mostrar `6.18.65.c1186-trim`. El kernel origin
 
 ### Instalación normal
 
-Compile desde el código fuente y luego instale con `dpkg -i` como en la instalación rápida:
+Compile desde el código fuente y luego instale con `dpkg -i` como en la instalación rápida. La compilación tarda alrededor de 1 hora (20 hilos):
 
 ```bash
 git clone https://github.com/CharlesGool/fnOS-cust-kernel.git
 cd fnOS-cust-kernel
-cp .env.example .env        # rellénelo según la guía
-scripts/ck.sh fetch         # descarga el paquete de código fuente del kernel y verifica la firma de kernel.org
+cp .env.example .env        # rellene al menos CK_DEPS_DIR, véase la guía
+scripts/ck.sh container     # crea el contenedor de compilación: debian:12, dependencias, pahole v1.31
+scripts/ck.sh fetch         # descarga y verifica el código fuente del kernel, de ZFS y de los módulos externos
 scripts/ck.sh bootstrap     # paquete de código fuente + patches/ -> ck/linux y ck/zfs en el directorio de dependencias
 scripts/ck.sh build         # kernel, ZFS, módulos externos y empaquetado; la salida queda en ck/out/ del directorio de dependencias
+```
+
+Para incluir el controlador propietario de NVIDIA, lea la [licencia de NVIDIA](../../third_party/nvidia-linux-driver/LICENSE) antes de `bootstrap` y, si la acepta, ejecute:
+
+```bash
+scripts/ck.sh fetch-nvidia --accept-nvidia-license
+```
+
+Solo extrae el directorio `kernel/` del controlador con `--extract-only`, no instala el controlador en el host y comprueba que el contenido extraído coincida con el usado en la versión publicada.
+
+Comparación con la versión publicada (las claves de firma de módulos difieren entre compilaciones, por lo que se eliminan las firmas antes de comparar):
+
+```bash
+scripts/cmpdeb.sh linux-image-6.18.65.c1186-trim_6.18.65-3_amd64.deb <directorio de dependencias>/ck/out/linux-image-6.18.65.c1186-trim_6.18.65-3_amd64.deb
 ```
 
 ## Uso
@@ -83,33 +111,36 @@ scripts/ck.sh build         # kernel, ZFS, módulos externos y empaquetado; la s
 | `CK_DEPS_DIR` | Directorio de dependencias: paquetes de código fuente del upstream, código fuente de módulos externos y el área de trabajo `ck/`. Obligatorio |
 | `CK_CONTAINER_DIR` | Ruta del directorio de dependencias dentro del contenedor de compilación, por defecto `/k` |
 | `CK_BUILD_CONTAINER` | Nombre del contenedor de compilación, por defecto `kwork` |
-| `CK_DOCKER` | Comando para invocar docker, por defecto `docker`; si el contenedor está en otro entorno, puede indicarse un script contenedor |
+| `CK_DOCKER` | Comando para invocar docker, por defecto `docker`; si se necesita `sudo` o el contenedor está en otro entorno, puede indicarse un script contenedor |
 | `KJOBS` | Número de trabajos de compilación en paralelo, por defecto el número de CPU del contenedor |
 | `CK_GNUPGHOME` | Directorio de GnuPG para verificar la firma de kernel.org, por defecto `$CK_DEPS_DIR/gnupg` |
 | `CK_KVM_DIR` | Directorio de la máquina de pruebas (disco, variables de OVMF, `qmp.sock`); obligatorio para las pruebas |
 | `VM_PASS` | Contraseña de la cuenta `admintest` de la máquina de pruebas; obligatoria para las pruebas |
 | `U1_PASS` | Contraseña de la cuenta `u1` de la máquina de pruebas; obligatoria para `smbtest.sh` |
 
-El número de versión está en `config/VERSION`, con el formato `<versión del upstream>-<revisión>`; `config/versions.conf` contiene el sufijo de la cadena de versión y la versión de ZFS.
+El número de versión está en `config/VERSION`, con el formato `<versión del upstream>-<revisión>`; `config/versions.conf` contiene el sufijo de la cadena de versión, las versiones de ZFS, del controlador propietario de NVIDIA y de pahole, los sha256 de las descargas y la versión del paquete de código fuente de los módulos externos.
 
 ### Comandos de compilación
 
 | Comando | Función |
 | --- | --- |
+| `ck.sh container` | Crea el contenedor de compilación; se detiene si ya existe uno con el mismo nombre |
+| `ck.sh fetch [versión]` | Descarga y verifica el paquete de código fuente del kernel; sin versión, también descarga el de ZFS y extrae en `extsrc/` el código fuente de los módulos externos que falte en el directorio de dependencias |
+| `ck.sh fetch-nvidia --accept-nvidia-license` | Descarga el controlador propietario de NVIDIA y extrae `extsrc/nvidia-prop-work` |
 | `ck.sh kernel` / `zfs` / `pkg` | Compilación por pasos. `kernel` copia la configuración de `config/` al árbol y ejecuta `olddefconfig`; se detiene si hay opciones que cambian |
-| `ck.sh extmod [nombre...]` | Compila los módulos externos, por defecto todos; antes de compilar comprueba que el HEAD del código fuente coincida con `MANIFEST.tsv` |
+| `ck.sh extmod [nombre...]` | Compila los módulos externos, por defecto todos; antes de compilar comprueba que el commit del código fuente coincida con `MANIFEST.tsv` (los directorios extraídos del paquete de código fuente lo registran en `.ck-rev`) |
 | `ck.sh saveconfig` | Guarda en `config/` el `.config` del árbol |
 | `ck.sh export` | Exporta a `patches/` los commits locales del árbol del kernel, del árbol de ZFS y del código fuente de los módulos externos |
 | `ck.sh newbase <versión>` | Crea una nueva base upstream en el árbol del kernel y rebasa los parches sobre ella |
 | `ck.sh release` | Copia la salida a `releases/<versión>/` y escribe `SHA256SUMS` y `BUILDINFO` |
-| `ck.sh srcpkg` | Reúne en `releases/<versión>/` el código fuente para la publicación: paquete de código fuente de los módulos externos, paquetes de código fuente del upstream del kernel y de ZFS con sus firmas, y la licencia de NVIDIA |
+| `ck.sh srcpkg` | Reúne en `releases/<versión>/` el código fuente para la publicación: paquete de código fuente de los módulos externos (sin el controlador propietario de NVIDIA), paquetes de código fuente del upstream del kernel y de ZFS con sus firmas, y la licencia de NVIDIA |
 | `cmpdeb.sh <antiguo> <nuevo>` | Compara dos paquetes del kernel: lista de archivos y contenido tras quitar la firma y el build-id |
 
 Los registros están en `ck/logs/` del directorio de dependencias; los de los módulos externos, en `ck/extbuild/<nombre>.log`.
 
 ### Modificar los parches
 
-Haga commit en `ck/linux` (rama `r<versión del upstream>`), `ck/zfs` o `extsrc/<directorio>` del directorio de dependencias, luego ejecute `ck.sh export` y haga commit en este repositorio de los cambios de `patches/`.
+Haga commit en `ck/linux` (rama `r<versión del upstream>`), `ck/zfs` o `extsrc/<directorio>` del directorio de dependencias, luego ejecute `ck.sh export` y haga commit en este repositorio de los cambios de `patches/`. Los directorios de módulos externos extraídos del paquete de código fuente no son repositorios de Git; antes de modificar uno, ejecute `git init` en él, elimine `.ck-rev` y haga commit del contenido tal cual.
 
 ### Pruebas
 
@@ -144,7 +175,7 @@ Solo se añaden parches (por ejemplo, una corrección de seguridad):
 1. Haga commit de la corrección en `ck/linux` y ejecute `ck.sh export`.
 2. Modifique `config/VERSION` y ejecute `ck.sh build`.
 3. Ejecute las pruebas en la máquina de pruebas y compare con la salida de la versión anterior.
-4. Ejecute `ck.sh release` y `ck.sh srcpkg`, actualice [CHANGELOG](CHANGELOG.md), cree la etiqueta `v<versión>` y publique.
+4. Ejecute `ck.sh release` y `ck.sh srcpkg`; si cambiaron los módulos externos, actualice `EXTSRC_VER` y `EXTSRC_SHA256` en `config/versions.conf` según indique `srcpkg`. Actualice [CHANGELOG](CHANGELOG.md), cree la etiqueta `v<versión>` y publique, subiendo todos los archivos de `releases/<versión>/`.
 
 Seguir el upstream 6.18.y:
 

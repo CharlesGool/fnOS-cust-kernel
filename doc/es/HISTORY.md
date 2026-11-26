@@ -68,3 +68,10 @@ El mantenimiento del kernel se separó de la compilación del sistema y pasó a 
 - vmlinuz difiere solo en la cadena de hora de compilación y en el certificado de firma incorporado.
 
 El repositorio publicado por primera vez ese mismo día contenía rutas de la máquina local; se eliminó y se volvió a publicar con la estructura actual.
+
+### 2026-11-26: Compilación desde cero siguiendo el README
+
+Se clonó el repositorio en un directorio vacío y se compiló en un contenedor de compilación nuevo siguiendo el README: `container`, `fetch`, `fetch-nvidia`, `bootstrap`, `build`; todo el código fuente procede de descargas públicas. Se encontró y corrigió una ruta incorrecta del código fuente de los módulos externos en `extmod.sh` (el script de v6.18.65-3 no podía compilar los módulos externos). Resultados:
+
+- El `System.map` y el `.config` del árbol del kernel son idénticos a la recompilación del área de trabajo del mantenedor; frente al paquete de esa recompilación, todo es idéntico salvo `__DATE__`/`__TIME__` en 4 módulos y la cadena de hora de compilación y el certificado de firma en vmlinuz.
+- Frente al deb publicado, los módulos coinciden con la sección anterior; además, la cadena de versión de la cabecera del archivo `config` difiere y 83 direcciones de símbolos de datos de vmlinuz están desplazadas, porque el paquete publicado se compiló en el árbol de trabajo original.

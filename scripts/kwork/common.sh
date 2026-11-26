@@ -14,11 +14,11 @@ LOGS=$W/logs; mkdir -p $LOGS
 J=/var/jenkins_home/workspace/kernel-build/modules_integration/build
 KS=/var/jenkins_home/workspace/kernel-build/kernel-source/patched_source/linux-$UPV
 KJOBS=${KJOBS:-$(nproc)}
-# 树归 uid 1000(主机上的构建用户), 容器里是 root: 让 git 不报 dubious ownership
+# 树归主机上的构建用户, 容器里是 root: 让 git 不报 dubious ownership
 export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'
 # 内核 make 通用参数(和飞牛一致的构建者信息; 时间戳固定为 HEAD 提交时间, 便于重现)
 kmake(){ make -C $L -j$KJOBS EXTRAVERSION=$LOCALVER LOCALVERSION= \
   KBUILD_BUILD_USER=devops KBUILD_BUILD_HOST=fnnas.com KBUILD_BUILD_VERSION=1186 \
   KBUILD_BUILD_TIMESTAMP="$(git -C $L log -1 --format=%cd --date=rfc)" KBUILD_MODPOST_WARN=1 "$@"; }
-own(){ chown -R 1000:1000 "$@" 2>/dev/null || true; }   # 让主机上的构建用户能直接用 git
+own(){ chown -R "$(stat -c %u:%g $K)" "$@" 2>/dev/null || true; }   # 产物归依赖目录的属主(主机上的构建用户), 让它能直接用 git
 die(){ echo "错误: $*" >&2; exit 1; }

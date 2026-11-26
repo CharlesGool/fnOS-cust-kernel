@@ -37,9 +37,22 @@ Runtime:
 
 Build:
 
-- A Linux host with Docker and about 25 GB of free space.
-- Build container: `debian:12` with `bc binutils bison bpftool build-essential cmake cpio flex git kmod libdw-dev libelf-dev libssl-dev python3 rsync xz-utils zlib1g-dev zstd` installed. The compiler is `gcc (Debian 12.2.0-14+deb12u1) 12.2.0` (identical to the original fnOS build; do not upgrade it), and `pahole` is v1.31 built from source. The dependency directory is mounted into the container.
-- In the dependency directory (`CK_DEPS_DIR`): the OpenZFS 2.4.1 source tarball `dl-zfs-2.4.1/zfs-2.4.1.tar.gz`, and the external module sources `extsrc/<directory>/` (each a Git repository; versions are listed in [`patches/extmod/MANIFEST.tsv`](../../patches/extmod/MANIFEST.tsv), and can also be extracted from the source archive of a Release). The kernel source tarball is downloaded by `ck.sh fetch`.
+- An x86_64 Linux host with Docker and `curl` that can reach the addresses in the table below. The dependency directory (`CK_DEPS_DIR`) needs about 30 GB of free space and must not be on an fnOS storage volume.
+- The build container is created by `ck.sh container`: `debian:12` plus the build dependencies. The compiler is `gcc (Debian 12.2.0-14+deb12u1) 12.2.0` (identical to the original fnOS build), and `pahole` is v1.31 built from source.
+
+The build downloads the following, all into the dependency directory or the build container, and verifies them against the sha256 values in `config/versions.conf` or the kernel.org signature:
+
+| Content | Source | Size | Command |
+| --- | --- | --- | --- |
+| Docker image `debian:12` and about 110 Debian packages | Docker Hub, `deb.debian.org` | about 180 MB | `ck.sh container` |
+| pahole v1.31 source with the libbpf submodule | `git.kernel.org`, GitHub | about 10 MB | `ck.sh container` |
+| `linux-6.18.65.tar.xz` and signature | `cdn.kernel.org` | 155 MB | `ck.sh fetch` |
+| `zfs-2.4.1.tar.gz` and signature | OpenZFS GitHub Release | 35 MB | `ck.sh fetch` |
+| External module source archive `fnos-cust-kernel-6.18.65-3-extmod-src.tar.xz` | GitHub Release of this project | 180 MB | `ck.sh fetch` |
+| Optional: NVIDIA proprietary driver `NVIDIA-Linux-x86_64-580.142.run` | `download.nvidia.com` | 380 MB | `ck.sh fetch-nvidia` |
+
+The NVIDIA proprietary driver is distributed under the NVIDIA Software License. This project no longer distributes its source; users download it themselves after reading the [license](../../third_party/nvidia-linux-driver/LICENSE). Without it, the build skips `nvidia-gpu-proprietary`, the package contains only the NVIDIA open driver, and `alternatives/nvidia-gpu` points to the open driver; everything else matches the release.
+
 - Testing: a host with KVM support, `qemu-system-x86_64`, OVMF, and `sshpass`.
 
 ## Install
@@ -61,15 +74,30 @@ After boot, `uname -r` should print `6.18.65.c1186-trim`. The stock 6.18.18 kern
 
 ### Normal Install
 
-Build from source, then install with `dpkg -i` as in Quick Install:
+Build from source, then install with `dpkg -i` as in Quick Install. A build takes about 1 hour (20 threads):
 
 ```bash
 git clone https://github.com/CharlesGool/fnOS-cust-kernel.git
 cd fnOS-cust-kernel
-cp .env.example .env        # fill in as described in Usage
-scripts/ck.sh fetch         # download kernel source tarball and verify the kernel.org signature
+cp .env.example .env        # set at least CK_DEPS_DIR, see Usage
+scripts/ck.sh container     # create the build container: debian:12, build dependencies, pahole v1.31
+scripts/ck.sh fetch         # download and verify the kernel, ZFS, and external module sources
 scripts/ck.sh bootstrap     # source tarballs + patches/ -> ck/linux and ck/zfs in the dependency directory
 scripts/ck.sh build         # kernel, ZFS, external modules, packaging; output in ck/out/ in the dependency directory
+```
+
+To include the NVIDIA proprietary driver, read the [NVIDIA license](../../third_party/nvidia-linux-driver/LICENSE) before `bootstrap` and, if you accept it, run:
+
+```bash
+scripts/ck.sh fetch-nvidia --accept-nvidia-license
+```
+
+It only extracts the `kernel/` directory of the driver with `--extract-only`, does not install the driver on the host, and checks that the extracted content matches the one used by the release.
+
+Compare with the release (module signing keys differ between builds, so signatures are removed before comparing):
+
+```bash
+scripts/cmpdeb.sh linux-image-6.18.65.c1186-trim_6.18.65-3_amd64.deb <dependency directory>/ck/out/linux-image-6.18.65.c1186-trim_6.18.65-3_amd64.deb
 ```
 
 ## Usage
@@ -83,33 +111,36 @@ scripts/ck.sh build         # kernel, ZFS, external modules, packaging; output i
 | `CK_DEPS_DIR` | Dependency directory: upstream source tarballs, external module sources, and the workspace `ck/`. Required |
 | `CK_CONTAINER_DIR` | Path of the dependency directory inside the build container, default `/k` |
 | `CK_BUILD_CONTAINER` | Build container name, default `kwork` |
-| `CK_DOCKER` | Command used to call docker, default `docker`; a wrapper script can be used when the container is in another environment |
+| `CK_DOCKER` | Command used to call docker, default `docker`; a wrapper script can be used when `sudo` is needed or the container is in another environment |
 | `KJOBS` | Number of parallel build jobs, default is the CPU count of the container |
 | `CK_GNUPGHOME` | GnuPG directory used to verify kernel.org signatures, default `$CK_DEPS_DIR/gnupg` |
 | `CK_KVM_DIR` | Test VM directory (disk, OVMF variables, `qmp.sock`); required for testing |
 | `VM_PASS` | Password of the account `admintest` on the test VM; required for testing |
 | `U1_PASS` | Password of the account `u1` on the test VM; required by `smbtest.sh` |
 
-The version number is in `config/VERSION`, in the format `<upstream version>-<revision>`; `config/versions.conf` holds the version string suffix and the ZFS version.
+The version number is in `config/VERSION`, in the format `<upstream version>-<revision>`; `config/versions.conf` holds the version string suffix, the versions of ZFS, the NVIDIA proprietary driver, and pahole, the sha256 values of the downloads, and the version of the external module source archive.
 
 ### Build Commands
 
 | Command | Purpose |
 | --- | --- |
+| `ck.sh container` | Create the build container; stops if a container with the same name exists |
+| `ck.sh fetch [version]` | Download and verify the kernel source tarball; without a version, also download the ZFS source tarball and extract the external module sources missing from the dependency directory into `extsrc/` |
+| `ck.sh fetch-nvidia --accept-nvidia-license` | Download the NVIDIA proprietary driver and extract `extsrc/nvidia-prop-work` |
 | `ck.sh kernel` / `zfs` / `pkg` | Build a single step. `kernel` copies the configuration from `config/` into the tree and runs `olddefconfig`, and stops if options changed |
-| `ck.sh extmod [name...]` | Build external modules, all by default; before building, checks that the source HEAD matches `MANIFEST.tsv` |
+| `ck.sh extmod [name...]` | Build external modules, all by default; before building, checks that the source commit matches `MANIFEST.tsv` (directories extracted from the source archive record it in `.ck-rev`) |
 | `ck.sh saveconfig` | Save the `.config` in the tree back to `config/` |
 | `ck.sh export` | Export local commits of the kernel tree, ZFS tree, and external module sources to `patches/` |
 | `ck.sh newbase <version>` | Create a new upstream baseline on the kernel tree and rebase the patches onto it |
 | `ck.sh release` | Copy the artifacts to `releases/<version>/` and write `SHA256SUMS` and `BUILDINFO` |
-| `ck.sh srcpkg` | Put the complete release sources in `releases/<version>/`: external module source archive, upstream kernel and ZFS tarballs with signatures, NVIDIA license |
+| `ck.sh srcpkg` | Put the complete release sources in `releases/<version>/`: external module source archive (without the NVIDIA proprietary driver), upstream kernel and ZFS tarballs with signatures, NVIDIA license |
 | `cmpdeb.sh <old> <new>` | Compare two kernel packages: file list, and contents after removing signatures and build-ids |
 
 Logs are in `ck/logs/` in the dependency directory; external module logs are in `ck/extbuild/<name>.log`.
 
 ### Modifying Patches
 
-Commit in `ck/linux` (branch `r<upstream version>`), `ck/zfs`, or `extsrc/<directory>` in the dependency directory, then run `ck.sh export` and commit the changes to `patches/` in this repository.
+Commit in `ck/linux` (branch `r<upstream version>`), `ck/zfs`, or `extsrc/<directory>` in the dependency directory, then run `ck.sh export` and commit the changes to `patches/` in this repository. External module directories extracted from the source archive are not Git repositories; before modifying one, run `git init` in it, delete `.ck-rev`, and commit the content as is.
 
 ### Testing
 
@@ -144,7 +175,7 @@ Adding patches only (for example, a security fix):
 1. Commit the fix in `ck/linux` and run `ck.sh export`.
 2. Edit `config/VERSION` and run `ck.sh build`.
 3. Run the tests on the test machine and compare with the output of the previous version.
-4. Run `ck.sh release` and `ck.sh srcpkg`, update [CHANGELOG](CHANGELOG.md), tag `v<version>`, and publish.
+4. Run `ck.sh release` and `ck.sh srcpkg`; if the external modules changed, update `EXTSRC_VER` and `EXTSRC_SHA256` in `config/versions.conf` as `srcpkg` prompts. Update [CHANGELOG](CHANGELOG.md), tag `v<version>`, and publish, uploading all files in `releases/<version>/`.
 
 Following upstream 6.18.y:
 

@@ -74,7 +74,7 @@ Cada Release de GitHub incluye el código fuente completo correspondiente al paq
 
 - Kernel: `linux-<versión del upstream>.tar.xz` y su firma `.tar.sign`, más `patches/kernel/` y `config/` de la misma etiqueta de este repositorio.
 - ZFS: `zfs-<versión>.tar.gz` y su firma `.asc`, más `patches/zfs/`.
-- Módulos externos: `fnos-cust-kernel-<versión>-extmod-src.tar.xz`, que contiene los árboles de código fuente completos de los commits listados en `MANIFEST.tsv` (ya incluye los cambios de `patches/extmod/`).
+- Módulos externos: `fnos-cust-kernel-<versión>-extmod-src.tar.xz`, que contiene los árboles de código fuente completos de los commits listados en `MANIFEST.tsv` (ya incluye los cambios de `patches/extmod/`). El paquete de v6.18.65-3 también contiene el directorio `kernel/` del controlador propietario de NVIDIA; las versiones posteriores no, y cada usuario lo descarga de la dirección de NVIDIA de la tabla anterior, verificado y extraído por `scripts/ck.sh fetch-nvidia`.
 - Scripts de compilación: `scripts/` de este repositorio.
 
 ### Revisión de cumplimiento

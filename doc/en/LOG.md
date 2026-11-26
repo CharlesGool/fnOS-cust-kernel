@@ -55,6 +55,8 @@ metadata:
 | 2026-11-26 | The repository is licensed under GPL-2.0-only | Accepted | The kernel patches are derivative works of Linux. |
 | 2026-11-26 | Releases provide both the deb and the complete source (upstream tarballs, external module source archive) | Accepted | Distributing binaries requires meeting the GPL source offer obligation. |
 | 2026-11-26 | The tools, comparison records, and fnOS binaries from the reverse-engineering phase are not published | Accepted | The build does not need them, and they contain fnOS binaries and disassembly. |
+| 2026-11-26 | This project no longer distributes the source of the NVIDIA proprietary driver; users download it from NVIDIA with `ck.sh fetch-nvidia` when needed | Accepted | The NVIDIA license places conditions on redistribution, so it is clearer for users to accept it themselves. |
+| 2026-11-26 | All downloads needed for a build are done and verified by `ck.sh container` and `ck.sh fetch`, and listed in the README in advance | Accepted | Others can build completely from this repository and public downloads alone. |
 
 ## Handoff
 

@@ -68,3 +68,10 @@ Kernel maintenance was split out of the system build into this project. 6.18.65-
 - vmlinuz differs only in the compile time string and the built-in signing certificate.
 
 The first public repository of the same day contained local paths; it was deleted and republished with the current structure.
+
+### 2026-11-26: Build from scratch following the README
+
+The repository was cloned into an empty directory and built in a new build container following the README: `container`, `fetch`, `fetch-nvidia`, `bootstrap`, `build`; all sources came from public downloads. A wrong external module source path in `extmod.sh` was found and fixed (the v6.18.65-3 script could not build the external modules). Results:
+
+- The `System.map` and `.config` of the kernel tree are identical to the rebuild in the maintainer workspace; compared with the package of that rebuild, everything is identical except `__DATE__`/`__TIME__` in 4 modules and the compile time string and signing certificate in vmlinuz.
+- Compared with the released deb, the module results match the previous section; in addition, the version string in the `config` file header differs and 83 data symbol addresses in vmlinuz are shifted, because the released package was built in the original work tree.

@@ -74,7 +74,7 @@ Each GitHub Release includes the complete source corresponding to the kernel pac
 
 - Kernel: `linux-<upstream version>.tar.xz` and its signature `.tar.sign`, plus `patches/kernel/` and `config/` of this repository at the same tag.
 - ZFS: `zfs-<version>.tar.gz` and its signature `.asc`, plus `patches/zfs/`.
-- External modules: `fnos-cust-kernel-<version>-extmod-src.tar.xz`, the complete source trees of the commits listed in `MANIFEST.tsv` (already including the changes in `patches/extmod/`).
+- External modules: `fnos-cust-kernel-<version>-extmod-src.tar.xz`, the complete source trees of the commits listed in `MANIFEST.tsv` (already including the changes in `patches/extmod/`). The v6.18.65-3 archive also contains the `kernel/` directory of the NVIDIA proprietary driver; later versions do not, and users download it from the NVIDIA address in the table above, verified and extracted by `scripts/ck.sh fetch-nvidia`.
 - Build scripts: `scripts/` of this repository.
 
 ### Compliance Review

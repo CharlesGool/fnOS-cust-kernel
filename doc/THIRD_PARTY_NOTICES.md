@@ -74,7 +74,7 @@ BSD 双许可组件按 GPL-2.0 使用. 各组件源码中的其他许可证文�
 
 - 内核: `linux-<上游版本>.tar.xz` 和签名 `.tar.sign`, 加本仓库同一标签下的 `patches/kernel/` 和 `config/`.
 - ZFS: `zfs-<版本>.tar.gz` 和签名 `.asc`, 加 `patches/zfs/`.
-- 外置模块: `fnos-cust-kernel-<版本>-extmod-src.tar.xz`, 是 `MANIFEST.tsv` 所列各提交的完整源码树(已包含 `patches/extmod/` 的改动).
+- 外置模块: `fnos-cust-kernel-<版本>-extmod-src.tar.xz`, 是 `MANIFEST.tsv` 所列各提交的完整源码树(已包含 `patches/extmod/` 的改动). v6.18.65-3 的源码包还含 NVIDIA 闭源驱动的 `kernel/` 目录; 之后的版本不含, 由使用者从上表的 NVIDIA 地址下载, `scripts/ck.sh fetch-nvidia` 校验并解出.
 - 构建脚本: 本仓库 `scripts/`.
 
 ### 合规审查

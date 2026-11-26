@@ -42,19 +42,29 @@ metadata:
 ```text
 linux-<上游>.tar.xz + patches/kernel ─> 内核树 ─> bzImage, 树内模块 ─┐
 zfs-<版本>.tar.gz + patches/zfs ─────> ZFS 树 ─> spl.ko, zfs.ko ─────┼─> pkg ─> linux-image-<版本串>_<版本>_amd64.deb
-extsrc/<目录> (= MANIFEST.tsv 的 HEAD) ──────> 外置模块 ─────────────┘
+extsrc/<目录> (= MANIFEST.tsv 的提交) ─────> 外置模块 ─────────────┘
 ```
 
-- `scripts/ck.sh` 在主机上运行, 下载和校验上游源码包, 把仓库同步到工作区, 再在编译容器里运行 `scripts/kwork/` 的各步骤.
+- `scripts/ck.sh` 在主机上运行: 建编译容器, 下载和校验源码, 把仓库同步到工作区, 再在编译容器里运行 `scripts/kwork/` 的各步骤.
+- 源码来源, 都在依赖目录里:
+
+  | 源码 | 来源 | 校验 |
+  | --- | --- | --- |
+  | 内核 | kernel.org 源码包 | kernel.org 签名的 `sha256sums.asc` |
+  | ZFS | OpenZFS 的 GitHub Release | `config/versions.conf` 的 sha256 |
+  | 外置模块 | 维护者: 各目录的 Git 仓库; 其他人: 本项目 Release 的外置模块源码包, 解出后提交号记在 `.ck-rev` | 源码包 sha256; 构建前核对提交号与 `MANIFEST.tsv` 一致 |
+  | NVIDIA 闭源驱动 | 使用者从 NVIDIA 下载 `.run`, 只解出 `kernel/` | `.run` 的 sha256 和解出目录的 Git tree 哈希 |
+  | pahole | `git.kernel.org` 的 v1.31 标签 | 提交哈希 |
+
 - 工作区在依赖目录的 `ck/` 下, 不在仓库里: `linux/`, `zfs/`(Git 树), `zfs-build/`, `extbuild/`, `extmod/`, `pkg/`, `out/`, `logs/`.
 
 顶层目录:
 
 | 目录 | 职责 |
 | --- | --- |
-| `config/` | 内核配置 `config-<版本串>`, 版本号 `VERSION`, 版本串后缀和 ZFS 版本 `versions.conf` |
+| `config/` | 内核配置 `config-<版本串>`, 版本号 `VERSION`, `versions.conf`: 版本串后缀, 各依赖的版本和 sha256 |
 | `patches/` | 源码的唯一来源: `kernel/`(含 `series`), `zfs/`, `extmod/<目录>/` 和记录各外置模块上游基线与 HEAD 的 `MANIFEST.tsv` |
-| `scripts/` | 主机端入口 `ck.sh`, 包比较 `cmpdeb.sh` 和 `kocmp.py`, 容器内步骤 `kwork/` |
+| `scripts/` | 主机端入口 `ck.sh`, 包比较 `cmpdeb.sh` 和 `kocmp.py`, 容器内步骤 `kwork/`(含建容器 `container.sh`, 解 NVIDIA 驱动 `nvidia-prop.sh`) |
 | `test/` | KVM 回归测试脚本 `kvm/` |
 | `third_party/` | 发布包中第三方组件的许可证原文, 每个来源一个子目录 |
 | `doc/` | 项目文档 |
@@ -86,3 +96,4 @@ extsrc/<目录> (= MANIFEST.tsv 的 HEAD) ──────> 外置模块 ─�
 6. btrfs 跟上游 7.0.x 和主线, 不跟 6.18.y.
 7. 改动 trimacl, nfsd, trimafs2 时, 不能削弱 4 个 NFS 安全修复的检查: `nfsd_permission` 对 trimacl 查写和执行, `fh_getattr` 只对 trimacl 报 0777, trimafs2 句柄必须在桥根下, 只有内部的第二级 `nfs` 目录算 NFS 路径.
 8. 不要在飞牛存储卷上解包或构建: trimacl 会把解出文件的权限改掉.
+9. 本项目不分发 NVIDIA 闭源驱动的源码: 外置模块源码包不含 `nvidia-prop-work`, 由使用者用 `ck.sh fetch-nvidia` 下载. 没有它时构建必须仍能完成, 只少 `nvidia-gpu-proprietary`.

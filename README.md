@@ -37,9 +37,22 @@
 
 构建:
 
-- Linux 主机, 有 Docker, 约 25 GB 可用空间.
-- 编译容器: `debian:12`, 装 `bc binutils bison bpftool build-essential cmake cpio flex git kmod libdw-dev libelf-dev libssl-dev python3 rsync xz-utils zlib1g-dev zstd`, 编译器为 `gcc (Debian 12.2.0-14+deb12u1) 12.2.0`(与飞牛原版相同, 不要升级), `pahole` 为从源码编译的 v1.31. 依赖目录挂载进容器.
-- 依赖目录(`CK_DEPS_DIR`)中: OpenZFS 2.4.1 源码包 `dl-zfs-2.4.1/zfs-2.4.1.tar.gz`, 外置模块源码 `extsrc/<目录>/`(各为 Git 仓库, 版本见 [`patches/extmod/MANIFEST.tsv`](patches/extmod/MANIFEST.tsv), 也可从 Release 的源码包解出). 内核源码包由 `ck.sh fetch` 下载.
+- x86_64 Linux 主机, 有 Docker 和 `curl`, 能访问下表的网址. 依赖目录(`CK_DEPS_DIR`)约需 30 GB 可用空间, 不能放在飞牛存储卷上.
+- 编译容器由 `ck.sh container` 建立: `debian:12` 加编译依赖, 编译器为 `gcc (Debian 12.2.0-14+deb12u1) 12.2.0`(与飞牛原版相同), `pahole` 为从源码编译的 v1.31.
+
+构建会下载以下内容, 都在依赖目录或编译容器里, 下载后按 `config/versions.conf` 中的 sha256 或 kernel.org 签名校验:
+
+| 内容 | 来源 | 大小 | 下载命令 |
+| --- | --- | --- | --- |
+| Docker 镜像 `debian:12` 和约 110 个 Debian 软件包 | Docker Hub, `deb.debian.org` | 约 180 MB | `ck.sh container` |
+| pahole v1.31 源码, 含 libbpf 子模块 | `git.kernel.org`, GitHub | 约 10 MB | `ck.sh container` |
+| `linux-6.18.65.tar.xz` 和签名 | `cdn.kernel.org` | 155 MB | `ck.sh fetch` |
+| `zfs-2.4.1.tar.gz` 和签名 | OpenZFS 的 GitHub Release | 35 MB | `ck.sh fetch` |
+| 外置模块源码包 `fnos-cust-kernel-6.18.65-3-extmod-src.tar.xz` | 本项目的 GitHub Release | 180 MB | `ck.sh fetch` |
+| 可选: NVIDIA 闭源驱动 `NVIDIA-Linux-x86_64-580.142.run` | `download.nvidia.com` | 380 MB | `ck.sh fetch-nvidia` |
+
+NVIDIA 闭源驱动按 NVIDIA 软件许可协议分发, 本项目不再分发它的源码, 由使用者阅读 [许可协议](third_party/nvidia-linux-driver/LICENSE) 后自行下载. 不下载时构建跳过 `nvidia-gpu-proprietary`, 包里只有 NVIDIA 开源驱动, `alternatives/nvidia-gpu` 指向开源版; 与发布版的其他内容相同.
+
 - 测试: 主机支持 KVM, 有 `qemu-system-x86_64`, OVMF, `sshpass`.
 
 ## 安装
@@ -61,15 +74,30 @@ reboot
 
 ### 常规安装
 
-从源码构建, 然后按快速安装的 `dpkg -i` 安装:
+从源码构建, 然后按快速安装的 `dpkg -i` 安装. 构建约需 1 小时(20 线程):
 
 ```bash
 git clone https://github.com/CharlesGool/fnOS-cust-kernel.git
 cd fnOS-cust-kernel
-cp .env.example .env        # 按 指南 填写
-scripts/ck.sh fetch         # 下载内核源码包并校验 kernel.org 签名
+cp .env.example .env        # 至少填写 CK_DEPS_DIR, 见 指南
+scripts/ck.sh container     # 建编译容器: debian:12, 编译依赖, pahole v1.31
+scripts/ck.sh fetch         # 下载并校验内核, ZFS 和外置模块源码
 scripts/ck.sh bootstrap     # 源码包 + patches/ -> 依赖目录下 ck/linux 和 ck/zfs
 scripts/ck.sh build         # 内核, ZFS, 外置模块, 打包; 产物在依赖目录下 ck/out/
+```
+
+要包含 NVIDIA 闭源驱动, 在 `bootstrap` 之前阅读 [NVIDIA 许可协议](third_party/nvidia-linux-driver/LICENSE), 同意后执行:
+
+```bash
+scripts/ck.sh fetch-nvidia --accept-nvidia-license
+```
+
+它只用 `--extract-only` 解出驱动里的 `kernel/` 目录, 不在主机上安装驱动, 并核对解出内容与发布版所用的相同.
+
+与发布版比较(不同构建的模块签名密钥不同, 比较时去掉签名):
+
+```bash
+scripts/cmpdeb.sh linux-image-6.18.65.c1186-trim_6.18.65-3_amd64.deb <依赖目录>/ck/out/linux-image-6.18.65.c1186-trim_6.18.65-3_amd64.deb
 ```
 
 ## 指南
@@ -83,33 +111,36 @@ scripts/ck.sh build         # 内核, ZFS, 外置模块, 打包; 产物在依赖
 | `CK_DEPS_DIR` | 依赖目录: 上游源码包, 外置模块源码, 工作区 `ck/`. 必填 |
 | `CK_CONTAINER_DIR` | 依赖目录在编译容器里的路径, 默认 `/k` |
 | `CK_BUILD_CONTAINER` | 编译容器名, 默认 `kwork` |
-| `CK_DOCKER` | 调用 docker 的命令, 默认 `docker`; 容器在另一个环境里时可填一个包装脚本 |
+| `CK_DOCKER` | 调用 docker 的命令, 默认 `docker`; 需要 `sudo` 或容器在另一个环境里时可填一个包装脚本 |
 | `KJOBS` | 并行编译数, 默认为容器的 CPU 数 |
 | `CK_GNUPGHOME` | 校验 kernel.org 签名用的 GnuPG 目录, 默认 `$CK_DEPS_DIR/gnupg` |
 | `CK_KVM_DIR` | 测试机目录(磁盘, OVMF 变量, `qmp.sock`), 测试必填 |
 | `VM_PASS` | 测试机账户 `admintest` 的密码, 测试必填 |
 | `U1_PASS` | 测试机账户 `u1` 的密码, `smbtest.sh` 必填 |
 
-版本号在 `config/VERSION`, 格式为 `<上游版本>-<修订号>`; `config/versions.conf` 写版本串后缀和 ZFS 版本.
+版本号在 `config/VERSION`, 格式为 `<上游版本>-<修订号>`; `config/versions.conf` 写版本串后缀, ZFS, NVIDIA 闭源驱动, pahole 的版本, 下载物的 sha256 和外置模块源码包的版本.
 
 ### 构建命令
 
 | 命令 | 作用 |
 | --- | --- |
+| `ck.sh container` | 建编译容器; 同名容器已存在时停下 |
+| `ck.sh fetch [版本]` | 下载并校验内核源码包; 不给版本时另下载 ZFS 源码包, 并把依赖目录中缺少的外置模块源码从源码包解到 `extsrc/` |
+| `ck.sh fetch-nvidia --accept-nvidia-license` | 下载 NVIDIA 闭源驱动并解出 `extsrc/nvidia-prop-work` |
 | `ck.sh kernel` / `zfs` / `pkg` | 单步构建. `kernel` 把 `config/` 的配置复制进树并 `olddefconfig`, 选项有变化时停下 |
-| `ck.sh extmod [名字...]` | 编外置模块, 默认全部; 编之前核对源码 HEAD 与 `MANIFEST.tsv` 一致 |
+| `ck.sh extmod [名字...]` | 编外置模块, 默认全部; 编之前核对源码的提交号与 `MANIFEST.tsv` 一致(从源码包解出的目录记在 `.ck-rev`) |
 | `ck.sh saveconfig` | 把树里的 `.config` 存回 `config/` |
 | `ck.sh export` | 把内核树, ZFS 树, 外置模块源码的本地提交导出到 `patches/` |
 | `ck.sh newbase <版本>` | 在内核树上建新上游基线并把补丁 rebase 上去 |
 | `ck.sh release` | 把产物复制到 `releases/<版本>/`, 写 `SHA256SUMS` 和 `BUILDINFO` |
-| `ck.sh srcpkg` | 在 `releases/<版本>/` 放齐发布用的源码: 外置模块源码包, 内核和 ZFS 上游源码包及签名, NVIDIA 许可证 |
+| `ck.sh srcpkg` | 在 `releases/<版本>/` 放齐发布用的源码: 外置模块源码包(不含 NVIDIA 闭源), 内核和 ZFS 上游源码包及签名, NVIDIA 许可证 |
 | `cmpdeb.sh <旧> <新>` | 比较两个内核包: 文件清单, 去掉签名和 build-id 后的内容 |
 
 日志在依赖目录的 `ck/logs/`, 外置模块的在 `ck/extbuild/<名字>.log`.
 
 ### 修改补丁
 
-在依赖目录的 `ck/linux`(分支 `r<上游版本>`), `ck/zfs`, `extsrc/<目录>` 里提交, 然后 `ck.sh export` 并在本仓库提交 `patches/` 的变化.
+在依赖目录的 `ck/linux`(分支 `r<上游版本>`), `ck/zfs`, `extsrc/<目录>` 里提交, 然后 `ck.sh export` 并在本仓库提交 `patches/` 的变化. 从源码包解出的外置模块目录不是 Git 仓库, 要修改时先在其中 `git init`, 删去 `.ck-rev` 并提交原样内容.
 
 ### 测试
 
@@ -144,7 +175,7 @@ test/kvm/vm.sh < test/kvm/probe.sh
 1. 在 `ck/linux` 提交修复, `ck.sh export`.
 2. 修改 `config/VERSION`, `ck.sh build`.
 3. 在测试机上运行测试, 与上一版本的输出比较.
-4. `ck.sh release`, `ck.sh srcpkg`, 更新 [CHANGELOG](doc/CHANGELOG.md), 打标签 `v<版本>` 并发布.
+4. `ck.sh release`, `ck.sh srcpkg`; 外置模块有变化时按 `srcpkg` 的提示更新 `config/versions.conf` 的 `EXTSRC_VER` 和 `EXTSRC_SHA256`. 更新 [CHANGELOG](doc/CHANGELOG.md), 打标签 `v<版本>` 并发布, 发布时上传 `releases/<版本>/` 中的全部文件.
 
 跟进上游 6.18.y:
 
