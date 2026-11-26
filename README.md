@@ -25,7 +25,11 @@
 
 - 内核包 `linux-image-6.18.65.c1186-trim`, 可替换 fnOS 1.2.1000 的原装内核, 版本串保留飞牛的 `.c1186-trim` 后缀.
 - 还原的飞牛功能: trimacl 权限(VFS, ext4, btrfs, fuse, nfsd, ZFS), 11 个 trim 系统调用, 回收站, trimafs2 文件系统, sysdiag 事件上报, md 的 DFR 和 llbitmap 改动, recvfile 系统调用, bonding 混合速率, 网卡和 libata 改动. btrfs 是飞牛整体移植的上游 7.0.9.
-- 4 个 NFS 安全修复(飞牛原版没有), 见 [CHANGELOG](doc/CHANGELOG.md).
+- 4 个 NFS 安全修复, 飞牛原版没有, 详见 [CHANGELOG](doc/CHANGELOG.md):
+  - trimacl 卷上 NFS 也检查写和执行权限, 原版只检查读.
+  - 只有 trimacl 文件对 NFS 报 0777 权限, 普通文件系统报真实权限.
+  - trimafs2 的 NFS 句柄不能越出桥目录.
+  - 用户自建的 `nfs` 目录不会被当成 NFS 共享路径.
 - 包内含 OpenZFS 2.4.1 和飞牛同款外置驱动(Realtek 厂商网卡驱动, NVIDIA 开源和闭源驱动, 无线网卡等), 目录布局与飞牛一致.
 - 已知问题见 [LOG 的缺陷](doc/LOG.md#缺陷), 未实现的目标见 [DESIGN 的设计目标](doc/DESIGN.md#设计目标).
 

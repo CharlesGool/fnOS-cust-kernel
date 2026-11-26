@@ -25,7 +25,11 @@ fnOS 1.2.1000 ships the kernel `6.18.18.c1186-trim`, which contains many private
 
 - Kernel package `linux-image-6.18.65.c1186-trim`, a replacement for the stock kernel of fnOS 1.2.1000. The version string keeps the `.c1186-trim` suffix.
 - Reimplemented fnOS features: trimacl permissions (VFS, ext4, btrfs, fuse, nfsd, ZFS), 11 trim system calls, recycle bin, trimafs2 file system, sysdiag event reporting, md DFR and llbitmap changes, recvfile system call, bonding mixed-speed support, and network card and libata changes. btrfs is a wholesale port of upstream 7.0.9, as in fnOS.
-- 4 NFS security fixes (not present in the original fnOS kernel); see [CHANGELOG](CHANGELOG.md).
+- 4 NFS security fixes, not present in the original fnOS kernel; details in [CHANGELOG](CHANGELOG.md):
+  - On trimacl volumes, NFS also checks write and execute permissions; the original checks only read.
+  - Only trimacl files report 0777 permissions over NFS; ordinary file systems report their real permissions.
+  - trimafs2 NFS handles cannot escape the bridge directory.
+  - A user-created `nfs` directory is not treated as an NFS share path.
 - The package includes OpenZFS 2.4.1 and the same external drivers as fnOS (Realtek vendor network drivers, NVIDIA open and proprietary drivers, wireless adapters, etc.), with the same directory layout as fnOS.
 - Known issues are listed in [Bugs in LOG](LOG.md#bugs); unfinished goals are listed in [Design Goals in DESIGN](DESIGN.md#design-goals).
 

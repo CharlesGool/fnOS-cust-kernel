@@ -25,7 +25,11 @@ fnOS 1.2.1000 incluye el kernel `6.18.18.c1186-trim`, con muchos cambios privado
 
 - Paquete del kernel `linux-image-6.18.65.c1186-trim`, que puede sustituir al kernel original de fnOS 1.2.1000; la cadena de versión conserva el sufijo `.c1186-trim` de fnOS.
 - Funciones de fnOS restauradas: permisos trimacl (VFS, ext4, btrfs, fuse, nfsd, ZFS), 11 llamadas al sistema trim, papelera de reciclaje, sistema de archivos trimafs2, notificación de eventos de sysdiag, cambios de DFR y llbitmap en md, llamada al sistema recvfile, velocidad mixta en bonding, cambios en controladores de red y libata. btrfs es un port completo de la versión 7.0.9 del upstream que hizo fnOS.
-- 4 correcciones de seguridad de NFS (que la versión original de fnOS no tiene); véase [CHANGELOG](CHANGELOG.md).
+- 4 correcciones de seguridad de NFS, que la versión original de fnOS no tiene; detalles en [CHANGELOG](CHANGELOG.md):
+  - En volúmenes trimacl, NFS también comprueba los permisos de escritura y ejecución; el original solo comprueba la lectura.
+  - Solo los archivos trimacl informan permisos 0777 por NFS; los sistemas de archivos normales informan sus permisos reales.
+  - Los handles de NFS de trimafs2 no pueden salir del directorio puente.
+  - Un directorio `nfs` creado por el usuario no se trata como ruta de recurso compartido NFS.
 - El paquete incluye OpenZFS 2.4.1 y los mismos controladores externos que fnOS (controladores de red del fabricante Realtek, controladores NVIDIA de código abierto y propietarios, tarjetas inalámbricas, etc.), con la misma disposición de directorios que fnOS.
 - Los problemas conocidos están en [Errores de LOG](LOG.md#errores); los objetivos pendientes, en [Objetivos de diseño de DESIGN](DESIGN.md#objetivos-de-diseño).
 
