@@ -108,3 +108,4 @@
 0108-nfsd-fh_getattr-trimacl-0777.patch
 0109-trimafs2-NFS.patch
 0110-trimafs2-nfs-NFS.patch
+0111-trimacl-type-cache-sentinel-for-arm64.patch

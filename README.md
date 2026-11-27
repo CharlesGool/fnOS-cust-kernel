@@ -38,6 +38,7 @@
 运行:
 
 - fnOS 1.2.1000, x86_64.
+- ARM64 适配见 [小米 10 `trimafs` 验证](doc/ARM64-TRIMAFS.md)。
 
 构建:
 
