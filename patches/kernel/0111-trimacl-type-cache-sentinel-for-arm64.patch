@@ -1,0 +1,33 @@
+From: Ben <Ben8368@vip.qq.com>
+Subject: [PATCH] trimacl: match the expected pointer type for try_cmpxchg
+
+The generic try_cmpxchg fallback used on arm64 requires the old value
+pointer to have the same type as the cache slot pointer. Store the
+shared POSIX ACL sentinel with the type of the TRIM ACL slot and keep
+the sentinel value and cache protocol unchanged.
+
+---
+ fs/trim_acl.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/trim_acl.c b/fs/trim_acl.c
+--- a/fs/trim_acl.c
++++ b/fs/trim_acl.c
+@@ -424,7 +424,7 @@ EXPORT_SYMBOL(trim_acl_from_disk);
+
+ static struct trim_acl *get_inode_trim_acl(struct inode *inode)
+ {
+-	void *sentinel;
++	struct trim_acl *sentinel;
+ 	struct trim_acl **p;
+ 	struct trim_acl *acl;
+
+@@ -435,7 +435,7 @@ static struct trim_acl *get_inode_trim_acl(struct inode *inode)
+ 	if (!IS_TRIMACL_INODE(inode))
+ 		return NULL;
+
+-	sentinel = uncached_acl_sentinel(current);
++	sentinel = (struct trim_acl *)uncached_acl_sentinel(current);
+ 	p = &inode->i_trim_acl;
+
+ 	/*
